@@ -1592,7 +1592,8 @@ export class RuntimeAgentToolsService {
     jobId: string;
     workspaceId?: string | null;
   }): JsonObject | null {
-    const job = this.store.getCronjob(params.jobId);
+    const workspaceId = this.requireWorkspaceId(params.workspaceId);
+    const job = this.store.getCronjob({ workspaceId, jobId: params.jobId });
     if (!job) {
       return null;
     }
@@ -1639,8 +1640,12 @@ export class RuntimeAgentToolsService {
   }
 
   updateCronjob(params: RuntimeAgentToolsUpdateCronjobParams): JsonObject {
-    const existing = this.requireCronjob(params.jobId);
-    this.assertCronjobBelongsToWorkspace(existing, params.workspaceId);
+    const workspaceId = this.requireWorkspaceId(params.workspaceId);
+    const existing = this.requireCronjob({
+      workspaceId,
+      jobId: params.jobId,
+    });
+    this.assertCronjobBelongsToWorkspace(existing, workspaceId);
     const cron = params.cron == null ? null : normalizedString(params.cron);
     if (params.cron !== undefined && !cron) {
       throw new RuntimeAgentToolsServiceError(400, "cronjob_cron_required", "cron is required");
@@ -1654,6 +1659,7 @@ export class RuntimeAgentToolsService {
       throw new RuntimeAgentToolsServiceError(400, "cronjob_instruction_required", "instruction is required");
     }
     const updated = this.store.updateCronjob({
+      workspaceId,
       jobId: params.jobId,
       name: params.name === undefined ? undefined : normalizedString(params.name),
       cron,
@@ -1681,12 +1687,13 @@ export class RuntimeAgentToolsService {
     jobId: string;
     workspaceId?: string | null;
   }): JsonObject {
-    const existing = this.store.getCronjob(params.jobId);
+    const workspaceId = this.requireWorkspaceId(params.workspaceId);
+    const existing = this.store.getCronjob({ workspaceId, jobId: params.jobId });
     if (!existing) {
       return { success: false };
     }
     this.assertCronjobBelongsToWorkspace(existing, params.workspaceId);
-    return { success: this.store.deleteCronjob(params.jobId) };
+    return { success: this.store.deleteCronjob({ workspaceId, jobId: params.jobId }) };
   }
 
   delegateTask(params: RuntimeAgentToolsDelegateTaskParams): JsonObject {
@@ -1720,7 +1727,12 @@ export class RuntimeAgentToolsService {
       const childSessionId = `subagent-${randomUUID()}`;
       const title = normalizedSubagentTaskTitle(task.title, task.goal);
       const requestedModel = task.model || null;
-      const parentInput = parentInputId ? this.store.getInput(parentInputId) : null;
+      const parentInput = parentInputId
+        ? this.store.getInput({
+            workspaceId: params.workspaceId,
+            inputId: parentInputId,
+          })
+        : null;
       const allowUserBrowserSurface = textExplicitlyRequestsUserBrowserSurface(
         inputTextValue(parentInput),
       );
@@ -1811,6 +1823,7 @@ export class RuntimeAgentToolsService {
       });
       const updatedRun =
         this.store.updateSubagentRun({
+          workspaceId: params.workspaceId,
           subagentId: createdRun.subagentId,
           fields: {
             initialChildInputId: input.inputId,
@@ -1842,10 +1855,14 @@ export class RuntimeAgentToolsService {
     }
     const now = utcNowIso();
     if (state.currentInput?.status === "QUEUED") {
-      this.store.updateInput(state.currentInput.inputId, {
-        status: "DONE",
-        claimedBy: null,
-        claimedUntil: null,
+      this.store.updateInput({
+        workspaceId: params.workspaceId,
+        inputId: state.currentInput.inputId,
+        fields: {
+          status: "DONE",
+          claimedBy: null,
+          claimedUntil: null,
+        },
       });
       this.store.updateRuntimeState({
         workspaceId: params.workspaceId,
@@ -1900,6 +1917,7 @@ export class RuntimeAgentToolsService {
       null;
     const updated =
       this.store.updateSubagentRun({
+        workspaceId: params.workspaceId,
         subagentId: state.run.subagentId,
         fields: {
           status: "cancelled",
@@ -1932,7 +1950,10 @@ export class RuntimeAgentToolsService {
       );
     }
     const previousChildInput = normalizedString(state.run.latestChildInputId)
-      ? this.store.getInput(normalizedString(state.run.latestChildInputId))
+      ? this.store.getInput({
+          workspaceId: params.workspaceId,
+          inputId: normalizedString(state.run.latestChildInputId),
+        })
       : null;
     const effectiveProfile = resolveSubagentExecutionProfile({
       selectedModel:
@@ -1963,7 +1984,7 @@ export class RuntimeAgentToolsService {
         },
       },
     });
-    this.store.updateRuntimeState({
+      this.store.updateRuntimeState({
       workspaceId: params.workspaceId,
       sessionId: state.run.childSessionId,
       status: "QUEUED",
@@ -1975,6 +1996,7 @@ export class RuntimeAgentToolsService {
     });
     const updated =
       this.store.updateSubagentRun({
+        workspaceId: params.workspaceId,
         subagentId: state.run.subagentId,
         fields: {
           ownerMainSessionId: controllerSession.sessionId,
@@ -1988,6 +2010,7 @@ export class RuntimeAgentToolsService {
       }) ?? state.run;
     const staleWaitingEventIds = this.store
       .listPendingMainSessionEvents({
+        workspaceId: params.workspaceId,
         ownerMainSessionId: controllerSession.sessionId,
         deliveryBucket: "waiting_on_user",
         limit: 500,
@@ -1996,6 +2019,7 @@ export class RuntimeAgentToolsService {
       .map((event) => event.eventId);
     if (staleWaitingEventIds.length > 0) {
       this.store.markMainSessionEventsSuperseded({
+        workspaceId: params.workspaceId,
         eventIds: staleWaitingEventIds,
       });
     }
@@ -2030,10 +2054,16 @@ export class RuntimeAgentToolsService {
       );
     }
     const parentInput = normalizedString(params.inputId)
-      ? this.store.getInput(normalizedString(params.inputId))
+      ? this.store.getInput({
+          workspaceId: params.workspaceId,
+          inputId: normalizedString(params.inputId),
+        })
       : null;
     const previousChildInput = normalizedString(state.run.latestChildInputId)
-      ? this.store.getInput(normalizedString(state.run.latestChildInputId))
+      ? this.store.getInput({
+          workspaceId: params.workspaceId,
+          inputId: normalizedString(state.run.latestChildInputId),
+        })
       : null;
     const effectiveProfile = resolveSubagentExecutionProfile({
       selectedModel:
@@ -2103,6 +2133,7 @@ export class RuntimeAgentToolsService {
     const nextTitle = normalizedSubagentTaskTitle(params.title, instruction);
     const updated =
       this.store.updateSubagentRun({
+        workspaceId: params.workspaceId,
         subagentId: state.run.subagentId,
         fields: {
           parentInputId: normalizedString(params.inputId) || state.run.parentInputId,
@@ -2762,15 +2793,24 @@ export class RuntimeAgentToolsService {
   }
 
   getTerminalSession(params: RuntimeAgentToolsGetTerminalSessionParams): JsonObject {
-    return terminalSessionPayload(this.requireTerminalSession(params));
+    return terminalSessionPayload(
+      this.requireTerminalSession({
+        terminalId: params.terminalId,
+        workspaceId: normalizedString(params.workspaceId),
+      })
+    );
   }
 
   readTerminalSession(params: RuntimeAgentToolsReadTerminalSessionParams): JsonObject {
     const manager = this.requireTerminalSessionManager();
-    const terminal = this.requireTerminalSession(params);
+    const terminal = this.requireTerminalSession({
+      terminalId: params.terminalId,
+      workspaceId: normalizedString(params.workspaceId),
+    });
     const afterSequence = normalizedInteger(params.afterSequence, 0, 0, Number.MAX_SAFE_INTEGER);
     const limit = normalizedInteger(params.limit, 200, 1, 1000);
     const events = manager.listEvents({
+      workspaceId: terminal.workspaceId,
       terminalId: terminal.terminalId,
       afterSequence,
       limit,
@@ -2780,17 +2820,24 @@ export class RuntimeAgentToolsService {
 
   async waitTerminalSession(params: RuntimeAgentToolsWaitTerminalSessionParams): Promise<JsonObject> {
     const manager = this.requireTerminalSessionManager();
-    const initialTerminal = this.requireTerminalSession(params);
+    const initialTerminal = this.requireTerminalSession({
+      terminalId: params.terminalId,
+      workspaceId: normalizedString(params.workspaceId),
+    });
     const afterSequence = normalizedInteger(params.afterSequence, 0, 0, Number.MAX_SAFE_INTEGER);
     const limit = normalizedInteger(params.limit, 200, 1, 1000);
     const timeoutMs = normalizedInteger(params.timeoutMs, 15_000, 1, 60_000);
     const immediateEvents = manager.listEvents({
+      workspaceId: initialTerminal.workspaceId,
       terminalId: initialTerminal.terminalId,
       afterSequence,
       limit,
     });
     if (immediateEvents.length > 0 || !["starting", "running"].includes(initialTerminal.status)) {
-      const terminal = this.requireTerminalSession(params);
+      const terminal = this.requireTerminalSession({
+        terminalId: params.terminalId,
+        workspaceId: normalizedString(params.workspaceId),
+      });
       return terminalSessionReadPayload({
         terminal,
         events: immediateEvents,
@@ -2812,8 +2859,12 @@ export class RuntimeAgentToolsService {
           clearTimeout(timeoutHandle);
         }
         unsubscribe();
-        const terminal = this.requireTerminalSession(params);
+        const terminal = this.requireTerminalSession({
+          terminalId: params.terminalId,
+          workspaceId: normalizedString(params.workspaceId),
+        });
         const events = manager.listEvents({
+          workspaceId: terminal.workspaceId,
           terminalId: terminal.terminalId,
           afterSequence,
           limit,
@@ -2840,8 +2891,12 @@ export class RuntimeAgentToolsService {
   }
 
   async sendTerminalSessionInput(params: RuntimeAgentToolsSendTerminalSessionInputParams): Promise<JsonObject> {
-    this.requireTerminalSession(params);
+    const terminal = this.requireTerminalSession({
+      terminalId: params.terminalId,
+      workspaceId: normalizedString(params.workspaceId),
+    });
     const session = await this.requireTerminalSessionManager().sendInput({
+      workspaceId: terminal.workspaceId,
       terminalId: normalizedString(params.terminalId),
       data: params.data,
     });
@@ -2849,8 +2904,12 @@ export class RuntimeAgentToolsService {
   }
 
   async signalTerminalSession(params: RuntimeAgentToolsSignalTerminalSessionParams): Promise<JsonObject> {
-    this.requireTerminalSession(params);
+    const terminal = this.requireTerminalSession({
+      terminalId: params.terminalId,
+      workspaceId: normalizedString(params.workspaceId),
+    });
     const session = await this.requireTerminalSessionManager().signal({
+      workspaceId: terminal.workspaceId,
       terminalId: normalizedString(params.terminalId),
       signal: normalizedString(params.signal) || null,
     });
@@ -2858,8 +2917,12 @@ export class RuntimeAgentToolsService {
   }
 
   async closeTerminalSession(params: RuntimeAgentToolsCloseTerminalSessionParams): Promise<JsonObject> {
-    this.requireTerminalSession(params);
+    const terminal = this.requireTerminalSession({
+      terminalId: params.terminalId,
+      workspaceId: normalizedString(params.workspaceId),
+    });
     const session = await this.requireTerminalSessionManager().closeSession({
+      workspaceId: terminal.workspaceId,
       terminalId: normalizedString(params.terminalId),
     });
     return terminalSessionPayload(session);
@@ -2893,8 +2956,8 @@ export class RuntimeAgentToolsService {
     if (!subagentId) {
       throw new RuntimeAgentToolsServiceError(400, "subagent_id_required", "subagent_id is required");
     }
-    const run = this.store.getSubagentRun({ subagentId });
-    if (!run || run.workspaceId !== params.workspaceId) {
+    const run = this.store.getSubagentRun({ workspaceId: params.workspaceId, subagentId });
+    if (!run) {
       throw new RuntimeAgentToolsServiceError(404, "subagent_not_found", "subagent not found");
     }
     return run;
@@ -2913,6 +2976,7 @@ export class RuntimeAgentToolsService {
     if (ownerMainSessionId && run.ownerMainSessionId !== ownerMainSessionId) {
       run =
         this.store.transferSubagentOwnership({
+          workspaceId: params.workspaceId,
           subagentId: run.subagentId,
           ownerMainSessionId,
         }) ?? run;
@@ -2934,9 +2998,25 @@ export class RuntimeAgentToolsService {
       normalizedString(run.latestChildInputId) ||
       currentInputId ||
       normalizedString(run.initialChildInputId);
-    const currentInput = currentInputId ? this.store.getInput(currentInputId) : null;
-    const latestInput = latestInputId ? this.store.getInput(latestInputId) : null;
-    const latestTurnResult = latestInputId ? this.store.getTurnResult({ inputId: latestInputId }) : null;
+    const workspaceId = run.workspaceId;
+    const currentInput = currentInputId
+      ? this.store.getInput({
+          workspaceId,
+          inputId: currentInputId,
+        })
+      : null;
+    const latestInput = latestInputId
+      ? this.store.getInput({
+          workspaceId,
+          inputId: latestInputId,
+        })
+      : null;
+    const latestTurnResult = latestInputId
+      ? this.store.getTurnResult({
+          workspaceId: run.workspaceId,
+          inputId: latestInputId,
+        })
+      : null;
 
     const runtimeStatus = normalizedString(runtimeState?.status).toUpperCase();
     const currentInputStatus = normalizedString(currentInput?.status).toUpperCase();
@@ -3030,6 +3110,7 @@ export class RuntimeAgentToolsService {
     const syncedRun =
       Object.keys(updates).length > 0
         ? (this.store.updateSubagentRun({
+            workspaceId: run.workspaceId,
             subagentId: run.subagentId,
             fields: updates,
           }) ?? run)
@@ -3121,8 +3202,17 @@ export class RuntimeAgentToolsService {
     return workspace;
   }
 
-  private requireCronjob(jobId: string): CronjobRecord {
-    const job = this.store.getCronjob(jobId);
+  private requireWorkspaceId(workspaceId?: string | null): string {
+    const normalized = normalizedString(workspaceId);
+    if (!normalized) {
+      throw new RuntimeAgentToolsServiceError(400, "workspace_id_required", "workspace_id is required");
+    }
+    return normalized;
+  }
+
+  private requireCronjob(params: { workspaceId?: string | null; jobId: string }): CronjobRecord {
+    const workspaceId = this.requireWorkspaceId(params.workspaceId);
+    const job = this.store.getCronjob({ workspaceId, jobId: params.jobId });
     if (!job) {
       throw new RuntimeAgentToolsServiceError(404, "cronjob_not_found", "cronjob not found");
     }
@@ -3154,15 +3244,19 @@ export class RuntimeAgentToolsService {
 
   private requireTerminalSession(params: {
     terminalId: string;
-    workspaceId?: string | null;
+    workspaceId: string;
   }): TerminalSessionRecord {
     const terminalId = normalizedString(params.terminalId);
     if (!terminalId) {
       throw new RuntimeAgentToolsServiceError(400, "terminal_session_id_required", "terminal_id is required");
     }
+    const workspaceId = normalizedString(params.workspaceId);
+    if (!workspaceId) {
+      throw new RuntimeAgentToolsServiceError(400, "workspace_id_required", "workspace_id is required");
+    }
     const terminal = this.requireTerminalSessionManager().getSession({
       terminalId,
-      workspaceId: normalizedString(params.workspaceId) || undefined,
+      workspaceId,
     });
     if (!terminal) {
       throw new RuntimeAgentToolsServiceError(404, "terminal_session_not_found", "terminal session not found");
@@ -3301,7 +3395,7 @@ export class RuntimeAgentToolsService {
         row_count: rows.length,
         column_count: columns.length,
         replaced_existing: exists && replaceExisting,
-        db_path: ".holaboss/data.db",
+        db_path: ".holaboss/state/data.db",
       };
     } catch (error) {
       if (error instanceof RuntimeAgentToolsServiceError) {

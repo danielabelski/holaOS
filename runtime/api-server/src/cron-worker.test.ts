@@ -156,7 +156,7 @@ test("runtime cron worker queues due session_run cronjobs as hidden subagents an
   });
 
   const processed = await worker.processDueCronjobsOnce(new Date("2025-01-01T09:30:00Z"));
-  const updated = store.getCronjob(job.id);
+  const updated = store.getCronjob({ workspaceId: workspace.id, jobId: job.id });
   const runs = store.listSubagentRunsByWorkspace({ workspaceId: workspace.id });
   const run = runs[0];
   const runtimeState = run
@@ -348,7 +348,7 @@ test("runtime cron worker persists system_notification cronjobs as unread notifi
   const worker = new RuntimeCronWorker({ store });
   const processed = await worker.processDueCronjobsOnce(new Date("2025-01-01T09:30:00Z"));
   const notifications = store.listRuntimeNotifications({ workspaceId: workspace.id });
-  const updated = store.getCronjob(job.id);
+  const updated = store.getCronjob({ workspaceId: workspace.id, jobId: job.id });
 
   assert.equal(processed, 1);
   assert.equal(notifications.length, 1);
@@ -389,7 +389,7 @@ test("runtime cron worker records failures for unsupported delivery channels", a
 
   const worker = new RuntimeCronWorker({ store });
   const processed = await worker.processDueCronjobsOnce(new Date("2025-01-01T09:30:00Z"));
-  const updated = store.getCronjob(job.id);
+  const updated = store.getCronjob({ workspaceId: "workspace-1", jobId: job.id });
 
   assert.equal(processed, 1);
   assert.ok(updated);
@@ -428,36 +428,38 @@ test("cronjob routes compute next_run_at and cron worker lifecycle hooks run", a
       }
     }
   });
+  try {
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/v1/cronjobs",
+      payload: {
+        workspace_id: workspace.id,
+        initiated_by: "workspace_agent",
+        cron: "0 9 * * *",
+        description: "Daily check",
+        delivery: { channel: "session_run" }
+      }
+    });
+    const body = created.json() as { id: string; next_run_at: string | null };
+    const updated = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/cronjobs/${body.id}`,
+      payload: {
+        workspace_id: workspace.id,
+        cron: "0 10 * * *"
+      }
+    });
 
-  const created = await app.inject({
-    method: "POST",
-    url: "/api/v1/cronjobs",
-    payload: {
-      workspace_id: workspace.id,
-      initiated_by: "workspace_agent",
-      cron: "0 9 * * *",
-      description: "Daily check",
-      delivery: { channel: "session_run" }
-    }
-  });
-  const body = created.json() as { id: string; next_run_at: string | null };
-  const updated = await app.inject({
-    method: "PATCH",
-    url: `/api/v1/cronjobs/${body.id}`,
-    payload: {
-      cron: "0 10 * * *"
-    }
-  });
-
-  assert.equal(startCalls, 1);
-  assert.equal(created.statusCode, 200);
-  assert.ok(body.next_run_at);
-  assert.equal(updated.statusCode, 200);
-  assert.ok(updated.json().next_run_at);
-
-  await app.close();
-  assert.equal(closeCalls, 1);
-  store.close();
+    assert.equal(startCalls, 1);
+    assert.equal(created.statusCode, 200);
+    assert.ok(body.next_run_at);
+    assert.equal(updated.statusCode, 200);
+    assert.ok(updated.json().next_run_at);
+  } finally {
+    await app.close();
+    assert.equal(closeCalls, 1);
+    store.close();
+  }
 });
 
 test("runtime cron worker does not execute a newly created cronjob before next_run_at", async () => {
@@ -512,7 +514,7 @@ test("runtime cron worker does not execute a newly created cronjob before next_r
   });
 
   const processed = await worker.processDueCronjobsOnce(new Date("2025-01-01T09:30:00Z"));
-  const updated = store.getCronjob(job.id);
+  const updated = store.getCronjob({ workspaceId: "workspace-1", jobId: job.id });
   const runs = store.listSubagentRunsByWorkspace({ workspaceId: workspace.id });
   const notifications = store.listRuntimeNotifications({ workspaceId: workspace.id });
 

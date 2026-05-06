@@ -11,10 +11,11 @@ The runtime memory model is intentionally split:
 
 | Layer | Purpose | Durable? |
 | --- | --- | --- |
-| `state/runtime.db` | execution truth, profile state, continuity boundaries | yes |
-| `memory/workspace/<workspace-id>/runtime/` | latest-turn projections, blockers, recent-turn snapshots | no |
-| `memory/workspace/<workspace-id>/runtime/session-memory/` | resume-friendly continuity snapshots | semi-volatile |
-| `memory/workspace/<workspace-id>/knowledge/` | workspace facts, procedures, blockers, reference memories | yes |
+| `state/control-plane.db` | canonical profile state and profile-global memory metadata | yes |
+| `<workspace-id>/.holaboss/state/runtime.db` | workspace execution truth, workspace-scoped memory metadata, pending proposals | yes |
+| `<workspace-id>/.holaboss/memory/runtime/` | latest-turn projections, blockers, recent-turn snapshots | no |
+| `<workspace-id>/.holaboss/memory/runtime/session-memory/` | resume-friendly continuity snapshots | semi-volatile |
+| `<workspace-id>/.holaboss/memory/knowledge/` | workspace facts, procedures, blockers, reference memories | yes |
 | `memory/preference/` | user preferences | yes |
 | `memory/identity/` | user identity memory | yes |
 
@@ -62,13 +63,13 @@ That is why durable memory is intentionally smaller and more opinionated than se
 There are currently two durable write paths:
 
 - background evolve writeback
-  - writes workspace durable memory under `workspace/<workspace-id>/knowledge/`
-  - updates the durable memory catalog in `state/runtime.db`
-  - refreshes `workspace/<workspace-id>/MEMORY.md` and the root `MEMORY.md` when indexed scopes change
+  - writes workspace durable memory under `.holaboss/memory/knowledge/`
+  - updates the durable memory catalog in the workspace runtime DB or `state/control-plane.db`, depending on scope
+  - refreshes the workspace-local `MEMORY.md` plus the root `MEMORY.md` when indexed scopes change
 - accepted user-memory proposals
   - capture explicit user preferences from input
   - persist accepted preference memory into markdown under `memory/preference/`
-  - update the canonical runtime profile for accepted profile proposals
+  - update the canonical runtime profile in `state/control-plane.db` for accepted profile proposals
   - refresh durable markdown indexes for accepted preference-memory writes
 
 ## What lives where
@@ -77,14 +78,14 @@ Use these rules of thumb when reasoning about durable state:
 
 - `AGENTS.md`
   - human-authored workspace policy and operating instructions
-- `memory/workspace/<workspace-id>/knowledge/`
+- `<workspace-id>/.holaboss/memory/knowledge/`
   - durable workspace memory that may be recalled in later runs
 - `memory/preference/`
   - durable user preference memory
 - `memory/identity/`
   - durable user identity facts beyond the canonical runtime profile
 
-If it should be recalled later without replaying the full session, it belongs in durable memory. If it is a standing workspace rule, it belongs in `AGENTS.md`. If it is only a runtime profile field such as the canonical user name, it stays in `state/runtime.db` until a separate path promotes related durable identity memory.
+If it should be recalled later without replaying the full session, it belongs in durable memory. If it is a standing workspace rule, it belongs in `AGENTS.md`. If it is only a runtime profile field such as the canonical user name, it stays in `state/control-plane.db` until a separate path promotes related durable identity memory.
 
 ## Namespace boundaries
 

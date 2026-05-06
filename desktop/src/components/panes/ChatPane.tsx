@@ -3927,6 +3927,7 @@ export function ChatPane({
         const [outputEventsResult, outputListResult, memoryProposalListResult] =
           await Promise.allSettled([
             window.electronAPI.workspace.getSessionOutputEvents({
+              workspaceId: params.workspaceId,
               sessionId: params.sessionId,
               inputId,
             }),
@@ -4596,6 +4597,7 @@ export function ChatPane({
     try {
       await window.electronAPI.workspace.acceptMemoryUpdateProposal({
         proposalId: proposal.proposal_id,
+        workspaceId: proposal.workspace_id,
         summary: nextSummary,
       });
       setEditingMemoryProposalId((current) =>
@@ -4623,6 +4625,7 @@ export function ChatPane({
     });
     try {
       await window.electronAPI.workspace.dismissMemoryUpdateProposal(
+        proposal.workspace_id,
         proposal.proposal_id,
       );
       setEditingMemoryProposalId((current) =>

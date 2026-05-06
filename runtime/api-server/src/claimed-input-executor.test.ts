@@ -112,6 +112,37 @@ function writeRuntimeConfigDocument(document: Record<string, unknown>): string {
   return configPath;
 }
 
+function outputEventsForInput(
+  store: RuntimeStateStore,
+  record: { workspaceId: string; sessionId: string; inputId: string },
+) {
+  return store.listOutputEvents({
+    workspaceId: record.workspaceId,
+    sessionId: record.sessionId,
+    inputId: record.inputId,
+  });
+}
+
+function turnResultForInput(
+  store: RuntimeStateStore,
+  record: { workspaceId: string; inputId: string },
+) {
+  return store.getTurnResult({
+    workspaceId: record.workspaceId,
+    inputId: record.inputId,
+  });
+}
+
+function turnRequestSnapshotForInput(
+  store: RuntimeStateStore,
+  record: { workspaceId: string; inputId: string },
+) {
+  return store.getTurnRequestSnapshot({
+    workspaceId: record.workspaceId,
+    inputId: record.inputId,
+  });
+}
+
 function createSubagentRunFixture(params: {
   store: RuntimeStateStore;
   workspaceId: string;
@@ -184,16 +215,13 @@ test("claimed input marks missing workspace failed and runtime error", async () 
     record: claimed[0],
   });
 
-  const updated = store.getInput(queued.inputId);
+  const updated = store.getInput({ workspaceId: workspace.id, inputId: queued.inputId });
   const runtimeState = store.getRuntimeState({
     workspaceId: workspace.id,
     sessionId: "session-main",
   });
-  const events = store.listOutputEvents({
-    sessionId: "session-main",
-    inputId: queued.inputId,
-  });
-  const turnResult = store.getTurnResult({ inputId: queued.inputId });
+  const events = outputEventsForInput(store, queued);
+  const turnResult = turnResultForInput(store, queued);
 
   assert.ok(updated);
   assert.equal(updated.status, "FAILED");
@@ -276,14 +304,11 @@ test("claimed input persists runner events, assistant text, and idle state on su
   store.updateInput = ((
     ...args: Parameters<typeof store.updateInput>
   ): ReturnType<typeof store.updateInput> => {
-    const [inputId, fields] = args;
-    if (inputId === queued.inputId && fields.status === "DONE") {
-      terminalPersistedBeforeDone = store
-        .listOutputEvents({
-          sessionId: "session-main",
-          inputId: queued.inputId,
-        })
-        .some((event) => event.eventType === "run_completed");
+    const [params] = args;
+    if (params.inputId === queued.inputId && params.fields.status === "DONE") {
+      terminalPersistedBeforeDone = outputEventsForInput(store, queued).some(
+        (event) => event.eventType === "run_completed"
+      );
     }
     return originalUpdateInput(...args);
   }) as typeof store.updateInput;
@@ -295,29 +320,23 @@ test("claimed input persists runner events, assistant text, and idle state on su
     memoryService,
     runEvolveTasksFn: async (options) => {
       scheduledEvolveTasks += 1;
-      eventTypesAtSchedule = store
-        .listOutputEvents({
-          sessionId: options.record.sessionId,
-          inputId: options.record.inputId,
-        })
-        .map((event) => event.eventType);
+      eventTypesAtSchedule = outputEventsForInput(store, options.record).map(
+        (event) => event.eventType
+      );
     },
   });
 
-  const updated = store.getInput(queued.inputId);
+  const updated = store.getInput({ workspaceId: workspace.id, inputId: queued.inputId });
   const runtimeState = store.getRuntimeState({
     workspaceId: workspace.id,
     sessionId: "session-main",
   });
-  const events = store.listOutputEvents({
-    sessionId: "session-main",
-    inputId: queued.inputId,
-  });
+  const events = outputEventsForInput(store, queued);
   const messages = store.listSessionMessages({
     workspaceId: workspace.id,
     sessionId: "session-main",
   });
-  const turnResult = store.getTurnResult({ inputId: queued.inputId });
+  const turnResult = turnResultForInput(store, queued);
 
   assert.ok(updated);
   assert.equal(updated.status, "DONE");
@@ -414,7 +433,7 @@ test("claimed input persists runner events, assistant text, and idle state on su
     input_tokens: 12,
     output_tokens: 34,
   });
-  const snapshot = store.getTurnRequestSnapshot({ inputId: queued.inputId });
+  const snapshot = turnRequestSnapshotForInput(store, queued);
   assert.equal(snapshot, null);
 
   store.close();
@@ -540,11 +559,8 @@ test("claimed input persists context-budget telemetry from replay clipping and c
     runEvolveTasksFn: async () => {},
   });
 
-  const turnResult = store.getTurnResult({ inputId: queued.inputId });
-  const events = store.listOutputEvents({
-    sessionId: "session-main",
-    inputId: queued.inputId,
-  });
+  const turnResult = turnResultForInput(store, queued);
+  const events = outputEventsForInput(store, queued);
   const terminalEvent = events.at(-1);
   const terminalBudgetDecisions = recordValue(
     terminalEvent?.payload.context_budget_decisions,
@@ -601,7 +617,7 @@ test("claimed input summarizes browser tool usage and browser telemetry", async 
     claimedBy: "sandbox-agent-ts-worker",
   });
 
-  const turnResult = store.getTurnResult({ inputId: queued.inputId });
+  const turnResult = turnResultForInput(store, queued);
   assert.ok(turnResult);
   assert.deepEqual(turnResult.toolUsageSummary, {
     total_calls: 3,
@@ -729,8 +745,7 @@ test("claimed input creates a completion notification for successful cronjob ses
   const notifications = store.listRuntimeNotifications({
     workspaceId: workspace.id,
   });
-  const queuedEvents = store.listPendingMainSessionEvents({
-    ownerMainSessionId: "session-main",
+  const queuedEvents = store.listPendingMainSessionEvents({ workspaceId: workspace.id, ownerMainSessionId: "session-main",
   });
 
   assert.equal(notifications.length, 1);
@@ -926,12 +941,12 @@ test("claimed input persists waiting_user terminal status for harnesses that sup
     claimedBy: "sandbox-agent-ts-worker",
   });
 
-  const updated = store.getInput(queued.inputId);
+  const updated = store.getInput({ workspaceId: workspace.id, inputId: queued.inputId });
   const runtimeState = store.getRuntimeState({
     workspaceId: workspace.id,
     sessionId: "session-main",
   });
-  const turnResult = store.getTurnResult({ inputId: queued.inputId });
+  const turnResult = turnResultForInput(store, queued);
 
   assert.ok(updated);
   assert.equal(updated.status, "DONE");
@@ -983,10 +998,7 @@ test("claimed input persists a paused turn when the run is aborted mid-execution
 
   for (let attempt = 0; attempt < 50; attempt += 1) {
     if (
-      store.listOutputEvents({
-        sessionId: "session-main",
-        inputId: queued.inputId,
-      }).length > 0
+      outputEventsForInput(store, queued).length > 0
     ) {
       break;
     }
@@ -995,16 +1007,13 @@ test("claimed input persists a paused turn when the run is aborted mid-execution
   controller.abort("user_requested_pause");
   await execution;
 
-  const updated = store.getInput(queued.inputId);
+  const updated = store.getInput({ workspaceId: workspace.id, inputId: queued.inputId });
   const runtimeState = store.getRuntimeState({
     workspaceId: workspace.id,
     sessionId: "session-main",
   });
-  const events = store.listOutputEvents({
-    sessionId: "session-main",
-    inputId: queued.inputId,
-  });
-  const turnResult = store.getTurnResult({ inputId: queued.inputId });
+  const events = outputEventsForInput(store, queued);
+  const turnResult = turnResultForInput(store, queued);
   const completedBudgetDecisions = recordValue(
     events[1]?.payload.context_budget_decisions,
   );
@@ -1186,9 +1195,8 @@ test("claimed input writes completed subagent results and queues a background up
     },
   });
 
-  const updatedRun = store.getSubagentRun({ subagentId: run.subagentId });
-  const queuedEvents = store.listPendingMainSessionEvents({
-    ownerMainSessionId: "session-main",
+  const updatedRun = store.getSubagentRun({ workspaceId: run.workspaceId, subagentId: run.subagentId });
+  const queuedEvents = store.listPendingMainSessionEvents({ workspaceId: workspace.id, ownerMainSessionId: "session-main",
   });
 
   assert.ok(updatedRun);
@@ -1281,9 +1289,8 @@ test("claimed input writes waiting-on-user subagent blockers and queues a blocke
     },
   });
 
-  const updatedRun = store.getSubagentRun({ subagentId: run.subagentId });
-  const queuedEvents = store.listPendingMainSessionEvents({
-    ownerMainSessionId: "session-main",
+  const updatedRun = store.getSubagentRun({ workspaceId: run.workspaceId, subagentId: run.subagentId });
+  const queuedEvents = store.listPendingMainSessionEvents({ workspaceId: workspace.id, ownerMainSessionId: "session-main",
   });
 
   assert.ok(updatedRun);
@@ -1362,9 +1369,8 @@ test("claimed input treats recoverable login blockers as waiting-on-user subagen
     },
   });
 
-  const updatedRun = store.getSubagentRun({ subagentId: run.subagentId });
-  const queuedEvents = store.listPendingMainSessionEvents({
-    ownerMainSessionId: "session-main",
+  const updatedRun = store.getSubagentRun({ workspaceId: run.workspaceId, subagentId: run.subagentId });
+  const queuedEvents = store.listPendingMainSessionEvents({ workspaceId: workspace.id, ownerMainSessionId: "session-main",
   });
 
   assert.ok(updatedRun);
@@ -1437,9 +1443,8 @@ test("claimed input writes failed subagent results and queues a failure update",
     },
   });
 
-  const updatedRun = store.getSubagentRun({ subagentId: run.subagentId });
-  const queuedEvents = store.listPendingMainSessionEvents({
-    ownerMainSessionId: "session-main",
+  const updatedRun = store.getSubagentRun({ workspaceId: run.workspaceId, subagentId: run.subagentId });
+  const queuedEvents = store.listPendingMainSessionEvents({ workspaceId: workspace.id, ownerMainSessionId: "session-main",
   });
 
   assert.ok(updatedRun);
@@ -1494,6 +1499,7 @@ test("claimed input delivers materialized main-session event batches without ins
     idempotencyKey: `main-session-event-batch:${event.eventId}`,
   });
   store.markMainSessionEventsMaterialized({
+    workspaceId: workspace.id,
     eventIds: [event.eventId],
     materializedInputId: queued.inputId,
   });
@@ -1537,7 +1543,7 @@ test("claimed input delivers materialized main-session event batches without ins
     workspaceId: workspace.id,
     sessionId: "session-main",
   });
-  const updatedEvent = store.getMainSessionEvent({ eventId: event.eventId });
+  const updatedEvent = store.getMainSessionEvent({ workspaceId: workspace.id, eventId: event.eventId });
 
   assert.equal(messages.length, 1);
   assert.equal(messages[0]?.role, "assistant");
@@ -1590,6 +1596,7 @@ test("claimed input requeues materialized main-session event batches when the re
     idempotencyKey: `main-session-event-batch:${event.eventId}`,
   });
   store.markMainSessionEventsMaterialized({
+    workspaceId: workspace.id,
     eventIds: [event.eventId],
     materializedInputId: queued.inputId,
   });
@@ -1602,7 +1609,7 @@ test("claimed input requeues materialized main-session event batches when the re
     },
   });
 
-  const updatedEvent = store.getMainSessionEvent({ eventId: event.eventId });
+  const updatedEvent = store.getMainSessionEvent({ workspaceId: workspace.id, eventId: event.eventId });
   const updatedPayload = recordValue(updatedEvent?.payload);
   const deliveryRetry = recordValue(updatedPayload?.delivery_retry);
 
@@ -1657,6 +1664,7 @@ test("claimed input requeues paused materialized main-session event batches with
     idempotencyKey: `main-session-event-batch:${event.eventId}`,
   });
   store.markMainSessionEventsMaterialized({
+    workspaceId: workspace.id,
     eventIds: [event.eventId],
     materializedInputId: queued.inputId,
   });
@@ -1689,7 +1697,10 @@ test("claimed input requeues paused materialized main-session event batches with
     },
   });
 
-  const updatedEvent = store.getMainSessionEvent({ eventId: event.eventId });
+  const updatedEvent = store.getMainSessionEvent({
+    workspaceId: workspace.id,
+    eventId: event.eventId,
+  });
   const updatedPayload = recordValue(updatedEvent?.payload);
   const deliveryRetry = recordValue(updatedPayload?.delivery_retry);
   const messages = store.listSessionMessages({
@@ -1802,6 +1813,7 @@ test("claimed input folds attached background updates into a normal user turn", 
     },
   });
   store.markMainSessionEventsMaterialized({
+    workspaceId: workspace.id,
     eventIds: [event.eventId],
     materializedInputId: queued.inputId,
   });
@@ -1849,7 +1861,7 @@ test("claimed input folds attached background updates into a normal user turn", 
     workspaceId: workspace.id,
     sessionId: "session-main",
   });
-  const updatedEvent = store.getMainSessionEvent({ eventId: event.eventId });
+  const updatedEvent = store.getMainSessionEvent({ workspaceId: workspace.id, eventId: event.eventId });
   const outputs = store.listOutputs({
     workspaceId: workspace.id,
     sessionId: "session-main",
@@ -1919,7 +1931,7 @@ test("claimed input renews its claim lease while the runner is still healthy", a
     executeRunnerRequestFn: async (payload, options = {}) => {
       await options.onHeartbeat?.();
       claimedUntilDuringRun =
-        store.getInput(String(payload.input_id))?.claimedUntil ?? null;
+        store.getInput({ workspaceId: workspace.id, inputId: String(payload.input_id) })?.claimedUntil ?? null;
       await options.onEvent?.({
         session_id: payload.session_id,
         input_id: payload.input_id,
@@ -2041,7 +2053,7 @@ test("claimed input treats streamed runner events as lease activity", async () =
         payload: {},
       });
       claimedUntilDuringRun =
-        store.getInput(String(payload.input_id))?.claimedUntil ?? null;
+        store.getInput({ workspaceId: workspace.id, inputId: String(payload.input_id) })?.claimedUntil ?? null;
       await options.onEvent?.({
         session_id: payload.session_id,
         input_id: payload.input_id,
@@ -2129,20 +2141,17 @@ test("claimed input honors a persisted failure terminal after claim recovery abo
     },
   });
 
-  const updated = store.getInput(queued.inputId);
+  const updated = store.getInput({ workspaceId: workspace.id, inputId: queued.inputId });
   const runtimeState = store.getRuntimeState({
     workspaceId: workspace.id,
     sessionId: "session-main",
   });
-  const events = store.listOutputEvents({
-    sessionId: "session-main",
-    inputId: queued.inputId,
-  });
+  const events = outputEventsForInput(store, queued);
   const messages = store.listSessionMessages({
     workspaceId: workspace.id,
     sessionId: "session-main",
   });
-  const turnResult = store.getTurnResult({ inputId: queued.inputId });
+  const turnResult = turnResultForInput(store, queued);
 
   assert.ok(updated);
   assert.equal(updated.status, "FAILED");
@@ -2380,7 +2389,7 @@ test("claimed input records skill-policy denial audit in tool usage summary", as
     },
   });
 
-  const turnResult = store.getTurnResult({ inputId: queued.inputId });
+  const turnResult = turnResultForInput(store, queued);
   assert.ok(turnResult);
   assert.deepEqual(turnResult.toolUsageSummary, {
     total_calls: 1,
@@ -2437,16 +2446,13 @@ test("claimed input synthesizes run_failed when runner exits without terminal ev
     claimedBy: "sandbox-agent-ts-worker",
   });
 
-  const updated = store.getInput(queued.inputId);
+  const updated = store.getInput({ workspaceId: workspace.id, inputId: queued.inputId });
   const runtimeState = store.getRuntimeState({
     workspaceId: workspace.id,
     sessionId: "session-main",
   });
-  const events = store.listOutputEvents({
-    sessionId: "session-main",
-    inputId: queued.inputId,
-  });
-  const turnResult = store.getTurnResult({ inputId: queued.inputId });
+  const events = outputEventsForInput(store, queued);
+  const turnResult = turnResultForInput(store, queued);
 
   assert.ok(updated);
   assert.equal(updated.status, "FAILED");
@@ -2501,16 +2507,13 @@ test("claimed input succeeds when runner emits terminal event but keeps the proc
     claimedBy: "sandbox-agent-ts-worker",
   });
 
-  const updated = store.getInput(queued.inputId);
+  const updated = store.getInput({ workspaceId: workspace.id, inputId: queued.inputId });
   const runtimeState = store.getRuntimeState({
     workspaceId: workspace.id,
     sessionId: "session-main",
   });
-  const events = store.listOutputEvents({
-    sessionId: "session-main",
-    inputId: queued.inputId,
-  });
-  const turnResult = store.getTurnResult({ inputId: queued.inputId });
+  const events = outputEventsForInput(store, queued);
+  const turnResult = turnResultForInput(store, queued);
 
   assert.ok(updated);
   assert.equal(updated.status, "DONE");
@@ -2561,16 +2564,13 @@ test("claimed input fails when runner becomes idle after run_started", async () 
     claimedBy: "sandbox-agent-ts-worker",
   });
 
-  const updated = store.getInput(queued.inputId);
+  const updated = store.getInput({ workspaceId: workspace.id, inputId: queued.inputId });
   const runtimeState = store.getRuntimeState({
     workspaceId: workspace.id,
     sessionId: "session-main",
   });
-  const events = store.listOutputEvents({
-    sessionId: "session-main",
-    inputId: queued.inputId,
-  });
-  const turnResult = store.getTurnResult({ inputId: queued.inputId });
+  const events = outputEventsForInput(store, queued);
+  const turnResult = turnResultForInput(store, queued);
 
   assert.ok(updated);
   assert.equal(updated.status, "FAILED");
@@ -2618,11 +2618,11 @@ test("claimed input stops without overwriting state after it loses its claim mid
         event_type: "run_started",
         payload: {},
       });
-      store.updateInput(queued.inputId, {
+      store.updateInput({ workspaceId: queued.workspaceId, inputId: queued.inputId, fields: {
         status: "FAILED",
         claimedBy: null,
         claimedUntil: null,
-      });
+      } });
       store.updateRuntimeState({
         workspaceId: workspace.id,
         sessionId: "session-main",
@@ -2666,20 +2666,17 @@ test("claimed input stops without overwriting state after it loses its claim mid
     },
   });
 
-  const updated = store.getInput(queued.inputId);
+  const updated = store.getInput({ workspaceId: workspace.id, inputId: queued.inputId });
   const runtimeState = store.getRuntimeState({
     workspaceId: workspace.id,
     sessionId: "session-main",
   });
-  const events = store.listOutputEvents({
-    sessionId: "session-main",
-    inputId: queued.inputId,
-  });
+  const events = outputEventsForInput(store, queued);
   const messages = store.listSessionMessages({
     workspaceId: workspace.id,
     sessionId: "session-main",
   });
-  const turnResult = store.getTurnResult({ inputId: queued.inputId });
+  const turnResult = turnResultForInput(store, queued);
 
   assert.equal(updated?.status, "FAILED");
   assert.equal(updated?.claimedBy, null);
@@ -2977,10 +2974,7 @@ test("claimed input hydrates runtime exec context from runtime config", async ()
     },
   });
 
-  const events = store.listOutputEvents({
-    sessionId: "session-main",
-    inputId: queued.inputId,
-  });
+  const events = outputEventsForInput(store, queued);
   assert.equal(events.length, 2);
   const runtimeExecContext = events[0].payload.runtime_exec_context as Record<
     string,
@@ -4046,11 +4040,15 @@ test("claimed input waits for an in-flight session checkpoint before starting th
   let checkpointReleased = false;
   setTimeout(() => {
     checkpointReleased = true;
-    store.updatePostRunJob(checkpointJob.jobId, {
-      status: "DONE",
-      claimedBy: null,
-      claimedUntil: null,
-      lastError: null,
+    store.updatePostRunJob({
+      workspaceId: workspace.id,
+      jobId: checkpointJob.jobId,
+      fields: {
+        status: "DONE",
+        claimedBy: null,
+        claimedUntil: null,
+        lastError: null,
+      },
     });
   }, 50);
 
@@ -4086,7 +4084,10 @@ test("claimed input waits for an in-flight session checkpoint before starting th
   });
 
   assert.equal(runnerStarted, true);
-  assert.equal(store.getPostRunJob(checkpointJob.jobId)?.status, "DONE");
+  assert.equal(
+    store.getPostRunJob({ workspaceId: workspace.id, jobId: checkpointJob.jobId })?.status,
+    "DONE",
+  );
 
   store.close();
 });

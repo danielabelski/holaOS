@@ -110,7 +110,13 @@ import {
 } from "../shared/model-catalog.js";
 import * as modelCatalog from "../shared/model-catalog.js";
 import { buildAppSdkClient } from "./appSdkClient.js";
+import {
+  bootstrapLocalControlPlaneDatabase,
+  createLocalRuntimeUserProfileStore,
+  createLocalWorkspaceRegistry,
+} from "./control-plane-owned-state.js";
 import { ensureWorkspaceGitRepo } from "./workspace-git.js";
+import { createLocalWorkspaceControlPlane } from "./workspace-control-plane.js";
 import {
   createRuntimeClient,
   isTransientRuntimeError as sdkIsTransientRuntimeError,
@@ -2665,8 +2671,11 @@ interface ProactiveIngestItemResultPayload {
   detail?: string | null;
 }
 
+type WorkspaceLocationPayload = "local" | "cloud";
+
 interface WorkspaceRecordPayload {
   id: string;
+  location: WorkspaceLocationPayload;
   name: string;
   status: string;
   harness: string | null;
@@ -2857,6 +2866,7 @@ interface MemoryUpdateProposalListResponsePayload {
 
 interface MemoryUpdateProposalAcceptPayload {
   proposalId: string;
+  workspaceId: string;
   summary?: string | null;
 }
 
@@ -3233,6 +3243,7 @@ interface SessionOutputEventPayload {
 }
 
 interface SessionOutputEventListRequestPayload {
+  workspaceId: string;
   sessionId: string;
   inputId?: string | null;
 }
@@ -3301,6 +3312,18 @@ interface WorkspaceLifecyclePayload {
   phase_label: string;
   phase_detail: string | null;
   blocking_apps: WorkspaceLifecycleBlockingAppPayload[];
+}
+
+interface WorkspaceRuntimeSessionPayload {
+  workspace_id: string;
+  location: WorkspaceLocationPayload;
+  runtime_base_url: string;
+  runtime_auth_token: string | null;
+  workspace_root: string;
+}
+
+interface WorkspaceOpenSessionPayload extends WorkspaceRuntimeSessionPayload {
+  lifecycle: WorkspaceLifecyclePayload;
 }
 
 interface WorkspaceOutputRecordPayload {
@@ -3796,12 +3819,65 @@ function runtimeModelCatalogCachePath() {
   return path.join(runtimeSandboxRoot(), "state", "runtime-model-catalog.json");
 }
 
-function runtimeDatabasePath() {
+function legacyRuntimeDatabasePath() {
   return path.join(runtimeSandboxRoot(), "state", "runtime.db");
+}
+
+function hostStateDatabasePath() {
+  return path.join(runtimeSandboxRoot(), "state", "host-state.db");
+}
+
+function runtimeDatabasePath() {
+  return hostStateDatabasePath();
+}
+
+function controlPlaneDatabasePath() {
+  return path.join(runtimeSandboxRoot(), "state", "control-plane.db");
 }
 
 function runtimeWorkspaceRoot() {
   return path.join(runtimeSandboxRoot(), "workspace");
+}
+
+async function migrateLegacyHostStateDatabaseFiles() {
+  const nextPath = hostStateDatabasePath();
+  const legacyPath = legacyRuntimeDatabasePath();
+  if (nextPath === legacyPath) {
+    return;
+  }
+  try {
+    await fs.access(nextPath);
+    return;
+  } catch {
+    // continue
+  }
+  try {
+    await fs.access(legacyPath);
+  } catch {
+    return;
+  }
+  await fs.mkdir(path.dirname(nextPath), { recursive: true });
+  for (const suffix of ["", "-wal", "-shm"]) {
+    const source = `${legacyPath}${suffix}`;
+    const target = `${nextPath}${suffix}`;
+    try {
+      await fs.access(source);
+    } catch {
+      continue;
+    }
+    try {
+      await fs.access(target);
+      continue;
+    } catch {
+      // continue
+    }
+    try {
+      await fs.rename(source, target);
+    } catch {
+      await fs.copyFile(source, target);
+      await fs.unlink(source);
+    }
+  }
 }
 
 function diagnosticsBundleWorkspaceSegment(
@@ -4053,6 +4129,49 @@ function openRuntimeDiagnosticsDatabase(): Database.Database | null {
   return database;
 }
 
+function openWorkspaceRuntimeDiagnosticsDatabases(): Database.Database[] {
+  const databases: Database.Database[] = [];
+  const seenPaths = new Set<string>();
+  let workspaces: WorkspaceRecordPayload[] = [];
+  try {
+    workspaces = localWorkspaceRegistry.listCachedWorkspaces().items;
+  } catch {
+    return [];
+  }
+  for (const workspace of workspaces) {
+    const workspacePath = workspace.workspace_path?.trim() || "";
+    if (!workspacePath) {
+      continue;
+    }
+    const workspaceRuntimeDbPath = path.join(workspacePath, ".holaboss", "state", "runtime.db");
+    if (!existsSync(workspaceRuntimeDbPath) || seenPaths.has(workspaceRuntimeDbPath)) {
+      continue;
+    }
+    try {
+      const database = new Database(workspaceRuntimeDbPath, {
+        readonly: true,
+        fileMustExist: true,
+      });
+      database.pragma(`busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS}`);
+      databases.push(database);
+      seenPaths.add(workspaceRuntimeDbPath);
+    } catch {
+      // Ignore unhealthy or missing workspace-local runtime DBs in diagnostics snapshots.
+    }
+  }
+  return databases;
+}
+
+function closeRuntimeDatabases(databases: Database.Database[]) {
+  for (const database of databases) {
+    try {
+      database.close();
+    } catch {
+      // Ignore close errors while collecting diagnostics.
+    }
+  }
+}
+
 function readDesktopRuntimeDiagnosticsSnapshot(): Record<string, unknown> {
   const snapshot: Record<string, unknown> = {
     captured_at: utcNowIso(),
@@ -4071,7 +4190,7 @@ function readDesktopRuntimeDiagnosticsSnapshot(): Record<string, unknown> {
     runtime_status: runtimeStatus,
     persisted_runtime_process: readPersistedRuntimeProcessState(),
     files: {
-      runtime_db: runtimeSentryFileMetadata(runtimeDatabasePath()),
+      host_state_db: runtimeSentryFileMetadata(runtimeDatabasePath()),
       runtime_log: runtimeSentryFileMetadata(runtimeLogsPath()),
       runtime_config: runtimeSentryFileMetadata(runtimeConfigPath()),
     },
@@ -4082,26 +4201,76 @@ function readDesktopRuntimeDiagnosticsSnapshot(): Record<string, unknown> {
     return redactDesktopSentryValue(snapshot) as Record<string, unknown>;
   }
 
+  const workspaceDatabases = openWorkspaceRuntimeDiagnosticsDatabases();
   try {
-    const readCount = (sql: string): number => {
-      const row = database.prepare(sql).get() as { count?: number } | undefined;
-      return Number(row?.count ?? 0);
-    };
+    const workspaceTerminalSessions = workspaceDatabases.flatMap((workspaceDatabase) =>
+      workspaceDatabase.prepare(`
+        SELECT terminal_id, workspace_id, session_id, input_id, owner, status, title, command, last_activity_at, created_at
+        FROM terminal_sessions
+      `).all() as Array<Record<string, unknown>>
+    );
+    workspaceTerminalSessions.sort((left, right) => {
+      const activityCompare = String(right.last_activity_at ?? "").localeCompare(String(left.last_activity_at ?? ""));
+      if (activityCompare !== 0) {
+        return activityCompare;
+      }
+      const createdCompare = String(right.created_at ?? "").localeCompare(String(left.created_at ?? ""));
+      if (createdCompare !== 0) {
+        return createdCompare;
+      }
+      return String(right.terminal_id ?? "").localeCompare(String(left.terminal_id ?? ""));
+    });
+    const activeTerminalSessionCount = workspaceTerminalSessions.filter((row) =>
+      ["starting", "running"].includes(String(row.status ?? ""))
+    ).length;
+
+    const workspaceAppBuilds = workspaceDatabases.flatMap((workspaceDatabase) =>
+      workspaceDatabase.prepare(`
+        SELECT workspace_id, app_id, status, error, updated_at
+        FROM app_builds
+        WHERE status IN ('running', 'failed')
+      `).all() as Array<Record<string, unknown>>
+    );
+    workspaceAppBuilds.sort((left, right) =>
+      String(right.updated_at ?? "").localeCompare(String(left.updated_at ?? ""))
+    );
+
+    const workspaceRuntimeStateRows = workspaceDatabases.flatMap((workspaceDatabase) =>
+      workspaceDatabase.prepare(`
+        SELECT workspace_id, session_id, status, current_input_id, updated_at
+        FROM session_runtime_state
+      `).all() as Array<Record<string, unknown>>
+    );
+    workspaceRuntimeStateRows.sort((left, right) => {
+      const updatedCompare = String(right.updated_at ?? "").localeCompare(String(left.updated_at ?? ""));
+      if (updatedCompare !== 0) {
+        return updatedCompare;
+      }
+      const sessionCompare = String(right.session_id ?? "").localeCompare(String(left.session_id ?? ""));
+      if (sessionCompare !== 0) {
+        return sessionCompare;
+      }
+      return String(right.workspace_id ?? "").localeCompare(String(left.workspace_id ?? ""));
+    });
+    const activeSessionCount = workspaceRuntimeStateRows.filter((row) => {
+      const status = String(row.status ?? "");
+      return status === "BUSY" || status === "QUEUED" || row.current_input_id != null;
+    }).length;
+    const queuedInputCount = workspaceDatabases.reduce((total, workspaceDatabase) => {
+      const row = workspaceDatabase
+        .prepare(
+          "SELECT COUNT(*) AS count FROM agent_session_inputs WHERE status IN ('queued', 'claimed')",
+        )
+        .get() as { count?: number } | undefined;
+      return total + Number(row?.count ?? 0);
+    }, 0);
 
     snapshot.database = {
       counts: {
-        active_sessions: readCount(
-          "SELECT COUNT(*) AS count FROM session_runtime_state WHERE status IN ('BUSY', 'QUEUED') OR current_input_id IS NOT NULL",
-        ),
-        active_terminal_sessions: readCount(
-          "SELECT COUNT(*) AS count FROM terminal_sessions WHERE status IN ('starting', 'running')",
-        ),
-        failed_app_builds: readCount(
-          "SELECT COUNT(*) AS count FROM app_builds WHERE status IN ('failed', 'running')",
-        ),
-        queued_inputs: readCount(
-          "SELECT COUNT(*) AS count FROM agent_session_inputs WHERE status IN ('queued', 'claimed')",
-        ),
+        active_sessions: activeSessionCount,
+        active_terminal_sessions: activeTerminalSessionCount,
+        failed_app_builds: workspaceAppBuilds.length,
+        queued_inputs: queuedInputCount,
       },
       recent_event_log: database.prepare(`
         SELECT category, event, outcome, detail, created_at
@@ -4109,31 +4278,16 @@ function readDesktopRuntimeDiagnosticsSnapshot(): Record<string, unknown> {
         ORDER BY created_at DESC
         LIMIT ?
       `).all(SENTRY_RECENT_EVENT_LIMIT),
-      session_runtime_state: database.prepare(`
-        SELECT workspace_id, session_id, status, current_input_id, updated_at
-        FROM session_runtime_state
-        ORDER BY updated_at DESC
-        LIMIT ?
-      `).all(SENTRY_RECENT_STATE_LIMIT),
-      terminal_sessions: database.prepare(`
-        SELECT terminal_id, workspace_id, session_id, input_id, owner, status, title, command, last_activity_at
-        FROM terminal_sessions
-        ORDER BY last_activity_at DESC
-        LIMIT ?
-      `).all(SENTRY_RECENT_STATE_LIMIT),
-      app_builds: database.prepare(`
-        SELECT workspace_id, app_id, status, error, updated_at
-        FROM app_builds
-        WHERE status IN ('running', 'failed')
-        ORDER BY updated_at DESC
-        LIMIT ?
-      `).all(SENTRY_RECENT_STATE_LIMIT),
+      session_runtime_state: workspaceRuntimeStateRows.slice(0, SENTRY_RECENT_STATE_LIMIT),
+      terminal_sessions: workspaceTerminalSessions.slice(0, SENTRY_RECENT_STATE_LIMIT),
+      app_builds: workspaceAppBuilds.slice(0, SENTRY_RECENT_STATE_LIMIT),
     };
   } catch (error) {
     snapshot.database = {
       error: error instanceof Error ? error.message : String(error),
     };
   } finally {
+    closeRuntimeDatabases(workspaceDatabases);
     database.close();
   }
 
@@ -4438,6 +4592,7 @@ function migrateRuntimeProcessStateTable(database: Database.Database) {
 
 async function bootstrapRuntimeDatabase() {
   await fs.mkdir(path.dirname(runtimeDatabasePath()), { recursive: true });
+  await migrateLegacyHostStateDatabaseFiles();
 
   const database = openRuntimeDatabase();
   try {
@@ -4459,23 +4614,6 @@ async function bootstrapRuntimeDatabase() {
         updated_at TEXT NOT NULL
       );
 
-      CREATE TABLE IF NOT EXISTS agent_runtime_sessions (
-        workspace_id TEXT NOT NULL,
-        session_id TEXT NOT NULL,
-        harness TEXT NOT NULL,
-        harness_session_id TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        PRIMARY KEY (workspace_id, session_id),
-        UNIQUE (workspace_id, harness, harness_session_id)
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_agent_runtime_sessions_workspace_updated
-        ON agent_runtime_sessions (workspace_id, updated_at DESC);
-
-      CREATE INDEX IF NOT EXISTS idx_agent_runtime_sessions_workspace_harness_session
-        ON agent_runtime_sessions (workspace_id, harness_session_id);
-
       CREATE TABLE IF NOT EXISTS workspaces (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -4495,86 +4633,6 @@ async function bootstrapRuntimeDatabase() {
 
       CREATE INDEX IF NOT EXISTS idx_workspaces_updated
         ON workspaces (updated_at DESC);
-
-      CREATE TABLE IF NOT EXISTS agent_session_inputs (
-        input_id TEXT PRIMARY KEY,
-        session_id TEXT NOT NULL,
-        workspace_id TEXT NOT NULL,
-        payload TEXT NOT NULL,
-        status TEXT NOT NULL,
-        priority INTEGER NOT NULL DEFAULT 0,
-        available_at TEXT NOT NULL,
-        attempt INTEGER NOT NULL DEFAULT 0,
-        idempotency_key TEXT,
-        claimed_by TEXT,
-        claimed_until TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_agent_session_inputs_workspace_created
-        ON agent_session_inputs (workspace_id, created_at DESC);
-
-      CREATE INDEX IF NOT EXISTS idx_agent_session_inputs_session_status
-        ON agent_session_inputs (session_id, status, available_at);
-
-      CREATE TABLE IF NOT EXISTS session_runtime_state (
-        workspace_id TEXT NOT NULL,
-        session_id TEXT NOT NULL,
-        status TEXT NOT NULL CHECK (status IN ('IDLE', 'BUSY', 'WAITING_USER', 'ERROR', 'QUEUED')),
-        current_input_id TEXT,
-        current_worker_id TEXT,
-        lease_until TEXT,
-        heartbeat_at TEXT,
-        last_error TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        PRIMARY KEY (workspace_id, session_id)
-      );
-
-      CREATE INDEX IF NOT EXISTS session_runtime_state_status_idx
-        ON session_runtime_state (status, lease_until);
-
-      CREATE INDEX IF NOT EXISTS session_runtime_state_session_id_idx
-        ON session_runtime_state (session_id);
-
-      CREATE INDEX IF NOT EXISTS session_runtime_state_workspace_session_idx
-        ON session_runtime_state (workspace_id, session_id);
-
-      CREATE TABLE IF NOT EXISTS sandbox_run_tokens (
-        token TEXT PRIMARY KEY,
-        run_id TEXT NOT NULL UNIQUE,
-        holaboss_user_id TEXT NOT NULL,
-        workspace_id TEXT NOT NULL,
-        session_id TEXT NOT NULL,
-        input_id TEXT NOT NULL,
-        scopes TEXT NOT NULL DEFAULT '[]',
-        expires_at TEXT NOT NULL,
-        revoked_at TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-
-      CREATE INDEX IF NOT EXISTS sandbox_run_tokens_run_id_idx
-        ON sandbox_run_tokens (run_id);
-
-      CREATE INDEX IF NOT EXISTS sandbox_run_tokens_expires_at_idx
-        ON sandbox_run_tokens (expires_at);
-
-      CREATE INDEX IF NOT EXISTS sandbox_run_tokens_revoked_at_idx
-        ON sandbox_run_tokens (revoked_at);
-
-      CREATE TABLE IF NOT EXISTS session_messages (
-        id TEXT PRIMARY KEY,
-        workspace_id TEXT NOT NULL,
-        session_id TEXT NOT NULL,
-        role TEXT NOT NULL,
-        text TEXT NOT NULL,
-        created_at TEXT NOT NULL
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_session_messages_workspace_session_created
-        ON session_messages (workspace_id, session_id, created_at ASC);
 
       CREATE TABLE IF NOT EXISTS runtime_process_state (
         process_key TEXT PRIMARY KEY,
@@ -4659,6 +4717,14 @@ async function bootstrapRuntimeDatabase() {
   } finally {
     database.close();
   }
+}
+
+function bootstrapControlPlaneDatabase() {
+  bootstrapLocalControlPlaneDatabase({
+    controlPlaneDatabasePath: controlPlaneDatabasePath,
+    runtimeDatabasePath: runtimeDatabasePath,
+    workspaceRoot: runtimeWorkspaceRoot,
+  });
 }
 
 // `persistRuntimeProcessState` is invoked from ~13 sites and fires every
@@ -7134,10 +7200,10 @@ function listRuntimeRestartBlockingSessions(): Array<{
   status: string;
   currentInputId: string | null;
 }> {
-  const database = openRuntimeDatabase();
+  const databases = openWorkspaceRuntimeDiagnosticsDatabases();
   try {
-    const rows = database
-      .prepare(
+    const rows = databases.flatMap((database) =>
+      database.prepare(
         `
         SELECT
           workspace_id,
@@ -7147,15 +7213,13 @@ function listRuntimeRestartBlockingSessions(): Array<{
         FROM session_runtime_state
         WHERE status IN ('BUSY', 'QUEUED')
            OR current_input_id IS NOT NULL
-        ORDER BY updated_at DESC
       `,
-      )
-      .all() as Array<{
+      ).all() as Array<{
       workspace_id: string;
       session_id: string;
       status: string;
       current_input_id: string | null;
-    }>;
+    }>);
     return rows
       .map((row) => ({
         workspaceId: row.workspace_id.trim(),
@@ -7169,7 +7233,7 @@ function listRuntimeRestartBlockingSessions(): Array<{
       }))
       .filter((row) => row.workspaceId && row.sessionId);
   } finally {
-    database.close();
+    closeRuntimeDatabases(databases);
   }
 }
 
@@ -7698,62 +7762,6 @@ function ensureOpenAiCodexRefreshLoop(): void {
   codexOauthRefreshTimer.unref();
 }
 
-function runtimeUserProfileNameSourceFromApi(
-  value: unknown,
-): RuntimeUserProfileNameSource | null {
-  const normalized = typeof value === "string" ? value.trim() : "";
-  if (normalized === "manual" || normalized === "agent") {
-    return normalized;
-  }
-  if (normalized === "auth_fallback") {
-    return "authFallback";
-  }
-  return null;
-}
-
-function runtimeUserProfileNameSourceToApi(
-  value: RuntimeUserProfileNameSource | null | undefined,
-): string | null | undefined {
-  if (value === undefined) {
-    return undefined;
-  }
-  if (value === null) {
-    return null;
-  }
-  if (value === "authFallback") {
-    return "auth_fallback";
-  }
-  return value;
-}
-
-function runtimeUserProfilePayloadFromApi(
-  value: unknown,
-): RuntimeUserProfilePayload {
-  const record =
-    value && typeof value === "object" && !Array.isArray(value)
-      ? (value as Record<string, unknown>)
-      : {};
-  return {
-    profileId:
-      typeof record.profile_id === "string" && record.profile_id.trim()
-        ? record.profile_id
-        : "default",
-    name:
-      typeof record.name === "string" && record.name.trim()
-        ? record.name
-        : null,
-    nameSource: runtimeUserProfileNameSourceFromApi(record.name_source),
-    createdAt:
-      typeof record.created_at === "string" && record.created_at.trim()
-        ? record.created_at
-        : null,
-    updatedAt:
-      typeof record.updated_at === "string" && record.updated_at.trim()
-        ? record.updated_at
-        : null,
-  };
-}
-
 async function runtimeApiRequest<T>(
   pathname: string,
   init: RequestInit = {},
@@ -7775,54 +7783,25 @@ async function runtimeApiRequest<T>(
   return (await response.json()) as T;
 }
 
+const localRuntimeUserProfileStore = createLocalRuntimeUserProfileStore({
+  controlPlaneDatabasePath: controlPlaneDatabasePath,
+});
+
 async function getRuntimeUserProfile(): Promise<RuntimeUserProfilePayload> {
-  const payload = await runtimeApiRequest<unknown>("/api/v1/runtime/profile", {
-    method: "GET",
-  });
-  return runtimeUserProfilePayloadFromApi(payload);
+  return localRuntimeUserProfileStore.getProfile();
 }
 
 async function setRuntimeUserProfile(
   payload: RuntimeUserProfileUpdatePayload,
 ): Promise<RuntimeUserProfilePayload> {
-  const body: Record<string, unknown> = {};
-  if (typeof payload.profileId === "string" && payload.profileId.trim()) {
-    body.profile_id = payload.profileId.trim();
-  }
-  if (payload.name !== undefined) {
-    body.name = payload.name;
-  }
-  if (payload.nameSource !== undefined) {
-    body.name_source = runtimeUserProfileNameSourceToApi(payload.nameSource);
-  }
-  const response = await runtimeApiRequest<unknown>("/api/v1/runtime/profile", {
-    method: "PUT",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
-  return runtimeUserProfilePayloadFromApi(response);
+  return localRuntimeUserProfileStore.setProfile(payload);
 }
 
 async function applyRuntimeUserProfileAuthFallback(
   name: string,
   profileId = "default",
 ): Promise<RuntimeUserProfilePayload> {
-  const response = await runtimeApiRequest<unknown>(
-    "/api/v1/runtime/profile/auth-fallback",
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        profile_id: profileId,
-        name,
-      }),
-    },
-  );
-  return runtimeUserProfilePayloadFromApi(response);
+  return localRuntimeUserProfileStore.applyAuthFallback(name, profileId);
 }
 
 async function syncRuntimeUserProfileFromAuth(
@@ -9518,9 +9497,10 @@ async function acceptMemoryUpdateProposal(
 }
 
 async function dismissMemoryUpdateProposal(
+  workspaceId: string,
   proposalId: string,
 ): Promise<MemoryUpdateProposalDismissResponsePayload> {
-  return runtimeClient.memory.dismissUpdateProposal(proposalId);
+  return runtimeClient.memory.dismissUpdateProposal(workspaceId, proposalId);
 }
 
 async function getProactiveStatus(
@@ -9551,19 +9531,30 @@ async function getProactiveStatus(
 
   let proposalCount = 0;
   let heartbeat = fallbackHeartbeat;
-  const database = openRuntimeDatabase();
-  try {
-    const proposalRow = database
-      .prepare(
-        `
+  const workspacePath = getWorkspaceRecord(normalizedWorkspaceId)?.workspace_path?.trim() || "";
+  const workspaceRuntimeDbPath = workspacePath
+    ? path.join(workspacePath, ".holaboss", "state", "runtime.db")
+    : "";
+  if (workspaceRuntimeDbPath && existsSync(workspaceRuntimeDbPath)) {
+    const workspaceDatabase = new Database(workspaceRuntimeDbPath, { readonly: true });
+    try {
+      const proposalRow = workspaceDatabase
+        .prepare(
+          `
           SELECT COUNT(*) AS proposal_count
           FROM task_proposals
           WHERE workspace_id = ?
         `,
-      )
-      .get(normalizedWorkspaceId) as { proposal_count?: number } | undefined;
-    proposalCount = Number(proposalRow?.proposal_count ?? 0);
+        )
+        .get(normalizedWorkspaceId) as { proposal_count?: number } | undefined;
+      proposalCount = Number(proposalRow?.proposal_count ?? 0);
+    } finally {
+      workspaceDatabase.close();
+    }
+  }
 
+  const database = openRuntimeDatabase();
+  try {
     const correlationId = `workspace-ready-${normalizedWorkspaceId}`;
     const heartbeatRow = database
       .prepare(
@@ -9715,9 +9706,10 @@ async function listCronjobs(
 }
 
 async function runCronjobNow(
+  workspaceId: string,
   jobId: string,
 ): Promise<CronjobRunResponsePayload> {
-  return runtimeClient.cronjobs.runNow(jobId);
+  return runtimeClient.cronjobs.runNow(workspaceId, jobId);
 }
 
 async function createCronjob(
@@ -9727,14 +9719,18 @@ async function createCronjob(
 }
 
 async function updateCronjob(
+  workspaceId: string,
   jobId: string,
   payload: CronjobUpdatePayload,
 ): Promise<CronjobRecordPayload> {
-  return runtimeClient.cronjobs.update(jobId, payload);
+  return runtimeClient.cronjobs.update(workspaceId, jobId, payload);
 }
 
-async function deleteCronjob(jobId: string): Promise<{ success: boolean }> {
-  return runtimeClient.cronjobs.delete(jobId);
+async function deleteCronjob(
+  workspaceId: string,
+  jobId: string,
+): Promise<{ success: boolean }> {
+  return runtimeClient.cronjobs.delete(workspaceId, jobId);
 }
 
 const runtimeNotificationListCache = new Map<
@@ -9806,10 +9802,12 @@ async function listNotifications(
 }
 
 async function updateNotification(
+  workspaceId: string,
   notificationId: string,
   payload: RuntimeNotificationUpdatePayload,
 ): Promise<RuntimeNotificationRecordPayload> {
   const response = await runtimeClient.notifications.update(
+    workspaceId,
     notificationId,
     payload,
   );
@@ -11051,10 +11049,11 @@ async function setProactiveHeartbeatWorkspaceEnabled(
 }
 
 async function updateTaskProposalState(
+  workspaceId: string,
   proposalId: string,
   state: string,
 ): Promise<TaskProposalStateUpdatePayload> {
-  return runtimeClient.taskProposals.updateState(proposalId, state);
+  return runtimeClient.taskProposals.updateState(workspaceId, proposalId, state);
 }
 
 const LOCAL_TEMPLATE_IGNORE_NAMES = new Set([
@@ -11861,23 +11860,26 @@ async function requestRuntimeJsonViaHttp<T>(
   method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE",
   payload?: unknown,
   timeoutMs = 15000,
+  extraHeaders?: Record<string, string>,
 ): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const serializedPayload =
       payload === undefined ? null : JSON.stringify(payload);
+    const headers =
+      serializedPayload === null
+        ? extraHeaders
+        : {
+            ...(extraHeaders ?? {}),
+            "Content-Type": "application/json",
+            "Content-Length": String(Buffer.byteLength(serializedPayload)),
+          };
     const request = httpRequest(
       {
         hostname: targetUrl.hostname,
         port: targetUrl.port || "80",
         path: `${targetUrl.pathname}${targetUrl.search}`,
         method,
-        headers:
-          serializedPayload === null
-            ? undefined
-            : {
-                "Content-Type": "application/json",
-                "Content-Length": Buffer.byteLength(serializedPayload),
-              },
+        headers,
         timeout: timeoutMs,
       },
       (response) => {
@@ -12029,6 +12031,172 @@ function forgetWorkspaceDir(workspaceId: string): void {
   } catch {
     // Ignore unsafe ids — they have no cache entry.
   }
+}
+
+const workspaceRuntimeSessionCache = new Map<
+  string,
+  WorkspaceRuntimeSessionPayload
+>();
+
+function localWorkspaceLocation(): WorkspaceLocationPayload {
+  return "local";
+}
+
+function withWorkspaceLocation(
+  workspace:
+    | Omit<WorkspaceRecordPayload, "location">
+    | WorkspaceRecordPayload
+    | null
+    | undefined,
+): WorkspaceRecordPayload | null {
+  if (!workspace) {
+    return null;
+  }
+  return {
+    ...workspace,
+    location: localWorkspaceLocation(),
+  };
+}
+
+function withWorkspaceResponseLocation(
+  response: Omit<WorkspaceResponsePayload, "workspace"> & {
+    workspace: Omit<WorkspaceRecordPayload, "location"> | WorkspaceRecordPayload;
+  },
+): WorkspaceResponsePayload {
+  return {
+    ...response,
+    workspace: withWorkspaceLocation(response.workspace)!,
+  };
+}
+
+function withWorkspaceListLocation(
+  response: Omit<WorkspaceListResponsePayload, "items"> & {
+    items: Array<Omit<WorkspaceRecordPayload, "location"> | WorkspaceRecordPayload>;
+  },
+): WorkspaceListResponsePayload {
+  return {
+    ...response,
+    items: response.items
+      .map((item) => withWorkspaceLocation(item))
+      .filter((item): item is WorkspaceRecordPayload => item !== null),
+  };
+}
+
+function withWorkspaceLifecycleLocation(
+  lifecycle: WorkspaceLifecyclePayload,
+): WorkspaceLifecyclePayload {
+  return {
+    ...lifecycle,
+    workspace: withWorkspaceLocation(lifecycle.workspace)!,
+  };
+}
+
+function cacheWorkspaceRuntimeSession(
+  session: WorkspaceRuntimeSessionPayload,
+): WorkspaceRuntimeSessionPayload {
+  const normalized: WorkspaceRuntimeSessionPayload = {
+    ...session,
+    workspace_id: assertSafeWorkspaceId(session.workspace_id),
+    workspace_root: path.resolve(session.workspace_root),
+  };
+  workspaceRuntimeSessionCache.set(normalized.workspace_id, normalized);
+  return normalized;
+}
+
+function forgetWorkspaceRuntimeSession(workspaceId: string): void {
+  try {
+    workspaceRuntimeSessionCache.delete(assertSafeWorkspaceId(workspaceId));
+  } catch {
+    // Ignore unsafe ids — they have no cache entry.
+  }
+}
+
+function workspaceRuntimeSessionHeaders(
+  session: WorkspaceRuntimeSessionPayload,
+): Record<string, string> | undefined {
+  const authToken = (session.runtime_auth_token ?? "").trim();
+  return authToken ? { "X-API-Key": authToken } : undefined;
+}
+
+async function buildWorkspaceRuntimeSession(
+  workspaceId: string,
+): Promise<WorkspaceRuntimeSessionPayload> {
+  const safeWorkspaceId = assertSafeWorkspaceId(workspaceId);
+  const status = await ensureRuntimeReady();
+  return {
+    workspace_id: safeWorkspaceId,
+    location: localWorkspaceLocation(),
+    runtime_base_url: status.url ?? runtimeBaseUrl(),
+    runtime_auth_token: null,
+    workspace_root: path.resolve(await resolveWorkspaceDir(safeWorkspaceId)),
+  };
+}
+
+async function resolveWorkspaceRuntimeSession(
+  workspaceId: string,
+  options: { refresh?: boolean } = {},
+): Promise<WorkspaceRuntimeSessionPayload> {
+  const safeWorkspaceId = assertSafeWorkspaceId(workspaceId);
+  if (!options.refresh) {
+    const cached = workspaceRuntimeSessionCache.get(safeWorkspaceId);
+    if (cached) {
+      return cached;
+    }
+  }
+  return cacheWorkspaceRuntimeSession(
+    await buildWorkspaceRuntimeSession(safeWorkspaceId),
+  );
+}
+
+async function requestWorkspaceRuntimeJson<T>(
+  workspaceId: string,
+  {
+    method,
+    path: requestPath,
+    payload,
+    params,
+    timeoutMs,
+    retryTransientErrors = false,
+  }: {
+    method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+    path: string;
+    payload?: unknown;
+    params?: Record<string, string | number | boolean | null | undefined>;
+    timeoutMs?: number;
+    retryTransientErrors?: boolean;
+  },
+): Promise<T> {
+  const safeWorkspaceId = assertSafeWorkspaceId(workspaceId);
+  const attempts = method === "GET" || retryTransientErrors ? 3 : 1;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      const session = await resolveWorkspaceRuntimeSession(safeWorkspaceId, {
+        refresh: attempt > 1,
+      });
+      const url = new URL(`${session.runtime_base_url}${requestPath}`);
+      if (params) {
+        for (const [key, value] of Object.entries(params)) {
+          if (value === undefined || value === null || value === "") {
+            continue;
+          }
+          url.searchParams.set(key, String(value));
+        }
+      }
+      return requestRuntimeJsonViaHttp<T>(
+        url,
+        method,
+        payload,
+        timeoutMs,
+        workspaceRuntimeSessionHeaders(session),
+      );
+    } catch (error) {
+      if (attempt < attempts && isTransientRuntimeError(error)) {
+        continue;
+      }
+      throw error;
+    }
+  }
+  throw new Error("Workspace runtime request failed after retries.");
 }
 
 async function resolveWorkspaceDir(workspaceId: string): Promise<string> {
@@ -12419,102 +12587,6 @@ async function stageSessionAttachmentPaths(
   return { attachments };
 }
 
-function insertSessionMessage(message: {
-  id: string;
-  workspaceId: string;
-  sessionId: string;
-  role: string;
-  text: string;
-  createdAt?: string;
-}) {
-  const database = openRuntimeDatabase();
-  try {
-    database
-      .prepare(
-        `
-        INSERT OR REPLACE INTO session_messages (
-          id, workspace_id, session_id, role, text, created_at
-        ) VALUES (
-          @id, @workspace_id, @session_id, @role, @text, @created_at
-        )
-      `,
-      )
-      .run({
-        id: message.id,
-        workspace_id: message.workspaceId,
-        session_id: message.sessionId,
-        role: message.role,
-        text: message.text,
-        created_at: message.createdAt ?? utcNowIso(),
-      });
-  } finally {
-    database.close();
-  }
-}
-
-function upsertRuntimeState(record: {
-  workspaceId: string;
-  sessionId: string;
-  status: "IDLE" | "BUSY" | "WAITING_USER" | "ERROR" | "QUEUED";
-  currentInputId?: string | null;
-  lastError?: Record<string, unknown> | string | null;
-}) {
-  const now = utcNowIso();
-  const database = openRuntimeDatabase();
-  try {
-    database
-      .prepare(
-        `
-        INSERT INTO session_runtime_state (
-          workspace_id,
-          session_id,
-          status,
-          current_input_id,
-          current_worker_id,
-          lease_until,
-          heartbeat_at,
-          last_error,
-          created_at,
-          updated_at
-        ) VALUES (
-          @workspace_id,
-          @session_id,
-          @status,
-          @current_input_id,
-          NULL,
-          NULL,
-          NULL,
-          @last_error,
-          @created_at,
-          @updated_at
-        )
-        ON CONFLICT(workspace_id, session_id) DO UPDATE SET
-          status = excluded.status,
-          current_input_id = excluded.current_input_id,
-          heartbeat_at = excluded.heartbeat_at,
-          last_error = excluded.last_error,
-          updated_at = excluded.updated_at
-      `,
-      )
-      .run({
-        workspace_id: record.workspaceId,
-        session_id: record.sessionId,
-        status: record.status,
-        current_input_id: record.currentInputId ?? null,
-        last_error:
-          typeof record.lastError === "string"
-            ? record.lastError
-            : record.lastError
-              ? JSON.stringify(record.lastError)
-              : null,
-        created_at: now,
-        updated_at: now,
-      });
-  } finally {
-    database.close();
-  }
-}
-
 function cloneRuntimeStateRecord(
   record: SessionRuntimeRecordPayload,
 ): SessionRuntimeRecordPayload {
@@ -12728,59 +12800,15 @@ function runtimeRecordEffectiveStatus(
     || "";
 }
 
-function updateQueuedInputStatus(inputId: string, status: string) {
-  const database = openRuntimeDatabase();
-  try {
-    database
-      .prepare(
-        `
-        UPDATE agent_session_inputs
-        SET status = @status, updated_at = @updated_at
-        WHERE input_id = @input_id
-      `,
-      )
-      .run({
-        input_id: inputId,
-        status,
-        updated_at: utcNowIso(),
-      });
-  } finally {
-    database.close();
-  }
-}
-
-const getWorkspaceRecordStatement = cacheRuntimeStatement(`
-  SELECT
-    id,
-    name,
-    status,
-    harness,
-    error_message,
-    onboarding_status,
-    onboarding_session_id,
-    onboarding_completed_at,
-    onboarding_completion_summary,
-    onboarding_requested_at,
-    onboarding_requested_by,
-    created_at,
-    updated_at,
-    deleted_at_utc
-  FROM workspaces
-  WHERE id = @id
-`);
+const localWorkspaceRegistry = createLocalWorkspaceRegistry({
+  controlPlaneDatabasePath: controlPlaneDatabasePath,
+  location: localWorkspaceLocation(),
+});
 
 function getWorkspaceRecord(
   workspaceId: string,
 ): WorkspaceRecordPayload | null {
-  try {
-    const row = getWorkspaceRecordStatement.get().get({ id: workspaceId }) as
-      | WorkspaceRecordPayload
-      | undefined;
-    return row ?? null;
-  } catch {
-    getWorkspaceRecordStatement.invalidate();
-    return null;
-  }
+  return localWorkspaceRegistry.getWorkspaceRecord(workspaceId);
 }
 
 async function listWorkspaces(): Promise<WorkspaceListResponsePayload> {
@@ -12789,12 +12817,9 @@ async function listWorkspaces(): Promise<WorkspaceListResponsePayload> {
 }
 
 /**
- * Read the workspaces table directly from runtime.db without going
- * through the sidecar. Used to hydrate the splash before the sidecar
- * finishes spawning + schema-ensure. The desktop and runtime share
- * runtime.db; the schema converges after the sidecar runs once on a
- * given machine, but we tolerate a missing `workspace_path` column on
- * the very first launch by reading PRAGMA table_info first.
+ * Read the cached workspace registry directly from control-plane.db
+ * without going through the sidecar. Used to hydrate the splash before
+ * the sidecar finishes spawning + schema-ensure.
  *
  * Synchronous + fast (5-15ms) — better-sqlite3 with WAL allows this
  * read while the sidecar is still booting in another process.
@@ -12803,99 +12828,7 @@ async function listWorkspaces(): Promise<WorkspaceListResponsePayload> {
  * silently falls back to the sidecar path.
  */
 function listWorkspacesFromLocalDb(): WorkspaceListResponsePayload {
-  const empty: WorkspaceListResponsePayload = {
-    items: [],
-    total: 0,
-    limit: 100,
-    offset: 0,
-  };
-  let database: Database.Database | null = null;
-  try {
-    database = new Database(runtimeDatabasePath(), { readonly: true });
-    const tableExists = database
-      .prepare(
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'workspaces' LIMIT 1",
-      )
-      .get();
-    if (!tableExists) {
-      return empty;
-    }
-    const columns = new Set<string>(
-      (
-        database.prepare("PRAGMA table_info(workspaces)").all() as Array<{
-          name: string;
-        }>
-      ).map((row) => row.name),
-    );
-    const hasWorkspacePath = columns.has("workspace_path");
-    const select = hasWorkspacePath
-      ? `SELECT id, name, status, harness, error_message,
-                onboarding_status, onboarding_session_id,
-                onboarding_completed_at, onboarding_completion_summary,
-                onboarding_requested_at, onboarding_requested_by,
-                created_at, updated_at, deleted_at_utc, workspace_path
-         FROM workspaces
-         WHERE deleted_at_utc IS NULL
-         ORDER BY datetime(updated_at) DESC, datetime(created_at) DESC
-         LIMIT 100`
-      : `SELECT id, name, status, harness, error_message,
-                onboarding_status, onboarding_session_id,
-                onboarding_completed_at, onboarding_completion_summary,
-                onboarding_requested_at, onboarding_requested_by,
-                created_at, updated_at, deleted_at_utc
-         FROM workspaces
-         WHERE deleted_at_utc IS NULL
-         ORDER BY datetime(updated_at) DESC, datetime(created_at) DESC
-         LIMIT 100`;
-    const rows = database.prepare(select).all() as Array<
-      Record<string, unknown>
-    >;
-    const items: WorkspaceRecordPayload[] = rows.map((row) => ({
-      id: String(row.id ?? ""),
-      name: String(row.name ?? ""),
-      status: String(row.status ?? "unknown"),
-      harness: row.harness == null ? null : String(row.harness),
-      error_message: row.error_message == null ? null : String(row.error_message),
-      onboarding_status: String(row.onboarding_status ?? "complete"),
-      onboarding_session_id:
-        row.onboarding_session_id == null
-          ? null
-          : String(row.onboarding_session_id),
-      onboarding_completed_at:
-        row.onboarding_completed_at == null
-          ? null
-          : String(row.onboarding_completed_at),
-      onboarding_completion_summary:
-        row.onboarding_completion_summary == null
-          ? null
-          : String(row.onboarding_completion_summary),
-      onboarding_requested_at:
-        row.onboarding_requested_at == null
-          ? null
-          : String(row.onboarding_requested_at),
-      onboarding_requested_by:
-        row.onboarding_requested_by == null
-          ? null
-          : String(row.onboarding_requested_by),
-      created_at: row.created_at == null ? null : String(row.created_at),
-      updated_at: row.updated_at == null ? null : String(row.updated_at),
-      deleted_at_utc:
-        row.deleted_at_utc == null ? null : String(row.deleted_at_utc),
-      workspace_path:
-        hasWorkspacePath && row.workspace_path != null
-          ? String(row.workspace_path)
-          : null,
-    }));
-    return { items, total: items.length, limit: 100, offset: 0 };
-  } catch {
-    return empty;
-  } finally {
-    try {
-      database?.close();
-    } catch {
-      // ignore
-    }
-  }
+  return localWorkspaceRegistry.listCachedWorkspaces();
 }
 
 async function listWorkspacesViaRuntime(): Promise<WorkspaceListResponsePayload> {
@@ -12910,7 +12843,7 @@ async function listWorkspacesViaRuntime(): Promise<WorkspaceListResponsePayload>
     forgetWorkspaceDir(item.id);
     rememberWorkspaceDir(item.id, item.workspace_path);
   }
-  return response;
+  return withWorkspaceListLocation(response);
 }
 
 const STATIC_APP_CATALOG: Record<
@@ -13312,7 +13245,7 @@ async function runDashboardQuery(params: {
     return { ok: false, error: "Query is empty." };
   }
   const workspaceDir = await resolveWorkspaceDir(workspaceId);
-  const dbPath = path.join(workspaceDir, ".holaboss", "data.db");
+  const dbPath = path.join(workspaceDir, ".holaboss", "state", "data.db");
   if (!existsSync(dbPath)) {
     return {
       ok: false,
@@ -13359,7 +13292,16 @@ async function listInstalledApps(
 async function listInstalledAppsViaRuntime(
   workspaceId: string,
 ): Promise<InstalledWorkspaceAppListResponsePayload> {
-  return runtimeClient.apps.listInstalled(workspaceId);
+  return requestWorkspaceRuntimeJson<InstalledWorkspaceAppListResponsePayload>(
+    workspaceId,
+    {
+      method: "GET",
+      path: "/api/v1/apps",
+      params: {
+        workspace_id: workspaceId,
+      },
+    },
+  );
 }
 
 async function removeInstalledApp(
@@ -13368,7 +13310,14 @@ async function removeInstalledApp(
 ): Promise<void> {
   const safeWorkspaceId = assertSafeWorkspaceId(workspaceId);
   const safeAppId = assertSafeAppId(appId);
-  await runtimeClient.apps.remove(safeWorkspaceId, safeAppId);
+  await requestWorkspaceRuntimeJson<Record<string, unknown>>(safeWorkspaceId, {
+    method: "DELETE",
+    path: `/api/v1/apps/${encodeURIComponent(safeAppId)}`,
+    payload: {
+      workspace_id: safeWorkspaceId,
+    },
+    timeoutMs: 30000,
+  });
 }
 
 async function controlPlaneWorkspaceUserId(): Promise<string | null> {
@@ -13486,11 +13435,27 @@ async function getWorkspaceLifecycle(
 async function activateWorkspace(
   workspaceId: string,
 ): Promise<WorkspaceLifecyclePayload> {
+  return (await openWorkspace(workspaceId)).lifecycle;
+}
+
+async function openWorkspace(
+  workspaceId: string,
+): Promise<WorkspaceOpenSessionPayload> {
   const safeWorkspaceId = assertSafeWorkspaceId(workspaceId);
-  // Desktop always activates via local runtime.
-  // Ensure all enabled apps are running in parallel via the runtime.
-  await runtimeClient.workspaces.ensureAppsRunning(safeWorkspaceId);
-  return getWorkspaceLifecycleViaRuntime(safeWorkspaceId);
+  const session = await resolveWorkspaceRuntimeSession(safeWorkspaceId, {
+    refresh: true,
+  });
+  await requestWorkspaceRuntimeJson<Record<string, unknown>>(safeWorkspaceId, {
+    method: "POST",
+    path: "/api/v1/apps/ensure-running",
+    payload: { workspace_id: safeWorkspaceId },
+    timeoutMs: 300000,
+    retryTransientErrors: true,
+  });
+  return {
+    ...session,
+    lifecycle: await getWorkspaceLifecycleViaRuntime(safeWorkspaceId),
+  };
 }
 
 async function getWorkspaceLifecycleViaRuntime(
@@ -13510,7 +13475,7 @@ async function getWorkspaceLifecycleViaRuntime(
   const readiness = workspaceReadinessFromApps(installedApps.apps);
   const phaseState = workspaceLifecyclePhaseFromState(workspace, readiness);
 
-  return {
+  return withWorkspaceLifecycleLocation({
     workspace,
     applications: installedApps.apps,
     ready: readiness.ready,
@@ -13519,7 +13484,7 @@ async function getWorkspaceLifecycleViaRuntime(
     phase_label: phaseState.phase_label,
     phase_detail: phaseState.phase_detail,
     blocking_apps: readiness.blocking_apps,
-  };
+  });
 }
 
 async function listOutputs(
@@ -13865,7 +13830,7 @@ async function createWorkspace(
     throw new Error("Choose a local folder or a marketplace template first.");
   }
   const customWorkspacePath = payload.workspace_path?.trim() || "";
-  let created: WorkspaceResponsePayload;
+  let created: Awaited<ReturnType<typeof runtimeClient.workspaces.create>>;
   stageLog("runtime_post_workspaces.start", {
     hasCustomWorkspacePath: Boolean(customWorkspacePath),
   });
@@ -13889,6 +13854,7 @@ async function createWorkspace(
   }
   const workspaceId = created.workspace.id;
   rememberWorkspaceDir(workspaceId, created.workspace.workspace_path);
+  forgetWorkspaceRuntimeSession(workspaceId);
 
   try {
     const workspaceDir = await resolveWorkspaceDir(workspaceId);
@@ -13979,7 +13945,7 @@ async function createWorkspace(
     }
 
     stageLog("activate_workspace.start", { workspaceId, onboardingStatus });
-    let updated: WorkspaceResponsePayload;
+    let updated: Awaited<ReturnType<typeof runtimeClient.workspaces.update>>;
     try {
       updated = await runtimeClient.workspaces.update(workspaceId, {
         status: "active",
@@ -14140,7 +14106,7 @@ async function createWorkspace(
           `requested_user_id=${requestedHeartbeatUserId || "missing"} runtime_user_id=${runtimeHeartbeatUserId || "missing"}`,
       });
     }
-    return updated;
+    return withWorkspaceResponseLocation(updated);
   } catch (error) {
     await runtimeClient.workspaces
       .update(workspaceId, {
@@ -14162,7 +14128,8 @@ async function deleteWorkspace(
     keepFiles !== undefined ? { keepFiles } : undefined,
   );
   forgetWorkspaceDir(safeWorkspaceId);
-  return response;
+  forgetWorkspaceRuntimeSession(safeWorkspaceId);
+  return withWorkspaceResponseLocation(response);
 }
 
 async function relocateWorkspace(
@@ -14175,15 +14142,28 @@ async function relocateWorkspace(
   });
   forgetWorkspaceDir(safeWorkspaceId);
   rememberWorkspaceDir(safeWorkspaceId, response.workspace.workspace_path);
-  return response;
+  forgetWorkspaceRuntimeSession(safeWorkspaceId);
+  return withWorkspaceResponseLocation(response);
 }
 
 async function activateWorkspaceRecord(
   workspaceId: string,
 ): Promise<WorkspaceResponsePayload> {
   const safeWorkspaceId = assertSafeWorkspaceId(workspaceId);
-  return runtimeClient.workspaces.activate(safeWorkspaceId);
+  return withWorkspaceResponseLocation(
+    await runtimeClient.workspaces.activate(safeWorkspaceId),
+  );
 }
+
+const localWorkspaceControlPlane = createLocalWorkspaceControlPlane({
+  listWorkspaces,
+  workspaceRegistry: localWorkspaceRegistry,
+  createWorkspace,
+  deleteWorkspace,
+  activateWorkspaceRecord,
+  getWorkspaceLifecycle,
+  openWorkspace,
+})
 
 async function pickWorkspaceRelocationFolder(
   workspaceId: string,
@@ -14212,9 +14192,14 @@ async function pickWorkspaceRelocationFolder(
     if (!stat.isDirectory()) {
       throw new Error("Selected path is not a directory.");
     }
-    // Accept if it contains a matching .holaboss/workspace_id identity file.
-    const identityFilePath = path.join(rootPath, ".holaboss", "workspace_id");
-    if (existsSync(identityFilePath)) {
+    // Accept if it contains a matching workspace identity file.
+    for (const identityFilePath of [
+      path.join(rootPath, ".holaboss", "state", "workspace_id"),
+      path.join(rootPath, ".holaboss", "workspace_id"),
+    ]) {
+      if (!existsSync(identityFilePath)) {
+        continue;
+      }
       const storedId = readFileSync(identityFilePath, "utf-8").trim();
       if (storedId === safeWorkspaceId) {
         return { canceled: false, rootPath };
@@ -14422,6 +14407,7 @@ async function getSessionOutputEvents(
   payload: SessionOutputEventListRequestPayload,
 ): Promise<SessionOutputEventListResponsePayload> {
   return runtimeClient.sessions.getOutputEvents({
+    workspaceId: payload.workspaceId,
     sessionId: payload.sessionId,
     inputId: payload.inputId,
   });
@@ -14619,61 +14605,6 @@ function emitSessionStreamEvent(payload: HolabossSessionStreamEventPayload) {
   }
 }
 
-function getQueuedInput(inputId: string) {
-  const database = openRuntimeDatabase();
-  try {
-    const row = database
-      .prepare(
-        `
-        SELECT
-          input_id,
-          session_id,
-          workspace_id,
-          payload,
-          status,
-          priority,
-          available_at,
-          attempt,
-          idempotency_key,
-          created_at,
-          updated_at
-        FROM agent_session_inputs
-        WHERE input_id = @input_id
-      `,
-      )
-      .get({ input_id: inputId }) as
-      | {
-          input_id: string;
-          session_id: string;
-          workspace_id: string;
-          payload: string;
-          status: string;
-          priority: number;
-          available_at: string;
-          attempt: number;
-          idempotency_key: string | null;
-          created_at: string;
-          updated_at: string;
-        }
-      | undefined;
-    if (!row) {
-      return null;
-    }
-    let parsedPayload: Record<string, unknown> = {};
-    try {
-      parsedPayload = JSON.parse(row.payload) as Record<string, unknown>;
-    } catch {
-      parsedPayload = {};
-    }
-    return {
-      ...row,
-      payload: parsedPayload,
-    };
-  } finally {
-    database.close();
-  }
-}
-
 async function openSessionOutputStream(
   payload: HolabossStreamSessionOutputsPayload,
 ): Promise<HolabossSessionStreamHandlePayload> {
@@ -14684,10 +14615,13 @@ async function openSessionOutputStream(
 
   void (async () => {
     try {
-      const status = await ensureRuntimeReady();
+      const workspaceSession = payload.workspaceId
+        ? await resolveWorkspaceRuntimeSession(payload.workspaceId)
+        : null;
+      const status = workspaceSession ? null : await ensureRuntimeReady();
       const url = new URL(
         `/api/v1/agent-sessions/${payload.sessionId}/outputs/stream`,
-        status.url ?? runtimeBaseUrl(),
+        workspaceSession?.runtime_base_url ?? status?.url ?? runtimeBaseUrl(),
       );
       if (payload.inputId) {
         url.searchParams.set("input_id", payload.inputId);
@@ -14721,6 +14655,11 @@ async function openSessionOutputStream(
             method: "GET",
             headers: {
               Accept: "text/event-stream",
+              ...(workspaceSession?.runtime_auth_token
+                ? {
+                    "X-API-Key": workspaceSession.runtime_auth_token,
+                  }
+                : {}),
             },
             // Session output uses a long-lived SSE connection. Let runtime-side
             // queue and runner recovery determine terminal failure instead of
@@ -15564,6 +15503,7 @@ async function startEmbeddedRuntime() {
 
       await fs.mkdir(sandboxRoot, { recursive: true });
       await bootstrapRuntimeDatabase();
+      bootstrapControlPlaneDatabase();
 
       const preflightRuntimePort = await ensureRuntimePortAvailable({
         url,
@@ -15718,7 +15658,9 @@ async function startEmbeddedRuntime() {
           HOLABOSS_EMBEDDED_RUNTIME: "1",
           SANDBOX_AGENT_HARNESS: harness,
           HOLABOSS_RUNTIME_WORKFLOW_BACKEND: workflowBackend,
+          HOLABOSS_HOST_STATE_DB_PATH: runtimeDatabasePath(),
           HOLABOSS_RUNTIME_DB_PATH: runtimeDatabasePath(),
+          HOLABOSS_CONTROL_PLANE_DB_PATH: controlPlaneDatabasePath(),
           HOLABOSS_RUNTIME_LOG_PATH: runtimeLogsPath(),
           HOLABOSS_RUNTIME_CONFIG_PATH: runtimeConfigPath(),
           HOLABOSS_DESKTOP_LAUNCH_ID: DESKTOP_LAUNCH_ID,
@@ -16021,7 +15963,13 @@ async function getAppHttpUrl(
   appId: string,
 ): Promise<string | null> {
   try {
-    const ports = await runtimeClient.apps.listPorts(workspaceId);
+    const ports = await requestWorkspaceRuntimeJson<
+      Record<string, { http: number; mcp: number }>
+    >(workspaceId, {
+      method: "GET",
+      path: "/api/v1/apps/ports",
+      params: { workspace_id: workspaceId },
+    });
     const appPorts = ports[appId];
     if (!appPorts?.http) {
       return null;
@@ -18383,9 +18331,10 @@ async function resolveWorkspaceScopedExplorerPath(
     };
   }
 
-  const workspaceRoot = path.resolve(
-    await resolveWorkspaceDir(normalizedWorkspaceId),
+  const workspaceSession = await resolveWorkspaceRuntimeSession(
+    normalizedWorkspaceId,
   );
+  const workspaceRoot = path.resolve(workspaceSession.workspace_root);
   const resolvedTargetPath = trimmedTargetPath
     ? path.resolve(
         path.isAbsolute(trimmedTargetPath)
@@ -20893,6 +20842,7 @@ app.whenReady().then(async () => {
 
   await loadBrowserPersistence();
   await bootstrapRuntimeDatabase();
+  bootstrapControlPlaneDatabase();
   ensureOpenAiCodexRefreshLoop();
   void refreshOpenAiCodexProviderCredentials().catch(() => undefined);
 
@@ -21420,7 +21370,7 @@ app.whenReady().then(async () => {
     "workspace:activate",
     ["main"],
     async (_event, workspaceId: string) =>
-      activateWorkspaceRecord(workspaceId),
+      localWorkspaceControlPlane.activateWorkspaceRecord(workspaceId),
   );
   handleTrustedIpc(
     "workspace:listImportBrowserProfiles",
@@ -21443,26 +21393,34 @@ app.whenReady().then(async () => {
   handleTrustedIpc(
     "workspace:listWorkspaces",
     ["main", "auth-popup"],
-    async () => listWorkspaces(),
+    async () => localWorkspaceControlPlane.listWorkspaces(),
   );
-  // Cached read straight from runtime.db without going through the
+  // Cached read straight from control-plane.db without going through the
   // sidecar — used by the splash to hydrate before the sidecar
   // finishes spawning. Returns empty on any failure so the renderer
   // can silently fall back to the live sidecar path.
   handleTrustedIpc(
     "workspace:listWorkspacesCached",
     ["main"],
-    async () => listWorkspacesFromLocalDb(),
+    async () => localWorkspaceControlPlane.listWorkspacesCached(),
   );
   handleTrustedIpc(
     "workspace:getWorkspaceLifecycle",
     ["main"],
-    async (_event, workspaceId: string) => getWorkspaceLifecycle(workspaceId),
+    async (_event, workspaceId: string) =>
+      localWorkspaceControlPlane.getWorkspaceLifecycle(workspaceId),
   );
   handleTrustedIpc(
     "workspace:activateWorkspace",
     ["main"],
-    async (_event, workspaceId: string) => activateWorkspace(workspaceId),
+    async (_event, workspaceId: string) =>
+      localWorkspaceControlPlane.activateWorkspace(workspaceId),
+  );
+  handleTrustedIpc(
+    "workspace:openWorkspace",
+    ["main"],
+    async (_event, workspaceId: string) =>
+      localWorkspaceControlPlane.openWorkspace(workspaceId),
   );
   handleTrustedIpc(
     "workspace:listInstalledApps",
@@ -21551,7 +21509,8 @@ app.whenReady().then(async () => {
   handleTrustedIpc(
     "workspace:getWorkspaceRoot",
     ["main"],
-    async (_event, workspaceId: string) => resolveWorkspaceDir(workspaceId),
+    async (_event, workspaceId: string) =>
+      (await resolveWorkspaceRuntimeSession(workspaceId)).workspace_root,
   );
   handleTrustedIpc(
     "workspace:setOperatorSurfaceContext",
@@ -21576,12 +21535,13 @@ app.whenReady().then(async () => {
     "workspace:createWorkspace",
     ["main"],
     async (_event, payload: HolabossCreateWorkspacePayload) =>
-      createWorkspace(payload),
+      localWorkspaceControlPlane.createWorkspace(payload),
   );
   handleTrustedIpc(
     "workspace:deleteWorkspace",
     ["main"],
-    async (_event, workspaceId: string, keepFiles?: boolean) => deleteWorkspace(workspaceId, keepFiles),
+    async (_event, workspaceId: string, keepFiles?: boolean) =>
+      localWorkspaceControlPlane.deleteWorkspace(workspaceId, keepFiles),
   );
   handleTrustedIpc(
     "workspace:listCronjobs",
@@ -21597,18 +21557,20 @@ app.whenReady().then(async () => {
   handleTrustedIpc(
     "workspace:runCronjobNow",
     ["main"],
-    async (_event, jobId: string) => runCronjobNow(jobId),
+    async (_event, workspaceId: string, jobId: string) =>
+      runCronjobNow(workspaceId, jobId),
   );
   handleTrustedIpc(
     "workspace:updateCronjob",
     ["main"],
-    async (_event, jobId: string, payload: CronjobUpdatePayload) =>
-      updateCronjob(jobId, payload),
+    async (_event, workspaceId: string, jobId: string, payload: CronjobUpdatePayload) =>
+      updateCronjob(workspaceId, jobId, payload),
   );
   handleTrustedIpc(
     "workspace:deleteCronjob",
     ["main"],
-    async (_event, jobId: string) => deleteCronjob(jobId),
+    async (_event, workspaceId: string, jobId: string) =>
+      deleteCronjob(workspaceId, jobId),
   );
   handleTrustedIpc(
     "workspace:listNotifications",
@@ -21628,9 +21590,10 @@ app.whenReady().then(async () => {
     ["main"],
     async (
       _event,
+      workspaceId: string,
       notificationId: string,
       payload: RuntimeNotificationUpdatePayload,
-    ) => updateNotification(notificationId, payload),
+    ) => updateNotification(workspaceId, notificationId, payload),
   );
   handleTrustedIpc(
     "workspace:listTaskProposals",
@@ -21670,8 +21633,8 @@ app.whenReady().then(async () => {
   handleTrustedIpc(
     "workspace:dismissMemoryUpdateProposal",
     ["main"],
-    async (_event, proposalId: string) =>
-      dismissMemoryUpdateProposal(proposalId),
+    async (_event, workspaceId: string, proposalId: string) =>
+      dismissMemoryUpdateProposal(workspaceId, proposalId),
   );
   handleTrustedIpc(
     "workspace:getProactiveStatus",
@@ -21681,8 +21644,8 @@ app.whenReady().then(async () => {
   handleTrustedIpc(
     "workspace:updateTaskProposalState",
     ["main"],
-    async (_event, proposalId: string, state: string) =>
-      updateTaskProposalState(proposalId, state),
+    async (_event, workspaceId: string, proposalId: string, state: string) =>
+      updateTaskProposalState(workspaceId, proposalId, state),
   );
   handleTrustedIpc(
     "workspace:requestRemoteTaskProposalGeneration",

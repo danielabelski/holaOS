@@ -150,11 +150,13 @@ test("handleRequest maps output event operations to snake_case payloads", () => 
 
   const latest = handleRequest("latest-output-event-id", {
     options,
+    workspace_id: "workspace-1",
     session_id: "session-main",
     input_id: "input-1"
   });
   const incremental = handleRequest("list-output-events", {
     options,
+    workspace_id: "workspace-1",
     session_id: "session-main",
     input_id: "input-1",
     after_event_id: 1
@@ -240,6 +242,7 @@ test("handleRequest maps cronjobs and task proposals to snake_case payloads", ()
   }) as Record<string, unknown>;
   const updatedJob = handleRequest("update-cronjob", {
     options,
+    workspace_id: "workspace-1",
     job_id: String(job.id),
     description: "Updated check",
     instruction: "Say hello louder"
@@ -256,6 +259,7 @@ test("handleRequest maps cronjobs and task proposals to snake_case payloads", ()
   }) as Record<string, unknown>;
   const updatedProposal = handleRequest("update-task-proposal-state", {
     options,
+    workspace_id: "workspace-1",
     proposal_id: "proposal-1",
     state: "accepted"
   }) as Record<string, unknown>;

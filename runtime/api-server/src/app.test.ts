@@ -392,14 +392,14 @@ test("browser capability preview mode spills screenshot data and trims browser_g
     );
     assert.match(
       String(body.screenshot.file_path ?? ""),
-      /^\.holaboss\/tool-results\/browser_get_state\/session-main\//,
+      /^\.holaboss\/state\/tool-results\/browser_get_state\/session-main\//,
     );
     assert.equal(body._preview.mode, "preview");
     assert.equal(body._preview.truncated, true);
     assert.equal(body._preview.spilled, true);
     assert.match(
       String(body.full_state_path ?? ""),
-      /^\.holaboss\/tool-results\/browser_get_state\/session-main\//,
+      /^\.holaboss\/state\/tool-results\/browser_get_state\/session-main\//,
     );
     assert.equal(
       fs.existsSync(
@@ -477,11 +477,11 @@ test("terminal session routes proxy to the terminal session manager", async () =
       };
       return currentSession;
     },
-    getSession(params: { terminalId: string; workspaceId?: string }) {
+    getSession(params: { terminalId: string; workspaceId: string }) {
       if (params.terminalId !== currentSession.terminalId) {
         return null;
       }
-      if (params.workspaceId && params.workspaceId !== currentSession.workspaceId) {
+      if (params.workspaceId !== currentSession.workspaceId) {
         return null;
       }
       return currentSession;
@@ -489,19 +489,34 @@ test("terminal session routes proxy to the terminal session manager", async () =
     listSessions() {
       return [currentSession];
     },
-    listEvents(params: { terminalId: string; afterSequence?: number }) {
+    listEvents(params: { workspaceId: string; terminalId: string; afterSequence?: number }) {
+      if (params.workspaceId !== currentSession.workspaceId) {
+        return [];
+      }
       return events.filter((event) => event.terminalId === params.terminalId && event.sequence > (params.afterSequence ?? 0));
     },
-    async sendInput() {
+    async sendInput(params: { workspaceId: string }) {
+      if (params.workspaceId !== currentSession.workspaceId) {
+        throw new Error("workspace mismatch");
+      }
       return currentSession;
     },
-    async resize() {
+    async resize(params: { workspaceId: string }) {
+      if (params.workspaceId !== currentSession.workspaceId) {
+        throw new Error("workspace mismatch");
+      }
       return currentSession;
     },
-    async signal() {
+    async signal(params: { workspaceId: string }) {
+      if (params.workspaceId !== currentSession.workspaceId) {
+        throw new Error("workspace mismatch");
+      }
       return currentSession;
     },
-    async closeSession() {
+    async closeSession(params: { workspaceId: string }) {
+      if (params.workspaceId !== currentSession.workspaceId) {
+        throw new Error("workspace mismatch");
+      }
       currentSession = {
         ...currentSession,
         status: "closed",
@@ -547,7 +562,7 @@ test("terminal session routes proxy to the terminal session manager", async () =
 
   const eventsResponse = await app.inject({
     method: "GET",
-    url: "/api/v1/terminal-sessions/term-1/events?after_sequence=0",
+    url: "/api/v1/terminal-sessions/term-1/events?workspace_id=workspace-1&after_sequence=0",
   });
   assert.equal(eventsResponse.statusCode, 200);
   assert.equal(eventsResponse.json().events.length, 1);
@@ -556,6 +571,9 @@ test("terminal session routes proxy to the terminal session manager", async () =
   const closeResponse = await app.inject({
     method: "POST",
     url: "/api/v1/terminal-sessions/term-1/close",
+    payload: {
+      workspace_id: "workspace-1",
+    },
   });
   assert.equal(closeResponse.statusCode, 200);
   assert.equal(closeResponse.json().status, "closed");
@@ -638,7 +656,7 @@ test("terminal session stream route replays history and forwards live events", a
   };
   const app = buildTestRuntimeApiServer({ store, terminalSessionManager });
   const baseUrl = await app.listen({ port: 0, host: "127.0.0.1" });
-  const wsUrl = `${String(baseUrl).replace(/^http/, "ws")}/api/v1/terminal-sessions/term-1/stream`;
+  const wsUrl = `${String(baseUrl).replace(/^http/, "ws")}/api/v1/terminal-sessions/term-1/stream?workspace_id=workspace-1`;
   const socket = new WebSocket(wsUrl);
   const messages: Array<Record<string, unknown>> = [];
   const waitForMessageCount = async (expectedCount: number) => {
@@ -908,7 +926,7 @@ test("runtime subagent capability routes create and cancel hidden background tas
     requested_tools: ["web", "browser"],
   });
 
-  const run = store.getSubagentRun({ subagentId: task.subagent_id });
+  const run = store.getSubagentRun({ workspaceId: workspace.id, subagentId: task.subagent_id });
   assert.ok(run);
   assert.equal(run?.parentSessionId, "session-main");
   assert.equal(run?.parentInputId, parentInput.inputId);
@@ -921,7 +939,9 @@ test("runtime subagent capability routes create and cancel hidden background tas
   });
   assert.equal(childSession?.kind, "subagent");
 
-  const childInput = run?.currentChildInputId ? store.getInput(run.currentChildInputId) : null;
+  const childInput = run?.currentChildInputId
+    ? store.getInput({ workspaceId: workspace.id, inputId: run.currentChildInputId })
+    : null;
   assert.ok(childInput);
   assert.equal(
     childInput?.payload.text,
@@ -1011,9 +1031,11 @@ test("runtime subagent capability routes create and cancel hidden background tas
   assert.equal(cancelled.statusCode, 200);
   assert.equal(cancelled.json().status, "cancelled");
 
-  const cancelledRun = store.getSubagentRun({ subagentId: task.subagent_id });
+  const cancelledRun = store.getSubagentRun({ workspaceId: workspace.id, subagentId: task.subagent_id });
   assert.equal(cancelledRun?.status, "cancelled");
-  const cancelledInput = run?.currentChildInputId ? store.getInput(run.currentChildInputId) : null;
+  const cancelledInput = run?.currentChildInputId
+    ? store.getInput({ workspaceId: workspace.id, inputId: run.currentChildInputId })
+    : null;
   assert.equal(cancelledInput?.status, "DONE");
 
   const archived = await app.inject({
@@ -1086,9 +1108,9 @@ test("delegated subagents use the configured global subagent model instead of re
 
   assert.equal(created.statusCode, 200);
   const task = created.json().tasks[0];
-  const run = store.getSubagentRun({ subagentId: task.subagent_id });
+  const run = store.getSubagentRun({ workspaceId: workspace.id, subagentId: task.subagent_id });
   const childInput = run?.currentChildInputId
-    ? store.getInput(run.currentChildInputId)
+    ? store.getInput({ workspaceId: workspace.id, inputId: run.currentChildInputId })
     : null;
 
   assert.equal(run?.requestedModel, "gemini_direct/gemini-2.5-pro");
@@ -1383,7 +1405,7 @@ test("runtime todo tools read, write, and block session todo state", async () =>
     assert.equal(status.statusCode, 200);
     assert.equal(status.json().blocked, true);
 
-    const todoPath = path.join(workspaceRoot, "workspace-1", ".holaboss", "todos", "session-main.json");
+  const todoPath = path.join(workspaceRoot, "workspace-1", ".holaboss", "state", "todos", "session-main.json");
     const persisted = JSON.parse(fs.readFileSync(todoPath, "utf8"));
     assert.equal(persisted.phases[0]?.tasks[0]?.status, "blocked");
     assert.equal(persisted.phases[0]?.tasks[1]?.status, "pending");
@@ -1414,6 +1436,7 @@ test("runtime scratchpad preview mode clips oversized inline content", async () 
   const scratchpadPath = path.join(
     workspaceDir,
     ".holaboss",
+    "state",
     "scratchpads",
     "session-main.md",
   );
@@ -1436,7 +1459,7 @@ test("runtime scratchpad preview mode clips oversized inline content", async () 
     assert.equal(typeof body.content, "string");
     assert.equal(body.content_truncated, true);
     assert.equal(String(body.content_preview ?? "").includes("[truncated]"), true);
-    assert.equal(body.source_file_path, ".holaboss/scratchpads/session-main.md");
+    assert.equal(body.source_file_path, ".holaboss/state/scratchpads/session-main.md");
     assert.equal(body._preview.mode, "preview");
     assert.equal(body._preview.truncated, true);
   } finally {
@@ -1505,11 +1528,11 @@ test("runtime terminal session tools proxy terminal session manager operations",
       };
       return currentSession;
     },
-    getSession(params: { terminalId: string; workspaceId?: string }) {
+    getSession(params: { terminalId: string; workspaceId: string }) {
       if (params.terminalId !== currentSession.terminalId) {
         return null;
       }
-      if (params.workspaceId && params.workspaceId !== currentSession.workspaceId) {
+      if (params.workspaceId !== currentSession.workspaceId) {
         return null;
       }
       return currentSession;
@@ -1517,22 +1540,34 @@ test("runtime terminal session tools proxy terminal session manager operations",
     listSessions() {
       return [currentSession];
     },
-    listEvents(params: { terminalId: string; afterSequence?: number; limit?: number }) {
+    listEvents(params: { workspaceId: string; terminalId: string; afterSequence?: number; limit?: number }) {
+      if (params.workspaceId !== currentSession.workspaceId) {
+        return [];
+      }
       return events
         .filter((event) => event.terminalId === params.terminalId && event.sequence > (params.afterSequence ?? 0))
         .slice(0, params.limit ?? events.length);
     },
-    async sendInput() {
+    async sendInput(params: { workspaceId: string }) {
+      if (params.workspaceId !== currentSession.workspaceId) {
+        throw new Error("workspace mismatch");
+      }
       currentSession = {
         ...currentSession,
         lastActivityAt: "2026-01-01T00:00:02.000Z",
       };
       return currentSession;
     },
-    async resize() {
+    async resize(params: { workspaceId: string }) {
+      if (params.workspaceId !== currentSession.workspaceId) {
+        throw new Error("workspace mismatch");
+      }
       return currentSession;
     },
-    async signal() {
+    async signal(params: { workspaceId: string }) {
+      if (params.workspaceId !== currentSession.workspaceId) {
+        throw new Error("workspace mismatch");
+      }
       currentSession = {
         ...currentSession,
         status: "failed",
@@ -1540,7 +1575,10 @@ test("runtime terminal session tools proxy terminal session manager operations",
       };
       return currentSession;
     },
-    async closeSession() {
+    async closeSession(params: { workspaceId: string }) {
+      if (params.workspaceId !== currentSession.workspaceId) {
+        throw new Error("workspace mismatch");
+      }
       currentSession = {
         ...currentSession,
         status: "closed",
@@ -1799,7 +1837,7 @@ test("runtime terminal read preview mode clips large event streams and spills fu
     assert.equal(body._preview.spilled, true);
     assert.match(
       String(body.full_events_path ?? ""),
-      /^\.holaboss\/tool-results\/terminal_session_read\/session-main\//,
+      /^\.holaboss\/state\/tool-results\/terminal_session_read\/session-main\//,
     );
     assert.equal(
       fs.existsSync(
@@ -2928,6 +2966,7 @@ test("ensure-main-session binds one desktop main session and exports legacy fron
   const legacyDir = path.join(
     store.workspaceDir(workspace.id),
     ".holaboss",
+    "state",
     "legacy-session-histories",
   );
   const manifestPath = path.join(legacyDir, "index.json");
@@ -3003,8 +3042,8 @@ test("PATCH workspace_path accepts a folder with matching identity (move case)",
   const workspaceId = (created.json().workspace as { id: string }).id;
 
   // Simulate the user moving the whole workspace folder elsewhere.
-  fs.mkdirSync(path.join(movedPath, ".holaboss"), { recursive: true });
-  fs.writeFileSync(path.join(movedPath, ".holaboss", "workspace_id"), workspaceId);
+  fs.mkdirSync(path.join(movedPath, ".holaboss", "state"), { recursive: true });
+  fs.writeFileSync(path.join(movedPath, ".holaboss", "state", "workspace_id"), workspaceId);
   fs.writeFileSync(path.join(movedPath, "AGENTS.md"), "preserved");
 
   const resp = await app.inject({
@@ -3014,6 +3053,40 @@ test("PATCH workspace_path accepts a folder with matching identity (move case)",
   });
   assert.equal(resp.statusCode, 200);
   assert.equal(fs.readFileSync(path.join(movedPath, "AGENTS.md"), "utf-8"), "preserved");
+
+  await app.close();
+  store.close();
+});
+
+test("PATCH workspace_path still accepts a folder with the legacy identity path", async () => {
+  const root = makeTempDir("hb-runtime-api-");
+  const customRoot = makeTempDir("hb-custom-ws-");
+  const movedPath = path.join(customRoot, "moved-legacy");
+  const store = new RuntimeStateStore({
+    dbPath: path.join(root, "runtime.db"),
+    workspaceRoot: path.join(root, "workspace")
+  });
+  const app = buildTestRuntimeApiServer({ store });
+  const created = await app.inject({
+    method: "POST",
+    url: "/api/v1/workspaces",
+    payload: { name: "M", harness: "pi" }
+  });
+  const workspaceId = (created.json().workspace as { id: string }).id;
+
+  fs.mkdirSync(path.join(movedPath, ".holaboss"), { recursive: true });
+  fs.writeFileSync(path.join(movedPath, ".holaboss", "workspace_id"), workspaceId);
+
+  const resp = await app.inject({
+    method: "PATCH",
+    url: `/api/v1/workspaces/${workspaceId}`,
+    payload: { workspace_path: movedPath }
+  });
+  assert.equal(resp.statusCode, 200);
+  assert.equal(
+    fs.readFileSync(path.join(movedPath, ".holaboss", "state", "workspace_id"), "utf-8").trim(),
+    workspaceId,
+  );
 
   await app.close();
   store.close();
@@ -3292,7 +3365,7 @@ test("POST /api/v1/workspaces accepts an explicit workspace_path", async () => {
   assert.equal(created.statusCode, 200);
   const payload = created.json().workspace as { id: string; workspace_path: string | null };
   assert.equal(payload.workspace_path && path.resolve(payload.workspace_path), path.resolve(customPath));
-  assert.equal(fs.existsSync(path.join(customPath, ".holaboss", "workspace_id")), true);
+  assert.equal(fs.existsSync(path.join(customPath, ".holaboss", "state", "workspace_id")), true);
   assert.equal(
     path.resolve(store.workspaceDir(payload.id)),
     path.resolve(customPath)
@@ -3318,6 +3391,7 @@ test("DELETE ?keep_files=true preserves files even for managed workspaces", asyn
   const workspaceId = (created.json().workspace as { id: string }).id;
   const workspaceDir = store.workspaceDir(workspaceId);
   fs.writeFileSync(path.join(workspaceDir, "important.txt"), "keep me");
+  const identityPath = path.join(workspaceDir, ".holaboss", "state", "workspace_id");
 
   const resp = await app.inject({
     method: "DELETE",
@@ -3325,7 +3399,7 @@ test("DELETE ?keep_files=true preserves files even for managed workspaces", asyn
   });
   assert.equal(resp.statusCode, 200);
   assert.equal(fs.existsSync(path.join(workspaceDir, "important.txt")), true);
-  assert.equal(fs.existsSync(path.join(workspaceDir, ".holaboss")), false);
+  assert.equal(fs.existsSync(identityPath), true);
 
   await app.close();
   store.close();
@@ -3359,7 +3433,7 @@ test("DELETE ?keep_files=false wipes files even for custom-path workspaces", asy
   store.close();
 });
 
-test("DELETE workspace at custom path preserves user files, wipes only metadata", async () => {
+test("DELETE workspace at custom path preserves user files and the workspace bundle", async () => {
   const root = makeTempDir("hb-runtime-api-");
   const customRoot = makeTempDir("hb-runtime-api-custom-ws-");
   const customPath = path.join(customRoot, "user-folder");
@@ -3383,6 +3457,7 @@ test("DELETE workspace at custom path preserves user files, wipes only metadata"
 
   // User drops a file into their own folder after creation.
   fs.writeFileSync(path.join(customPath, "my-notes.txt"), "keep me");
+  const identityPath = path.join(customPath, ".holaboss", "state", "workspace_id");
 
   const deleted = await app.inject({
     method: "DELETE",
@@ -3392,8 +3467,8 @@ test("DELETE workspace at custom path preserves user files, wipes only metadata"
 
   // User's file survives.
   assert.equal(fs.existsSync(path.join(customPath, "my-notes.txt")), true);
-  // Runtime's metadata is gone.
-  assert.equal(fs.existsSync(path.join(customPath, ".holaboss")), false);
+  // Workspace runtime state and memory survive too.
+  assert.equal(fs.existsSync(identityPath), true);
   // The user's folder itself is preserved.
   assert.equal(fs.existsSync(customPath), true);
 
@@ -3426,6 +3501,54 @@ test("DELETE workspace at managed path still wipes the whole directory", async (
   });
   assert.equal(deleted.statusCode, 200);
   assert.equal(fs.existsSync(workspaceDir), false);
+
+  await app.close();
+  store.close();
+});
+
+test("POST /api/v1/workspaces revives a kept workspace bundle instead of rejecting the preserved folder", async () => {
+  const root = makeTempDir("hb-runtime-api-");
+  const customRoot = makeTempDir("hb-runtime-api-custom-ws-");
+  const customPath = path.join(customRoot, "revive-me");
+  const store = new RuntimeStateStore({
+    dbPath: path.join(root, "runtime.db"),
+    workspaceRoot: path.join(root, "workspace")
+  });
+  const app = buildTestRuntimeApiServer({ store });
+
+  const created = await app.inject({
+    method: "POST",
+    url: "/api/v1/workspaces",
+    payload: {
+      name: "Original",
+      harness: "pi",
+      workspace_path: customPath
+    }
+  });
+  assert.equal(created.statusCode, 200);
+  const original = created.json().workspace as { id: string; workspace_path: string };
+  fs.writeFileSync(path.join(customPath, "AGENTS.md"), "preserved\n");
+
+  const deleted = await app.inject({
+    method: "DELETE",
+    url: `/api/v1/workspaces/${original.id}`
+  });
+  assert.equal(deleted.statusCode, 200);
+
+  const revived = await app.inject({
+    method: "POST",
+    url: "/api/v1/workspaces",
+    payload: {
+      name: "Ignored",
+      harness: "pi",
+      workspace_path: customPath
+    }
+  });
+  assert.equal(revived.statusCode, 200);
+  const revivedWorkspace = revived.json().workspace as { id: string; workspace_path: string | null };
+  assert.equal(revivedWorkspace.id, original.id);
+  assert.equal(path.resolve(revivedWorkspace.workspace_path ?? ""), path.resolve(customPath));
+  assert.equal(fs.readFileSync(path.join(customPath, "AGENTS.md"), "utf8"), "preserved\n");
 
   await app.close();
   store.close();
@@ -3466,47 +3589,6 @@ test("workspace delete stops installed apps and clears local workspace files", a
     dbPath: path.join(root, "runtime.db"),
     workspaceRoot
   });
-
-  const workspace = store.createWorkspace({
-    workspaceId: "workspace-1",
-    name: "Workspace 1",
-    harness: "pi",
-    status: "active",
-  });
-  const workspaceDir = store.workspaceDir(workspace.id);
-  const appId = "app-a";
-  const appDir = path.join(workspaceDir, "apps", appId);
-  fs.mkdirSync(appDir, { recursive: true });
-  fs.writeFileSync(
-    path.join(workspaceDir, "workspace.yaml"),
-    `applications:\n  - app_id: ${appId}\n    config_path: apps/${appId}/app.runtime.yaml\n`,
-    "utf8"
-  );
-  fs.writeFileSync(
-    path.join(appDir, "app.runtime.yaml"),
-    [
-      `app_id: ${appId}`,
-      "mcp:",
-      "  transport: http-sse",
-      "  port: 4100",
-      "  path: /mcp",
-      "healthchecks:",
-      "  mcp:",
-      "    path: /health",
-      "    timeout_s: 60",
-      "    interval_s: 5",
-      "lifecycle:",
-      "  setup: ''",
-      "  start: npm run start",
-      "  stop: npm run stop"
-    ].join("\n"),
-    "utf8"
-  );
-  store.upsertAppBuild({ workspaceId: workspace.id, appId, status: "running" });
-  store.allocateAppPort({ workspaceId: workspace.id, appId: `${appId}__http` });
-  store.allocateAppPort({ workspaceId: workspace.id, appId: `${appId}__mcp` });
-  assert.equal(store.listAppPorts({ workspaceId: workspace.id }).length, 2);
-
   const stopCalls: Array<{ appId: string; appDir?: string; hasResolvedApp: boolean }> = [];
   const executor: AppLifecycleExecutorLike = {
     async startApp() {
@@ -3531,26 +3613,68 @@ test("workspace delete stops installed apps and clears local workspace files", a
   };
   const app = buildTestRuntimeApiServer({ store, appLifecycleExecutor: executor });
 
-  const deleted = await app.inject({ method: "DELETE", url: `/api/v1/workspaces/${workspace.id}` });
+  try {
+    const workspace = store.createWorkspace({
+      workspaceId: "workspace-1",
+      name: "Workspace 1",
+      harness: "pi",
+      status: "active",
+    });
+    const workspaceDir = store.workspaceDir(workspace.id);
+    const appId = "app-a";
+    const appDir = path.join(workspaceDir, "apps", appId);
+    fs.mkdirSync(appDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(workspaceDir, "workspace.yaml"),
+      `applications:\n  - app_id: ${appId}\n    config_path: apps/${appId}/app.runtime.yaml\n`,
+      "utf8"
+    );
+    fs.writeFileSync(
+      path.join(appDir, "app.runtime.yaml"),
+      [
+        `app_id: ${appId}`,
+        "mcp:",
+        "  transport: http-sse",
+        "  port: 4100",
+        "  path: /mcp",
+        "healthchecks:",
+        "  mcp:",
+        "    path: /health",
+        "    timeout_s: 60",
+        "    interval_s: 5",
+        "lifecycle:",
+        "  setup: ''",
+        "  start: npm run start",
+        "  stop: npm run stop"
+      ].join("\n"),
+      "utf8"
+    );
+    store.upsertAppBuild({ workspaceId: workspace.id, appId, status: "running" });
+    store.allocateAppPort({ workspaceId: workspace.id, appId: `${appId}__http` });
+    store.allocateAppPort({ workspaceId: workspace.id, appId: `${appId}__mcp` });
+    assert.equal(store.listAppPorts({ workspaceId: workspace.id }).length, 2);
 
-  assert.equal(deleted.statusCode, 200);
-  assert.equal(deleted.json().workspace.status, "deleted");
-  assert.equal(stopCalls.length, 1);
-  assert.deepEqual(stopCalls[0], {
-    appId,
-    appDir,
-    hasResolvedApp: true
-  });
-  assert.equal(store.getAppBuild({ workspaceId: workspace.id, appId }), null);
-  assert.equal(store.listAppPorts({ workspaceId: workspace.id }).length, 0);
-  assert.equal(fs.existsSync(workspaceDir), false);
-  const deletedWorkspace = store.getWorkspace(workspace.id, { includeDeleted: true });
-  assert.ok(deletedWorkspace);
-  assert.equal(deletedWorkspace.status, "deleted");
-  assert.ok(deletedWorkspace.deletedAtUtc);
+    const deleted = await app.inject({ method: "DELETE", url: `/api/v1/workspaces/${workspace.id}` });
 
-  await app.close();
-  store.close();
+    assert.equal(deleted.statusCode, 200);
+    assert.equal(deleted.json().workspace.status, "deleted");
+    assert.equal(stopCalls.length, 1);
+    assert.deepEqual(stopCalls[0], {
+      appId,
+      appDir,
+      hasResolvedApp: true
+    });
+    assert.equal(store.getAppBuild({ workspaceId: workspace.id, appId }), null);
+    assert.equal(store.listAppPorts({ workspaceId: workspace.id }).length, 0);
+    assert.equal(fs.existsSync(workspaceDir), false);
+    const deletedWorkspace = store.getWorkspace(workspace.id, { includeDeleted: true });
+    assert.ok(deletedWorkspace);
+    assert.equal(deletedWorkspace.status, "deleted");
+    assert.ok(deletedWorkspace.deletedAtUtc);
+  } finally {
+    await app.close();
+    store.close();
+  }
 });
 
 test("runtime states and history endpoints read TS state store", async () => {
@@ -3638,9 +3762,9 @@ test("runtime states and history endpoints read TS state store", async () => {
   });
   const sessionMemoryPath = path.join(
     store.workspaceRoot,
-    "memory",
-    "workspace",
     workspace.id,
+    ".holaboss",
+    "memory",
     "runtime",
     "session-memory",
     "session-main.md",
@@ -3936,15 +4060,15 @@ test("output events endpoint supports incremental fetches and tail mode", async 
 
   const incremental = await app.inject({
     method: "GET",
-    url: "/api/v1/agent-sessions/session-main/outputs/events?input_id=input-1&after_event_id=1"
+    url: "/api/v1/agent-sessions/session-main/outputs/events?workspace_id=workspace-1&input_id=input-1&after_event_id=1"
   });
   const tailed = await app.inject({
     method: "GET",
-    url: "/api/v1/agent-sessions/session-main/outputs/events?input_id=input-1&include_history=false"
+    url: "/api/v1/agent-sessions/session-main/outputs/events?workspace_id=workspace-1&input_id=input-1&include_history=false"
   });
   const withNative = await app.inject({
     method: "GET",
-    url: "/api/v1/agent-sessions/session-main/outputs/events?input_id=input-1&after_event_id=0&include_native=true"
+    url: "/api/v1/agent-sessions/session-main/outputs/events?workspace_id=workspace-1&input_id=input-1&after_event_id=0&include_native=true"
   });
 
   assert.equal(incremental.statusCode, 200);
@@ -4009,7 +4133,7 @@ test("output stream endpoint emits SSE events and stops on terminal", async () =
 
   const response = await app.inject({
     method: "GET",
-    url: "/api/v1/agent-sessions/session-main/outputs/stream?input_id=input-1"
+    url: "/api/v1/agent-sessions/session-main/outputs/stream?workspace_id=workspace-1&input_id=input-1"
   });
   const body = response.body;
 
@@ -4020,7 +4144,7 @@ test("output stream endpoint emits SSE events and stops on terminal", async () =
 
   const responseWithNative = await app.inject({
     method: "GET",
-    url: "/api/v1/agent-sessions/session-main/outputs/stream?input_id=input-1&include_native=true"
+    url: "/api/v1/agent-sessions/session-main/outputs/stream?workspace_id=workspace-1&input_id=input-1&include_native=true"
   });
 
   assert.equal(responseWithNative.statusCode, 200);
@@ -4200,12 +4324,16 @@ test("cronjobs, task proposals, and session state routes preserve local payload 
   });
   const runNowJob = await app.inject({
     method: "POST",
-    url: `/api/v1/cronjobs/${jobId}/run`
+    url: `/api/v1/cronjobs/${jobId}/run?workspace_id=${workspace.id}`
   });
   const updatedJob = await app.inject({
     method: "PATCH",
     url: `/api/v1/cronjobs/${jobId}`,
-    payload: { description: "Updated check", instruction: "Say hello louder" }
+    payload: {
+      workspace_id: workspace.id,
+      description: "Updated check",
+      instruction: "Say hello louder"
+    }
   });
   assert.equal(listedJobs.statusCode, 200);
   assert.equal(listedJobs.json().count, 1);
@@ -4246,7 +4374,10 @@ test("cronjobs, task proposals, and session state routes preserve local payload 
   const updatedNotification = await app.inject({
     method: "PATCH",
     url: `/api/v1/notifications/${visibleNotification.id}`,
-    payload: { state: "read" }
+    payload: {
+      workspace_id: workspace.id,
+      state: "read"
+    }
   });
   assert.equal(listedNotifications.statusCode, 200);
   assert.equal(listedNotifications.json().count, 1);
@@ -4294,7 +4425,10 @@ test("cronjobs, task proposals, and session state routes preserve local payload 
   const updatedProposal = await app.inject({
     method: "PATCH",
     url: "/api/v1/task-proposals/proposal-1",
-    payload: { state: "accepted" }
+    payload: {
+      workspace_id: workspace.id,
+      state: "accepted"
+    }
   });
 
   assert.equal(listedProposals.statusCode, 200);
@@ -4338,13 +4472,16 @@ test("cronjobs, task proposals, and session state routes preserve local payload 
     method: "POST",
     url: "/api/v1/memory-update-proposals/memory-proposal-1/accept",
     payload: {
+      workspace_id: workspace.id,
       summary: "Prefer concise responses."
     }
   });
   const dismissedMemoryProposal = await app.inject({
     method: "POST",
     url: "/api/v1/memory-update-proposals/memory-proposal-1/dismiss",
-    payload: {}
+    payload: {
+      workspace_id: workspace.id
+    }
   });
 
   assert.equal(listedMemoryProposals.statusCode, 200);
@@ -6041,7 +6178,7 @@ test("queue route persists input and runtime state without writing session histo
   const sessionId = response.json().session_id;
   assert.ok(typeof sessionId === "string" && sessionId.trim().length > 0);
 
-  const queued = store.getInput(response.json().input_id);
+  const queued = store.getInput({ workspaceId: workspace.id, inputId: response.json().input_id });
   assert.ok(queued);
   assert.equal(queued.payload.text, "hello world");
   assert.equal("holaboss_user_id" in queued.payload, false);
@@ -6098,10 +6235,14 @@ test("queue route preserves the active claimed input while adding later queued w
     sessionId: "session-main",
     payload: { text: "currently running" },
   });
-  store.updateInput(active.inputId, {
-    status: "CLAIMED",
-    claimedBy: "worker-1",
-    claimedUntil: "2026-04-17T12:00:00.000Z",
+  store.updateInput({
+    workspaceId: workspace.id,
+    inputId: active.inputId,
+    fields: {
+      status: "CLAIMED",
+      claimedBy: "worker-1",
+      claimedUntil: "2026-04-17T12:00:00.000Z",
+    },
   });
   store.updateRuntimeState({
     workspaceId: workspace.id,
@@ -6226,8 +6367,8 @@ test("queue route folds pending background updates into the next main-session in
   });
 
   assert.equal(response.statusCode, 200);
-  const queued = store.getInput(response.json().input_id);
-  const updatedEvent = store.getMainSessionEvent({ eventId: event.eventId });
+  const queued = store.getInput({ workspaceId: workspace.id, inputId: response.json().input_id });
+  const updatedEvent = store.getMainSessionEvent({ workspaceId: workspace.id, eventId: event.eventId });
   const context = (queued?.payload.context ?? {}) as Record<string, unknown>;
 
   assert.ok(queued);
@@ -6332,7 +6473,7 @@ test("queued input edit route updates queued input text without writing session 
   assert.equal(response.json().status, "QUEUED");
   assert.equal(response.json().text, "draft this second");
 
-  const updated = store.getInput(queued.inputId);
+  const updated = store.getInput({ workspaceId: workspace.id, inputId: queued.inputId });
   assert.ok(updated);
   assert.equal(updated?.payload.text, "draft this second");
   const history = store.listSessionMessages({
@@ -6371,10 +6512,14 @@ test("queued input edit route rejects edits after the input is claimed", async (
       context: {},
     },
   });
-  store.updateInput(queued.inputId, {
-    status: "CLAIMED",
-    claimedBy: "worker-1",
-    claimedUntil: "2026-04-17T12:00:00.000Z",
+  store.updateInput({
+    workspaceId: workspace.id,
+    inputId: queued.inputId,
+    fields: {
+      status: "CLAIMED",
+      claimedBy: "worker-1",
+      claimedUntil: "2026-04-17T12:00:00.000Z",
+    },
   });
 
   const response = await app.inject({
@@ -6636,6 +6781,7 @@ test("accept task proposal creates a hidden subagent run with queued work", asyn
     method: "POST",
     url: "/api/v1/task-proposals/proposal-1/accept",
     payload: {
+      workspace_id: workspace.id,
       parent_session_id: "session-main",
       task_name: "Follow up",
       task_prompt: "Write the follow-up and send a reminder",
@@ -6672,7 +6818,7 @@ test("accept task proposal creates a hidden subagent run with queued work", asyn
   assert.equal(childRuntimeState.status, "QUEUED");
   assert.equal(childRuntimeState.currentInputId, body.input.input_id);
 
-  const childInput = store.getInput(body.input.input_id);
+  const childInput = store.getInput({ workspaceId: workspace.id, inputId: body.input.input_id });
   assert.ok(childInput);
   assert.equal(childInput.sessionId, body.session.session_id);
   assert.equal(childInput.priority, 2);
@@ -6693,6 +6839,7 @@ test("accept task proposal creates a hidden subagent run with queued work", asyn
     evolve_candidate: null,
   });
   const subagentRun = store.getSubagentRun({
+    workspaceId: workspace.id,
     subagentId: String(childContext.subagent_id),
   });
   assert.ok(subagentRun);
@@ -6712,7 +6859,9 @@ test("accept task proposal creates a hidden subagent run with queued work", asyn
   const secondAccept = await app.inject({
     method: "POST",
     url: "/api/v1/task-proposals/proposal-1/accept",
-    payload: {}
+    payload: {
+      workspace_id: workspace.id
+    }
   });
   assert.equal(secondAccept.statusCode, 409);
 
@@ -6829,6 +6978,7 @@ test("accepting and dismissing evolve task proposals updates linked skill candid
     method: "POST",
     url: "/api/v1/task-proposals/evolve-proposal-1/accept",
     payload: {
+      workspace_id: workspace.id,
       parent_session_id: "session-main",
       created_by: "workspace_user"
     }
@@ -6837,7 +6987,7 @@ test("accepting and dismissing evolve task proposals updates linked skill candid
   const acceptedBody = accepted.json();
   assert.equal(acceptedBody.proposal.proposal_source, "evolve");
   assert.equal(acceptedBody.session.kind, "subagent");
-  const acceptedInput = store.getInput(acceptedBody.input.input_id);
+  const acceptedInput = store.getInput({ workspaceId: workspace.id, inputId: acceptedBody.input.input_id });
   assert.ok(acceptedInput);
   const acceptedContext = acceptedInput.payload.context as Record<string, unknown>;
   assert.deepEqual(acceptedContext, {
@@ -6872,18 +7022,38 @@ test("accepting and dismissing evolve task proposals updates linked skill candid
       task_proposal_id: "evolve-proposal-1",
     },
   });
-  assert.equal(store.getEvolveSkillCandidate("evolve-skill-input-10")?.status, "accepted");
+  assert.equal(
+    store.getEvolveSkillCandidate({
+      workspaceId: "workspace-1",
+      candidateId: "evolve-skill-input-10"
+    })?.status,
+    "accepted"
+  );
   assert.equal(wakeCount, 1);
 
   const dismissed = await app.inject({
     method: "PATCH",
     url: "/api/v1/task-proposals/evolve-proposal-2",
-    payload: { state: "dismissed" }
+    payload: {
+      workspace_id: workspace.id,
+      state: "dismissed"
+    }
   });
   assert.equal(dismissed.statusCode, 200);
   assert.equal(dismissed.json().proposal.proposal_source, "evolve");
-  assert.equal(store.getEvolveSkillCandidate("evolve-skill-input-11")?.status, "dismissed");
-  assert.ok(store.getEvolveSkillCandidate("evolve-skill-input-11")?.dismissedAt);
+  assert.equal(
+    store.getEvolveSkillCandidate({
+      workspaceId: "workspace-1",
+      candidateId: "evolve-skill-input-11"
+    })?.status,
+    "dismissed"
+  );
+  assert.ok(
+    store.getEvolveSkillCandidate({
+      workspaceId: "workspace-1",
+      candidateId: "evolve-skill-input-11"
+    })?.dismissedAt
+  );
 
   await app.close();
   store.close();
@@ -6997,7 +7167,7 @@ test("queue route accepts staged file and folder attachments and history hydrate
   });
 
   assert.equal(response.statusCode, 200);
-  const queued = store.getInput(response.json().input_id);
+  const queued = store.getInput({ workspaceId: workspace.id, inputId: response.json().input_id });
   assert.ok(queued);
   assert.deepEqual(queued.payload.attachments, [
     {

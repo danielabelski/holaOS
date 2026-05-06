@@ -52,6 +52,27 @@ async function waitFor(
   }
 }
 
+function outputEventsForInput(
+  store: RuntimeStateStore,
+  record: { workspaceId: string; sessionId: string; inputId: string },
+) {
+  return store.listOutputEvents({
+    workspaceId: record.workspaceId,
+    sessionId: record.sessionId,
+    inputId: record.inputId,
+  });
+}
+
+function turnResultForInput(
+  store: RuntimeStateStore,
+  record: { workspaceId: string; inputId: string },
+) {
+  return store.getTurnResult({
+    workspaceId: record.workspaceId,
+    inputId: record.inputId,
+  });
+}
+
 test("runtime queue worker claims queued inputs and executes them in claim order", async () => {
   const root = makeTempDir("hb-runtime-queue-worker-");
   const store = new RuntimeStateStore({
@@ -82,11 +103,11 @@ test("runtime queue worker claims queued inputs and executes them in claim order
     store,
     executeClaimedInput: async (record) => {
       seen.push(record.inputId);
-      store.updateInput(record.inputId, {
+      store.updateInput({ workspaceId: record.workspaceId, inputId: record.inputId, fields: {
         status: "DONE",
         claimedBy: null,
         claimedUntil: null,
-      });
+      } });
     }
   });
 
@@ -217,8 +238,8 @@ test("runtime queue worker claims later queued work from another session while o
   await bStarted.promise;
 
   assert.deepEqual(seenSessions.sort(), ["session-a", "session-b"]);
-  assert.equal(store.getInput(sessionASecond.inputId)?.status, "QUEUED");
-  assert.equal(store.getInput(sessionBFirst.inputId)?.status, "CLAIMED");
+  assert.equal(store.getInput({ workspaceId: sessionASecond.workspaceId, inputId: sessionASecond.inputId })?.status, "QUEUED");
+  assert.equal(store.getInput({ workspaceId: sessionBFirst.workspaceId, inputId: sessionBFirst.inputId })?.status, "CLAIMED");
 
   release.resolve();
   await worker.close();
@@ -262,7 +283,7 @@ test("runtime queue worker marks claimed input failed when delegated execution r
   });
 
   const processed = await worker.processAvailableInputsOnce();
-  const updated = store.getInput(queued.inputId);
+  const updated = store.getInput({ workspaceId: queued.workspaceId, inputId: queued.inputId });
   const runtimeState = store.getRuntimeState({
     workspaceId: "workspace-1",
     sessionId: "session-main"
@@ -319,16 +340,20 @@ test("runtime queue worker can pause a queued session input before it is claimed
     workspaceId: "workspace-1",
     sessionId: "session-main",
   });
-  const updated = store.getInput(queued.inputId);
+  const updated = store.getInput({ workspaceId: queued.workspaceId, inputId: queued.inputId });
   const runtimeState = store.getRuntimeState({
     workspaceId: "workspace-1",
     sessionId: "session-main",
   });
   const events = store.listOutputEvents({
+    workspaceId: queued.workspaceId,
     sessionId: "session-main",
     inputId: queued.inputId,
   });
-  const turnResult = store.getTurnResult({ inputId: queued.inputId });
+  const turnResult = store.getTurnResult({
+    workspaceId: queued.workspaceId,
+    inputId: queued.inputId,
+  });
 
   assert.deepEqual(paused, {
     inputId: queued.inputId,
@@ -390,9 +415,9 @@ test("runtime queue worker recovers expired claimed input before processing fres
     eventType: "run_started",
     payload: { status: "running" },
   });
-  store.updateInput(stale.inputId, {
+  store.updateInput({ workspaceId: stale.workspaceId, inputId: stale.inputId, fields: {
     claimedUntil: "2000-01-01T00:00:00.000Z"
-  });
+  } });
   store.updateRuntimeState({
     workspaceId: "workspace-1",
     sessionId: "session-main",
@@ -408,11 +433,11 @@ test("runtime queue worker recovers expired claimed input before processing fres
     store,
     executeClaimedInput: async (record) => {
       seen.push(record.inputId);
-      store.updateInput(record.inputId, {
+      store.updateInput({ workspaceId: record.workspaceId, inputId: record.inputId, fields: {
         status: "DONE",
         claimedBy: null,
         claimedUntil: null
-      });
+      } });
       store.updateRuntimeState({
         workspaceId: record.workspaceId,
         sessionId: record.sessionId,
@@ -427,13 +452,14 @@ test("runtime queue worker recovers expired claimed input before processing fres
   });
 
   const processed = await worker.processAvailableInputsOnce();
-  const staleUpdated = store.getInput(stale.inputId);
-  const freshUpdated = store.getInput(fresh.inputId);
+  const staleUpdated = store.getInput({ workspaceId: stale.workspaceId, inputId: stale.inputId });
+  const freshUpdated = store.getInput({ workspaceId: fresh.workspaceId, inputId: fresh.inputId });
   const runtimeState = store.getRuntimeState({
     workspaceId: "workspace-1",
     sessionId: "session-main"
   });
   const staleEvents = store.listOutputEvents({
+    workspaceId: stale.workspaceId,
     sessionId: "session-main",
     inputId: stale.inputId
   });
@@ -505,11 +531,11 @@ test("runtime queue worker recovers a stale claimed input from another worker be
     claimStaleHeartbeatMs: 1_000,
     executeClaimedInput: async (record) => {
       seen.push(record.inputId);
-      store.updateInput(record.inputId, {
+      store.updateInput({ workspaceId: record.workspaceId, inputId: record.inputId, fields: {
         status: "DONE",
         claimedBy: null,
         claimedUntil: null
-      });
+      } });
       store.updateRuntimeState({
         workspaceId: record.workspaceId,
         sessionId: record.sessionId,
@@ -524,9 +550,10 @@ test("runtime queue worker recovers a stale claimed input from another worker be
   });
 
   const processed = await worker.processAvailableInputsOnce();
-  const staleUpdated = store.getInput(stale.inputId);
-  const freshUpdated = store.getInput(fresh.inputId);
+  const staleUpdated = store.getInput({ workspaceId: stale.workspaceId, inputId: stale.inputId });
+  const freshUpdated = store.getInput({ workspaceId: fresh.workspaceId, inputId: fresh.inputId });
   const events = store.listOutputEvents({
+    workspaceId: stale.workspaceId,
     sessionId: "session-main",
     inputId: stale.inputId
   });
@@ -589,11 +616,11 @@ test("runtime queue worker requeues a stale claimed input when execution never s
     claimStaleHeartbeatMs: 1_000,
     executeClaimedInput: async (record) => {
       seen.push(record.inputId);
-      store.updateInput(record.inputId, {
+      store.updateInput({ workspaceId: record.workspaceId, inputId: record.inputId, fields: {
         status: "DONE",
         claimedBy: null,
         claimedUntil: null,
-      });
+      } });
       store.updateRuntimeState({
         workspaceId: record.workspaceId,
         sessionId: record.sessionId,
@@ -609,12 +636,13 @@ test("runtime queue worker requeues a stale claimed input when execution never s
 
   const processed = await worker.processAvailableInputsOnce();
 
-  const updated = store.getInput(stale.inputId);
+  const updated = store.getInput({ workspaceId: stale.workspaceId, inputId: stale.inputId });
   const runtimeState = store.getRuntimeState({
     workspaceId: "workspace-1",
     sessionId: "session-main",
   });
   const events = store.listOutputEvents({
+    workspaceId: stale.workspaceId,
     sessionId: "session-main",
     inputId: stale.inputId,
   });
@@ -680,8 +708,8 @@ test("runtime queue worker does not recover a claimed input from another worker 
   const processed = await worker.processAvailableInputsOnce();
 
   assert.equal(processed, 0);
-  assert.equal(store.getInput(active.inputId)?.status, "CLAIMED");
-  assert.equal(store.getInput(blocked.inputId)?.status, "QUEUED");
+  assert.equal(store.getInput({ workspaceId: active.workspaceId, inputId: active.inputId })?.status, "CLAIMED");
+  assert.equal(store.getInput({ workspaceId: blocked.workspaceId, inputId: blocked.inputId })?.status, "QUEUED");
 
   store.close();
 });
@@ -731,9 +759,9 @@ test("runtime queue worker aborts an active run when recovering an expired claim
   assert.equal(firstProcessed, 1);
   await started.promise;
 
-  store.updateInput(queued.inputId, {
+  store.updateInput({ workspaceId: queued.workspaceId, inputId: queued.inputId, fields: {
     claimedUntil: "2000-01-01T00:00:00.000Z"
-  });
+  } });
   store.updateRuntimeState({
     workspaceId: "workspace-1",
     sessionId: "session-main",
@@ -748,12 +776,13 @@ test("runtime queue worker aborts an active run when recovering an expired claim
   const secondProcessed = await worker.processAvailableInputsOnce();
   await worker.close();
 
-  const updated = store.getInput(queued.inputId);
+  const updated = store.getInput({ workspaceId: queued.workspaceId, inputId: queued.inputId });
   const runtimeState = store.getRuntimeState({
     workspaceId: "workspace-1",
     sessionId: "session-main"
   });
   const events = store.listOutputEvents({
+    workspaceId: queued.workspaceId,
     sessionId: "session-main",
     inputId: queued.inputId
   });
@@ -794,11 +823,11 @@ test("runtime queue worker renews an expired claimed input while it waits on a s
       },
     },
   });
-  store.updatePostRunJob(checkpointJob.jobId, {
+  store.updatePostRunJob({ workspaceId: checkpointJob.workspaceId, jobId: checkpointJob.jobId, fields: {
     status: "CLAIMED",
     claimedBy: "memory-worker",
     claimedUntil: new Date(Date.now() + 60_000).toISOString(),
-  });
+  } });
   const queued = store.enqueueInput({
     workspaceId: "workspace-1",
     sessionId: "session-main",
@@ -822,11 +851,11 @@ test("runtime queue worker renews an expired claimed input while it waits on a s
           }).length === 0,
         5_000,
       );
-      store.updateInput(record.inputId, {
+      store.updateInput({ workspaceId: record.workspaceId, inputId: record.inputId, fields: {
         status: "DONE",
         claimedBy: null,
         claimedUntil: null,
-      });
+      } });
       store.updateRuntimeState({
         workspaceId: record.workspaceId,
         sessionId: record.sessionId,
@@ -843,28 +872,34 @@ test("runtime queue worker renews an expired claimed input while it waits on a s
   await worker.start();
   worker.wake();
 
-  await waitFor(() => store.getInput(queued.inputId)?.status === "CLAIMED");
+  await waitFor(
+    () => store.getInput({ workspaceId: queued.workspaceId, inputId: queued.inputId })?.status === "CLAIMED",
+  );
   await sleep(1_250);
 
-  const claimedWhileWaiting = store.getInput(queued.inputId);
+  const claimedWhileWaiting = store.getInput({ workspaceId: queued.workspaceId, inputId: queued.inputId });
   assert.ok(claimedWhileWaiting);
   assert.equal(claimedWhileWaiting.status, "CLAIMED");
   assert.ok(claimedWhileWaiting.claimedUntil);
   assert.ok(Date.parse(claimedWhileWaiting.claimedUntil) > Date.now());
 
-  store.updatePostRunJob(checkpointJob.jobId, {
+  store.updatePostRunJob({ workspaceId: checkpointJob.workspaceId, jobId: checkpointJob.jobId, fields: {
     status: "DONE",
     claimedBy: null,
     claimedUntil: null,
     lastError: null,
-  });
+  } });
   worker.wake();
 
-  await waitFor(() => store.getInput(queued.inputId)?.status === "DONE", 5_000);
+  await waitFor(
+    () => store.getInput({ workspaceId: queued.workspaceId, inputId: queued.inputId })?.status === "DONE",
+    5_000,
+  );
   await worker.close();
 
-  const updated = store.getInput(queued.inputId);
+  const updated = store.getInput({ workspaceId: queued.workspaceId, inputId: queued.inputId });
   const events = store.listOutputEvents({
+    workspaceId: queued.workspaceId,
     sessionId: "session-main",
     inputId: queued.inputId,
   });

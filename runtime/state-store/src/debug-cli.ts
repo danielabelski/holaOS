@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * holaboss-runtime — debug CLI for runtime.db inside a sandbox.
+ * holaboss-runtime — debug CLI for host-state.db inside a sandbox.
  *
  * Use this instead of curling the api-server when you need to:
  *   - Inspect schema version / pending migrations
@@ -28,6 +28,8 @@
  * Exit code: 0 on success, 1 on error, 2 on bad usage.
  */
 import Database from "better-sqlite3";
+import { existsSync } from "node:fs";
+import path from "node:path";
 
 import { LATEST_SEED_VERSION, RUNTIME_DB_MIGRATIONS } from "./migrations/index.js";
 import { runtimeDbPath } from "./store.js";
@@ -70,6 +72,10 @@ function openDb(dbPath: string): Database.Database {
   const db = new Database(dbPath, { readonly: true });
   db.pragma("query_only = ON");
   return db;
+}
+
+function workspaceRuntimeDbPathForWorkspacePath(workspacePath: string): string {
+  return path.join(workspacePath, ".holaboss", "state", "runtime.db");
 }
 
 function readUserVersion(db: Database.Database): number {
@@ -195,40 +201,137 @@ const commands: Record<string, (ctx: CommandContext) => Promise<number> | number
       out("usage: sessions <workspace-id>");
       return 2;
     }
-    const rows = db()
-      .prepare(
-        `SELECT s.session_id, s.kind, s.title, s.parent_session_id,
-                s.created_at, s.updated_at, s.archived_at,
-                rs.status AS runtime_status, rs.current_input_id,
-                rs.heartbeat_at, rs.last_error
-         FROM agent_sessions AS s
-         LEFT JOIN session_runtime_state AS rs
-           ON s.workspace_id = rs.workspace_id AND s.session_id = rs.session_id
-         WHERE s.workspace_id = ?
-         ORDER BY datetime(s.updated_at) DESC`,
+    const workspaceRow = db()
+      .prepare<[string], { workspace_path: string | null }>(
+        "SELECT workspace_path FROM workspaces WHERE id = ? LIMIT 1",
       )
-      .all(workspaceId);
+      .get(workspaceId);
+    const workspacePath = workspaceRow?.workspace_path?.trim() ?? "";
+    const workspaceDbPath = workspacePath
+      ? workspaceRuntimeDbPathForWorkspacePath(workspacePath)
+      : "";
+    const sessionSql = `SELECT s.session_id, s.kind, s.title, s.parent_session_id,
+            s.created_at, s.updated_at, s.archived_at,
+            rs.status AS runtime_status, rs.current_input_id,
+            rs.heartbeat_at, rs.last_error
+     FROM agent_sessions AS s
+     LEFT JOIN session_runtime_state AS rs
+       ON s.workspace_id = rs.workspace_id AND s.session_id = rs.session_id
+     WHERE s.workspace_id = ?
+     ORDER BY datetime(s.updated_at) DESC`;
+    let rows: unknown[] = [];
+    if (workspaceDbPath && existsSync(workspaceDbPath)) {
+      const workspaceDb = openDb(workspaceDbPath);
+      try {
+        rows = workspaceDb.prepare(sessionSql).all(workspaceId);
+      } finally {
+        workspaceDb.close();
+      }
+    } else {
+      const hasLegacySessionsTable = Boolean(
+        db()
+          .prepare<[string], { present: number }>(
+            "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
+          )
+          .get("agent_sessions")?.present,
+      );
+      rows = hasLegacySessionsTable ? db().prepare(sessionSql).all(workspaceId) : [];
+    }
     out(JSON.stringify(rows, null, 2));
     return 0;
   },
 
   jobs: ({ db, out }) => {
-    const queueRows = safeAll(
+    const queueCounts = new Map<string, number>();
+    const postRunCounts = new Map<string, number>();
+    const cronCounts = new Map<string, number>();
+    const evolveCounts = new Map<string, number>();
+    let usedWorkspaceRuntimeDb = false;
+    const workspaceRows = safeAll(
       db(),
-      `SELECT status, COUNT(*) AS count FROM agent_session_inputs GROUP BY status`,
+      `SELECT id, workspace_path FROM workspaces WHERE deleted_at_utc IS NULL`,
     );
-    const cronRows = safeAll(
-      db(),
-      `SELECT enabled, COUNT(*) AS count FROM cronjobs GROUP BY enabled`,
-    );
-    const postRunRows = safeAll(
-      db(),
-      `SELECT status, COUNT(*) AS count FROM post_run_jobs GROUP BY status`,
-    );
-    const evolveRows = safeAll(
-      db(),
-      `SELECT state, COUNT(*) AS count FROM evolve_skill_candidates GROUP BY state`,
-    );
+    if (Array.isArray(workspaceRows)) {
+      for (const workspaceRow of workspaceRows as Array<{ id?: string; workspace_path?: string }>) {
+        const workspacePath =
+          typeof workspaceRow.workspace_path === "string"
+            ? workspaceRow.workspace_path.trim()
+            : "";
+        if (!workspacePath) {
+          continue;
+        }
+        const workspaceRuntimeDbPath = workspaceRuntimeDbPathForWorkspacePath(workspacePath);
+        if (!existsSync(workspaceRuntimeDbPath)) {
+          continue;
+        }
+        usedWorkspaceRuntimeDb = true;
+        const workspaceDb = openDb(workspaceRuntimeDbPath);
+        try {
+          const workspaceQueueRows = safeAll(
+            workspaceDb,
+            `SELECT status, COUNT(*) AS count FROM agent_session_inputs GROUP BY status`,
+          );
+          if (Array.isArray(workspaceQueueRows)) {
+            for (const row of workspaceQueueRows as Array<{ status?: string; count?: number }>) {
+              const key = typeof row.status === "string" ? row.status : "";
+              queueCounts.set(key, (queueCounts.get(key) ?? 0) + Number(row.count ?? 0));
+            }
+          }
+          const workspacePostRunRows = safeAll(
+            workspaceDb,
+            `SELECT status, COUNT(*) AS count FROM post_run_jobs GROUP BY status`,
+          );
+          if (Array.isArray(workspacePostRunRows)) {
+            for (const row of workspacePostRunRows as Array<{ status?: string; count?: number }>) {
+              const key = typeof row.status === "string" ? row.status : "";
+              postRunCounts.set(key, (postRunCounts.get(key) ?? 0) + Number(row.count ?? 0));
+            }
+          }
+          const workspaceCronRows = safeAll(
+            workspaceDb,
+            `SELECT enabled, COUNT(*) AS count FROM cronjobs GROUP BY enabled`,
+          );
+          if (Array.isArray(workspaceCronRows)) {
+            for (const row of workspaceCronRows as Array<{ enabled?: number; count?: number }>) {
+              const key = String(row.enabled ?? 0);
+              cronCounts.set(key, (cronCounts.get(key) ?? 0) + Number(row.count ?? 0));
+            }
+          }
+          const workspaceEvolveRows = safeAll(
+            workspaceDb,
+            `SELECT status AS state, COUNT(*) AS count FROM evolve_skill_candidates GROUP BY status`,
+          );
+          if (Array.isArray(workspaceEvolveRows)) {
+            for (const row of workspaceEvolveRows as Array<{ state?: string; count?: number }>) {
+              const key = typeof row.state === "string" ? row.state : "";
+              evolveCounts.set(key, (evolveCounts.get(key) ?? 0) + Number(row.count ?? 0));
+            }
+          }
+        } finally {
+          workspaceDb.close();
+        }
+      }
+    }
+    const queueRows = usedWorkspaceRuntimeDb
+      ? Array.from(queueCounts.entries()).map(([status, count]) => ({ status, count }))
+      : safeAll(
+          db(),
+          `SELECT status, COUNT(*) AS count FROM agent_session_inputs GROUP BY status`,
+        );
+    const postRunRows = usedWorkspaceRuntimeDb
+      ? Array.from(postRunCounts.entries()).map(([status, count]) => ({ status, count }))
+      : safeAll(
+          db(),
+          `SELECT status, COUNT(*) AS count FROM post_run_jobs GROUP BY status`,
+        );
+    const cronRows = Array.from(cronCounts.entries()).map(([enabled, count]) => ({
+      enabled: Number(enabled),
+      count,
+    }));
+    const evolveRows = Array.from(evolveCounts.entries()).map(([state, count]) => ({
+      state,
+      count,
+    }));
     out(
       JSON.stringify(
         {
@@ -283,7 +386,7 @@ function safeAll(
   }
 }
 
-const USAGE = `holaboss-runtime — debug CLI for runtime.db
+const USAGE = `holaboss-runtime — debug CLI for host-state.db
 
 Usage:
   holaboss-runtime [--db-path <path>] <command> [args]
@@ -299,7 +402,7 @@ Commands:
   help                    Show this message
 
 Flags:
-  --db-path <path>        Override runtime.db location (default: env-resolved)`;
+  --db-path <path>        Override host-state.db location (default: env-resolved)`;
 
 export interface RunCliOptions {
   argv?: ReadonlyArray<string>;

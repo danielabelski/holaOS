@@ -7,6 +7,10 @@ import { afterEach, test } from "node:test";
 import { RuntimeStateStore, type MemoryEntryRecord } from "@holaboss/runtime-state-store";
 
 import { recalledMemoryContextFromManifest } from "./memory-recall-manifest.js";
+import {
+  globalMemoryDirForWorkspaceRoot,
+  workspaceMemoryDir,
+} from "./workspace-bundle-paths.js";
 
 const ORIGINAL_FETCH = globalThis.fetch;
 
@@ -15,7 +19,11 @@ afterEach(() => {
 });
 
 function writeMemoryFile(workspaceRoot: string, relPath: string, content: string): void {
-  const absPath = path.join(workspaceRoot, "memory", ...relPath.split("/"));
+  const normalized = relPath.replaceAll("\\", "/").replace(/^\/+/, "");
+  const match = /^workspace\/([^/]+)\/(.+)$/.exec(normalized);
+  const absPath = match
+    ? path.join(workspaceMemoryDir(path.join(workspaceRoot, match[1])), match[2])
+    : path.join(globalMemoryDirForWorkspaceRoot(workspaceRoot), ...normalized.split("/"));
   fs.mkdirSync(path.dirname(absPath), { recursive: true });
   fs.writeFileSync(absPath, content, "utf8");
 }
@@ -26,7 +34,7 @@ function makeMemoryEntry(
 ): MemoryEntryRecord {
   return {
     memoryId: overrides.memoryId,
-    workspaceId: overrides.workspaceId ?? "workspace-1",
+    workspaceId: overrides.workspaceId === undefined ? "workspace-1" : overrides.workspaceId,
     sessionId: overrides.sessionId ?? "session-1",
     scope: overrides.scope,
     memoryType: overrides.memoryType,

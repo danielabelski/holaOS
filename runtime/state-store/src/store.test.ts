@@ -6,6 +6,7 @@ import { afterEach, test } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
 
 import Database from "better-sqlite3";
+import * as sqliteVec from "sqlite-vec";
 
 import { RuntimeStateStore } from "./store.js";
 
@@ -23,6 +24,10 @@ function makeTempDir(prefix: string): string {
   return dir;
 }
 
+function workspaceRuntimeDbFile(workspaceRoot: string, workspaceId: string): string {
+  return path.join(workspaceRoot, workspaceId, ".holaboss", "state", "runtime.db");
+}
+
 test("workspace registry round trip uses hidden identity file", () => {
   const root = makeTempDir("hb-state-store-");
   const dbPath = path.join(root, "runtime.db");
@@ -36,7 +41,7 @@ test("workspace registry round trip uses hidden identity file", () => {
     status: "active"
   });
 
-  const identityPath = path.join(workspaceRoot, "workspace-1", ".holaboss", "workspace_id");
+  const identityPath = path.join(workspaceRoot, "workspace-1", ".holaboss", "state", "workspace_id");
   assert.equal(fs.readFileSync(identityPath, "utf-8").trim(), "workspace-1");
   assert.equal(created.id, "workspace-1");
   assert.deepEqual(store.getWorkspace("workspace-1"), created);
@@ -60,6 +65,327 @@ test("workspace registry round trip uses hidden identity file", () => {
   store.close();
 });
 
+test("control-plane metadata lives in control-plane.db while runtime.db keeps the mirrored workspace registry", () => {
+  const root = makeTempDir("hb-state-store-");
+  const dbPath = path.join(root, "runtime.db");
+  const controlPlanePath = path.join(root, "control-plane.db");
+  const workspaceRoot = path.join(root, "workspace");
+  const store = new RuntimeStateStore({ dbPath, workspaceRoot });
+
+  store.createWorkspace({
+    workspaceId: "workspace-1",
+    name: "Acme",
+    harness: "pi",
+    status: "active"
+  });
+  store.upsertRuntimeUserProfile({
+    profileId: "default",
+    name: "Jeffrey",
+    nameSource: "manual"
+  });
+  store.upsertAppCatalogEntry({
+    appId: "calendar",
+    source: "marketplace",
+    name: "Calendar",
+    description: "Calendar app",
+    icon: null,
+    category: null,
+    tags: ["productivity"],
+    version: "1.0.0",
+    archiveUrl: null,
+    archivePath: null,
+    target: "apps/calendar",
+    cachedAt: "2026-05-06T00:00:00.000Z"
+  });
+  store.close();
+
+  const runtimeDb = new Database(dbPath, { readonly: true });
+  const runtimeTables = new Set<string>(
+    (runtimeDb.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).map(
+      (row) => row.name
+    )
+  );
+  const runtimeWorkspace = runtimeDb
+    .prepare<[string], { workspace_path: string }>("SELECT workspace_path FROM workspaces WHERE id = ? LIMIT 1")
+    .get("workspace-1");
+  runtimeDb.close();
+
+  const controlPlaneDb = new Database(controlPlanePath, { readonly: true });
+  const controlPlaneTables = new Set<string>(
+    (controlPlaneDb.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).map(
+      (row) => row.name
+    )
+  );
+  const profileRow = controlPlaneDb
+    .prepare<[string], { name: string | null }>("SELECT name FROM runtime_user_profiles WHERE profile_id = ? LIMIT 1")
+    .get("default");
+  const appCatalogRow = controlPlaneDb
+    .prepare<[string], { name: string }>("SELECT name FROM app_catalog WHERE app_id = ? LIMIT 1")
+    .get("calendar");
+  controlPlaneDb.close();
+
+  assert.ok(runtimeWorkspace);
+  assert.equal(runtimeTables.has("workspaces"), true);
+  assert.equal(runtimeTables.has("runtime_user_profiles"), false);
+  assert.equal(runtimeTables.has("app_catalog"), false);
+  assert.equal(controlPlaneTables.has("workspaces"), true);
+  assert.equal(controlPlaneTables.has("runtime_user_profiles"), true);
+  assert.equal(controlPlaneTables.has("app_catalog"), true);
+  assert.equal(profileRow?.name, "Jeffrey");
+  assert.equal(appCatalogRow?.name, "Calendar");
+});
+
+test("opening the store migrates legacy runtime.db files into host-state.db by default", () => {
+  const root = makeTempDir("hb-state-store-");
+  const legacyPath = path.join(root, "state", "runtime.db");
+  const hostStatePath = path.join(root, "state", "host-state.db");
+  const workspaceRoot = path.join(root, "workspace");
+
+  fs.mkdirSync(path.dirname(legacyPath), { recursive: true });
+  const legacyDb = new Database(legacyPath);
+  legacyDb.exec("CREATE TABLE legacy_marker (value TEXT NOT NULL);");
+  legacyDb.exec("INSERT INTO legacy_marker (value) VALUES ('migrated');");
+  legacyDb.close();
+
+  const store = new RuntimeStateStore({ workspaceRoot, sandboxRoot: root });
+  store.listWorkspaces();
+  store.close();
+
+  assert.equal(fs.existsSync(hostStatePath), true);
+  const migratedDb = new Database(hostStatePath, { readonly: true });
+  const row = migratedDb
+    .prepare<[], { value: string }>("SELECT value FROM legacy_marker LIMIT 1")
+    .get();
+  migratedDb.close();
+  assert.equal(row?.value, "migrated");
+});
+
+test("control-plane memory vector backfill migrates legacy user-scoped vec rows", () => {
+  const root = makeTempDir("hb-state-store-control-plane-vec-");
+  const dbPath = path.join(root, "runtime.db");
+  const workspaceRoot = path.join(root, "workspace");
+
+  const legacyDb = new Database(dbPath);
+  sqliteVec.load(legacyDb);
+  legacyDb.exec(`
+    CREATE TABLE memory_embedding_index (
+      vec_rowid INTEGER PRIMARY KEY,
+      memory_id TEXT NOT NULL UNIQUE,
+      path TEXT NOT NULL UNIQUE,
+      workspace_id TEXT,
+      scope_bucket TEXT NOT NULL,
+      memory_type TEXT NOT NULL,
+      content_fingerprint TEXT NOT NULL,
+      embedding_model TEXT NOT NULL,
+      embedding_dim INTEGER NOT NULL,
+      indexed_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE VIRTUAL TABLE memory_recall_vec USING vec0(
+      vec_rowid INTEGER PRIMARY KEY,
+      embedding float[1536],
+      scope_bucket TEXT,
+      workspace_id TEXT,
+      memory_type TEXT
+    );
+  `);
+  legacyDb
+    .prepare(`
+      INSERT INTO memory_embedding_index (
+        vec_rowid,
+        memory_id,
+        path,
+        workspace_id,
+        scope_bucket,
+        memory_type,
+        content_fingerprint,
+        embedding_model,
+        embedding_dim,
+        indexed_at,
+        updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `)
+    .run(
+      14,
+      "user-preference:style",
+      "preference/response-style.md",
+      null,
+      "preference",
+      "preference",
+      "b".repeat(64),
+      "text-embedding-3-small",
+      1536,
+      "2026-05-06T00:00:00.000Z",
+      "2026-05-06T00:00:00.000Z",
+    );
+  const embedding = new Float32Array(1536);
+  embedding[1] = 1;
+  legacyDb
+    .prepare(`
+      INSERT INTO memory_recall_vec (vec_rowid, embedding, scope_bucket, workspace_id, memory_type)
+      VALUES (CAST(? AS INTEGER), ?, ?, ?, ?)
+    `)
+    .run(14, embedding, "preference", "", "preference");
+  legacyDb.close();
+
+  const store = new RuntimeStateStore({ dbPath, workspaceRoot });
+  assert.equal(store.supportsVectorIndex(), true);
+
+  const results = store.searchUserMemoryRecallVectors({
+    embedding,
+    limit: 5,
+  });
+
+  assert.equal(results[0]?.memoryId, "user-preference:style");
+  assert.equal(results[0]?.path, "preference/response-style.md");
+  store.close();
+});
+
+test("control-plane memory vector backfill is idempotent when a prior retry already inserted the vec row", () => {
+  const root = makeTempDir("hb-state-store-control-plane-vec-retry-");
+  const dbPath = path.join(root, "runtime.db");
+  const controlPlanePath = path.join(root, "control-plane.db");
+  const workspaceRoot = path.join(root, "workspace");
+
+  const embedding = new Float32Array(1536);
+  embedding[1] = 1;
+
+  const legacyDb = new Database(dbPath);
+  sqliteVec.load(legacyDb);
+  legacyDb.exec(`
+    CREATE TABLE memory_embedding_index (
+      vec_rowid INTEGER PRIMARY KEY,
+      memory_id TEXT NOT NULL UNIQUE,
+      path TEXT NOT NULL UNIQUE,
+      workspace_id TEXT,
+      scope_bucket TEXT NOT NULL,
+      memory_type TEXT NOT NULL,
+      content_fingerprint TEXT NOT NULL,
+      embedding_model TEXT NOT NULL,
+      embedding_dim INTEGER NOT NULL,
+      indexed_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE VIRTUAL TABLE memory_recall_vec USING vec0(
+      vec_rowid INTEGER PRIMARY KEY,
+      embedding float[1536],
+      scope_bucket TEXT,
+      workspace_id TEXT,
+      memory_type TEXT
+    );
+  `);
+  legacyDb
+    .prepare(`
+      INSERT INTO memory_embedding_index (
+        vec_rowid,
+        memory_id,
+        path,
+        workspace_id,
+        scope_bucket,
+        memory_type,
+        content_fingerprint,
+        embedding_model,
+        embedding_dim,
+        indexed_at,
+        updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `)
+    .run(
+      14,
+      "user-preference:style",
+      "preference/response-style.md",
+      null,
+      "preference",
+      "preference",
+      "b".repeat(64),
+      "text-embedding-3-small",
+      1536,
+      "2026-05-06T00:00:00.000Z",
+      "2026-05-06T00:00:00.000Z",
+    );
+  legacyDb
+    .prepare(`
+      INSERT INTO memory_recall_vec (vec_rowid, embedding, scope_bucket, workspace_id, memory_type)
+      VALUES (CAST(? AS INTEGER), ?, ?, ?, ?)
+    `)
+    .run(14, embedding, "preference", "", "preference");
+  legacyDb.close();
+
+  const controlPlaneDb = new Database(controlPlanePath);
+  sqliteVec.load(controlPlaneDb);
+  controlPlaneDb.exec(`
+    CREATE TABLE memory_embedding_index (
+      vec_rowid INTEGER PRIMARY KEY,
+      memory_id TEXT NOT NULL UNIQUE,
+      path TEXT NOT NULL UNIQUE,
+      workspace_id TEXT,
+      scope_bucket TEXT NOT NULL,
+      memory_type TEXT NOT NULL,
+      content_fingerprint TEXT NOT NULL,
+      embedding_model TEXT NOT NULL,
+      embedding_dim INTEGER NOT NULL,
+      indexed_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE VIRTUAL TABLE memory_recall_vec USING vec0(
+      vec_rowid INTEGER PRIMARY KEY,
+      embedding float[1536],
+      scope_bucket TEXT,
+      workspace_id TEXT,
+      memory_type TEXT
+    );
+  `);
+  controlPlaneDb
+    .prepare(`
+      INSERT INTO memory_embedding_index (
+        vec_rowid,
+        memory_id,
+        path,
+        workspace_id,
+        scope_bucket,
+        memory_type,
+        content_fingerprint,
+        embedding_model,
+        embedding_dim,
+        indexed_at,
+        updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `)
+    .run(
+      14,
+      "user-preference:style",
+      "preference/response-style.md",
+      null,
+      "preference",
+      "preference",
+      "b".repeat(64),
+      "text-embedding-3-small",
+      1536,
+      "2026-05-06T00:00:00.000Z",
+      "2026-05-06T00:00:00.000Z",
+    );
+  controlPlaneDb
+    .prepare(`
+      INSERT INTO memory_recall_vec (vec_rowid, embedding, scope_bucket, workspace_id, memory_type)
+      VALUES (CAST(? AS INTEGER), ?, ?, ?, ?)
+    `)
+    .run(14, embedding, "preference", "", "preference");
+  controlPlaneDb.close();
+
+  const store = new RuntimeStateStore({ dbPath, controlPlaneDbPath: controlPlanePath, workspaceRoot });
+  store.listWorkspaces();
+  store.close();
+
+  const verifyDb = new Database(controlPlanePath, { readonly: true });
+  sqliteVec.load(verifyDb);
+  const countRow = verifyDb
+    .prepare<[], { total: number }>("SELECT COUNT(*) AS total FROM memory_recall_vec WHERE vec_rowid = 14")
+    .get();
+  verifyDb.close();
+
+  assert.equal(countRow?.total, 1);
+});
+
 test("createWorkspace honors explicit workspacePath and registers it", () => {
   const root = makeTempDir("hb-state-store-");
   const dbPath = path.join(root, "runtime.db");
@@ -77,7 +403,7 @@ test("createWorkspace honors explicit workspacePath and registers it", () => {
 
   assert.equal(created.id, "ws-custom");
   assert.equal(fs.existsSync(customPath), true);
-  const identityPath = path.join(customPath, ".holaboss", "workspace_id");
+  const identityPath = path.join(customPath, ".holaboss", "state", "workspace_id");
   assert.equal(fs.readFileSync(identityPath, "utf-8").trim(), "ws-custom");
   assert.equal(path.resolve(store.workspaceDir("ws-custom")), path.resolve(customPath));
   // Default workspaceRoot was not touched.
@@ -292,6 +618,38 @@ test("createWorkspace allows reusing a soft-deleted workspace's former path", ()
   store.close();
 });
 
+test("createWorkspace revives a deleted workspace when the preserved folder still has its identity bundle", () => {
+  const root = makeTempDir("hb-state-store-");
+  const customRoot = makeTempDir("hb-custom-ws-");
+  const customPath = path.join(customRoot, "revive-folder");
+  const store = new RuntimeStateStore({
+    dbPath: path.join(root, "runtime.db"),
+    workspaceRoot: path.join(root, "workspace")
+  });
+
+  const created = store.createWorkspace({
+    workspaceId: "ws-revive",
+    name: "Revive Me",
+    harness: "pi",
+    workspacePath: customPath
+  });
+  fs.writeFileSync(path.join(customPath, "AGENTS.md"), "preserved\n");
+  store.deleteWorkspace(created.id);
+
+  const revived = store.createWorkspace({
+    name: "Ignored New Name",
+    harness: "pi",
+    workspacePath: customPath
+  });
+
+  assert.equal(revived.id, created.id);
+  assert.equal(revived.deletedAtUtc, null);
+  assert.equal(revived.name, "Revive Me");
+  assert.equal(path.resolve(store.workspaceDir(created.id)), path.resolve(customPath));
+  assert.equal(fs.readFileSync(path.join(customPath, "AGENTS.md"), "utf8"), "preserved\n");
+  store.close();
+});
+
 test("relocateWorkspace accepts an empty directory and re-registers", () => {
   const root = makeTempDir("hb-state-store-");
   const customRoot = makeTempDir("hb-custom-ws-");
@@ -307,7 +665,7 @@ test("relocateWorkspace accepts an empty directory and re-registers", () => {
   assert.equal(updated.id, "ws-r");
   assert.equal(path.resolve(store.workspaceDir("ws-r")), path.resolve(newPath));
   const identity = fs
-    .readFileSync(path.join(newPath, ".holaboss", "workspace_id"), "utf-8")
+    .readFileSync(path.join(newPath, ".holaboss", "state", "workspace_id"), "utf-8")
     .trim();
   assert.equal(identity, "ws-r");
   store.close();
@@ -318,8 +676,8 @@ test("relocateWorkspace accepts a directory that already has a matching identity
   const customRoot = makeTempDir("hb-custom-ws-");
   const movedPath = path.join(customRoot, "moved");
   // Pre-seed the folder as if the user moved a workspace dir here.
-  fs.mkdirSync(path.join(movedPath, ".holaboss"), { recursive: true });
-  fs.writeFileSync(path.join(movedPath, ".holaboss", "workspace_id"), "ws-moved");
+  fs.mkdirSync(path.join(movedPath, ".holaboss", "state"), { recursive: true });
+  fs.writeFileSync(path.join(movedPath, ".holaboss", "state", "workspace_id"), "ws-moved");
   fs.writeFileSync(path.join(movedPath, "AGENTS.md"), "preserved");
 
   const store = new RuntimeStateStore({
@@ -333,6 +691,28 @@ test("relocateWorkspace accepts a directory that already has a matching identity
   // Pre-existing content is preserved (we don't wipe).
   assert.equal(fs.readFileSync(path.join(movedPath, "AGENTS.md"), "utf-8"), "preserved");
   assert.equal(path.resolve(store.workspaceDir("ws-moved")), path.resolve(movedPath));
+  store.close();
+});
+
+test("relocateWorkspace still accepts a directory with the legacy identity file path", () => {
+  const root = makeTempDir("hb-state-store-");
+  const customRoot = makeTempDir("hb-custom-ws-");
+  const movedPath = path.join(customRoot, "moved-legacy");
+  fs.mkdirSync(path.join(movedPath, ".holaboss"), { recursive: true });
+  fs.writeFileSync(path.join(movedPath, ".holaboss", "workspace_id"), "ws-moved");
+
+  const store = new RuntimeStateStore({
+    dbPath: path.join(root, "runtime.db"),
+    workspaceRoot: path.join(root, "workspace")
+  });
+  store.createWorkspace({ workspaceId: "ws-moved", name: "M", harness: "pi" });
+
+  store.relocateWorkspace("ws-moved", movedPath);
+
+  assert.equal(
+    fs.readFileSync(path.join(movedPath, ".holaboss", "state", "workspace_id"), "utf-8").trim(),
+    "ws-moved",
+  );
   store.close();
 });
 
@@ -434,7 +814,7 @@ test("runtime schema migrates workspace rows to registry and identity file", () 
   const rows = store.listWorkspaces();
 
   assert.deepEqual(rows.map((record) => record.id), ["workspace-legacy"]);
-  const identityPath = path.join(workspaceRoot, "workspace-legacy", ".holaboss", "workspace_id");
+  const identityPath = path.join(workspaceRoot, "workspace-legacy", ".holaboss", "state", "workspace_id");
   assert.equal(fs.readFileSync(identityPath, "utf-8").trim(), "workspace-legacy");
 
   const dbAfter = new Database(dbPath, { readonly: true });
@@ -484,6 +864,7 @@ test("workspaceDir recovers when folder is renamed", () => {
 test("getWorkspace recovers missing row from identity file", () => {
   const root = makeTempDir("hb-state-store-");
   const dbPath = path.join(root, "runtime.db");
+  const controlPlanePath = path.join(root, "control-plane.db");
   const workspaceRoot = path.join(root, "workspace");
   const store = new RuntimeStateStore({
     dbPath,
@@ -497,9 +878,12 @@ test("getWorkspace recovers missing row from identity file", () => {
     harness: "pi",
     status: "active"
   });
-  const db = new Database(dbPath);
-  db.prepare("DELETE FROM workspaces WHERE id = ?").run("workspace-1");
-  db.close();
+  const controlPlaneDb = new Database(controlPlanePath);
+  controlPlaneDb.prepare("DELETE FROM workspaces WHERE id = ?").run("workspace-1");
+  controlPlaneDb.close();
+  const runtimeDb = new Database(dbPath);
+  runtimeDb.prepare("DELETE FROM workspaces WHERE id = ?").run("workspace-1");
+  runtimeDb.close();
 
   const recovered = store.getWorkspace("workspace-1");
 
@@ -623,10 +1007,12 @@ test("conversation bindings round trip across channels and session ownership", (
     metadata: { chat_id: "chat-123" }
   });
   const touched = store.touchConversationBinding({
+    workspaceId: "workspace-1",
     bindingId: desktop.bindingId,
     lastActiveAt: "2026-04-24T12:00:00.000Z"
   });
   const inactive = store.setConversationBindingActive({
+    workspaceId: "workspace-1",
     bindingId: telegram.bindingId,
     isActive: false
   });
@@ -682,6 +1068,7 @@ test("subagent runs round trip and support waiting-user resume metadata", () => 
     status: "running"
   });
   const updated = store.updateSubagentRun({
+    workspaceId: "workspace-1",
     subagentId: created.subagentId,
     fields: {
       status: "waiting_on_user",
@@ -706,11 +1093,15 @@ test("subagent runs round trip and support waiting-user resume metadata", () => 
     updated
   );
   assert.deepEqual(
-    store.listSubagentRunsByOwner({ ownerMainSessionId: "session-main" }).map((record) => record.subagentId),
+    store.listSubagentRunsByOwner({ workspaceId: "workspace-1", ownerMainSessionId: "session-main" }).map(
+      (record) => record.subagentId
+    ),
     [created.subagentId]
   );
   assert.deepEqual(
-    store.listWaitingSubagentRuns({ ownerMainSessionId: "session-main" }).map((record) => record.subagentId),
+    store.listWaitingSubagentRuns({ workspaceId: "workspace-1", ownerMainSessionId: "session-main" }).map(
+      (record) => record.subagentId
+    ),
     [created.subagentId]
   );
   assert.deepEqual(
@@ -758,6 +1149,7 @@ test("transferring subagent ownership also moves pending queued main-session eve
   });
 
   const transferred = store.transferSubagentOwnership({
+    workspaceId: "workspace-1",
     subagentId: run.subagentId,
     ownerMainSessionId: "session-main-telegram",
     ownerTransferredAt: "2026-04-24T12:21:00.000Z"
@@ -766,8 +1158,8 @@ test("transferring subagent ownership also moves pending queued main-session eve
   assert.ok(transferred);
   assert.equal(transferred?.ownerMainSessionId, "session-main-telegram");
   assert.equal(transferred?.ownerTransferredAt, "2026-04-24T12:21:00.000Z");
-  assert.equal(store.getMainSessionEvent({ eventId: pending.eventId })?.ownerMainSessionId, "session-main-telegram");
-  assert.equal(store.getMainSessionEvent({ eventId: delivered.eventId })?.ownerMainSessionId, "session-main-desktop");
+  assert.equal(store.getMainSessionEvent({ workspaceId: "workspace-1", eventId: pending.eventId })?.ownerMainSessionId, "session-main-telegram");
+  assert.equal(store.getMainSessionEvent({ workspaceId: "workspace-1", eventId: delivered.eventId })?.ownerMainSessionId, "session-main-desktop");
 
   store.close();
 });
@@ -796,16 +1188,19 @@ test("main session event queue supports materialize deliver supersede lifecycle"
     payload: { question: "Create a new GCP project?" }
   });
 
-  const pending = store.listPendingMainSessionEvents({ ownerMainSessionId: "session-main" });
+  const pending = store.listPendingMainSessionEvents({ workspaceId: "workspace-1", ownerMainSessionId: "session-main" });
   const materialized = store.markMainSessionEventsMaterialized({
+    workspaceId: "workspace-1",
     eventIds: [first.eventId],
     materializedInputId: "main-input-1"
   });
   const delivered = store.markMainSessionEventsDelivered({
+    workspaceId: "workspace-1",
     eventIds: [first.eventId],
     deliveredAt: "2026-04-24T12:30:00.000Z"
   });
   const superseded = store.markMainSessionEventsSuperseded({
+    workspaceId: "workspace-1",
     eventIds: [second.eventId],
     supersededAt: "2026-04-24T12:31:00.000Z"
   });
@@ -817,7 +1212,7 @@ test("main session event queue supports materialize deliver supersede lifecycle"
   assert.equal(delivered[0]?.deliveredAt, "2026-04-24T12:30:00.000Z");
   assert.equal(superseded[0]?.status, "superseded");
   assert.equal(superseded[0]?.supersededAt, "2026-04-24T12:31:00.000Z");
-  assert.equal(store.listPendingMainSessionEvents({ ownerMainSessionId: "session-main" }).length, 0);
+  assert.equal(store.listPendingMainSessionEvents({ workspaceId: "workspace-1", ownerMainSessionId: "session-main" }).length, 0);
 
   store.close();
 });
@@ -847,13 +1242,14 @@ test("main session pending selectors exclude materialized events", () => {
   });
 
   store.markMainSessionEventsMaterialized({
+    workspaceId: "workspace-1",
     eventIds: [materialized.eventId],
     materializedInputId: "main-input-1"
   });
 
   assert.deepEqual(
     store
-      .listPendingMainSessionEvents({ ownerMainSessionId: "session-main" })
+      .listPendingMainSessionEvents({ workspaceId: "workspace-1", ownerMainSessionId: "session-main" })
       .map((event) => event.eventId),
     [pending.eventId]
   );
@@ -1403,10 +1799,14 @@ test("input queue supports idempotent enqueue, update, and claiming by priority"
   assert.equal(deduped.inputId, first.inputId);
   assert.equal(store.hasAvailableInputsForSession({ sessionId: "session-main", workspaceId: "workspace-1" }), true);
 
-  const updated = store.updateInput(first.inputId, {
-    status: "QUEUED",
-    claimedBy: "worker-old",
-    payload: { text: "hello-updated" }
+  const updated = store.updateInput({
+    workspaceId: "workspace-1",
+    inputId: first.inputId,
+    fields: {
+      status: "QUEUED",
+      claimedBy: "worker-old",
+      payload: { text: "hello-updated" }
+    }
   });
   assert.ok(updated);
   assert.deepEqual(updated.payload, { text: "hello-updated" });
@@ -1509,7 +1909,7 @@ test("claimInputs skips queued work for sessions that already have a live claime
     secondClaim.map((record) => record.inputId),
     [available.inputId]
   );
-  assert.equal(store.getInput(blocked.inputId)?.status, "QUEUED");
+  assert.equal(store.getInput({ workspaceId: "workspace-1", inputId: blocked.inputId })?.status, "QUEUED");
 
   store.close();
 });
@@ -1550,10 +1950,14 @@ test("post-run job queue supports idempotent enqueue, update, and claiming by pr
 
   assert.equal(deduped.jobId, first.jobId);
 
-  const updated = store.updatePostRunJob(first.jobId, {
-    status: "QUEUED",
-    claimedBy: "worker-old",
-    payload: { instruction: "hello-updated" }
+  const updated = store.updatePostRunJob({
+    workspaceId: "workspace-1",
+    jobId: first.jobId,
+    fields: {
+      status: "QUEUED",
+      claimedBy: "worker-old",
+      payload: { instruction: "hello-updated" }
+    }
   });
   assert.ok(updated);
   assert.deepEqual(updated.payload, { instruction: "hello-updated" });
@@ -1596,15 +2000,23 @@ test("state store lists expired claimed post-run jobs", () => {
     payload: {}
   });
 
-  store.updatePostRunJob(stale.jobId, {
-    status: "CLAIMED",
-    claimedBy: "worker-old",
-    claimedUntil: "2000-01-01T00:00:00.000Z"
+  store.updatePostRunJob({
+    workspaceId: "workspace-1",
+    jobId: stale.jobId,
+    fields: {
+      status: "CLAIMED",
+      claimedBy: "worker-old",
+      claimedUntil: "2000-01-01T00:00:00.000Z"
+    }
   });
-  store.updatePostRunJob(active.jobId, {
-    status: "CLAIMED",
-    claimedBy: "worker-new",
-    claimedUntil: "2999-01-01T00:00:00.000Z"
+  store.updatePostRunJob({
+    workspaceId: "workspace-1",
+    jobId: active.jobId,
+    fields: {
+      status: "CLAIMED",
+      claimedBy: "worker-new",
+      claimedUntil: "2999-01-01T00:00:00.000Z"
+    }
   });
 
   const expired = store.listExpiredClaimedPostRunJobs("2026-01-01T00:00:00.000Z");
@@ -1665,7 +2077,8 @@ test("runtime state migration expands the status check constraint to include pau
   });
   store.close();
 
-  const db = new Database(dbPath);
+  const workspaceDbPath = workspaceRuntimeDbFile(workspaceRoot, "workspace-1");
+  const db = new Database(workspaceDbPath);
   db.exec(`
     ALTER TABLE session_runtime_state RENAME TO session_runtime_state_current;
 
@@ -1729,15 +2142,23 @@ test("state store lists expired claimed inputs", () => {
     payload: { text: "active" }
   });
 
-  store.updateInput(stale.inputId, {
-    status: "CLAIMED",
-    claimedBy: "worker-old",
-    claimedUntil: "2000-01-01T00:00:00.000Z"
+  store.updateInput({
+    workspaceId: "workspace-1",
+    inputId: stale.inputId,
+    fields: {
+      status: "CLAIMED",
+      claimedBy: "worker-old",
+      claimedUntil: "2000-01-01T00:00:00.000Z"
+    }
   });
-  store.updateInput(active.inputId, {
-    status: "CLAIMED",
-    claimedBy: "worker-new",
-    claimedUntil: "2999-01-01T00:00:00.000Z"
+  store.updateInput({
+    workspaceId: "workspace-1",
+    inputId: active.inputId,
+    fields: {
+      status: "CLAIMED",
+      claimedBy: "worker-new",
+      claimedUntil: "2999-01-01T00:00:00.000Z"
+    }
   });
 
   const expired = store.listExpiredClaimedInputs("2026-01-01T00:00:00.000Z");
@@ -1893,13 +2314,19 @@ test("output events support latest id, incremental listing, and tail mode", () =
     payload: { delta: "hi" }
   });
 
-  const latest = store.latestOutputEventId({ sessionId: "session-main", inputId: "input-1" });
+  const latest = store.latestOutputEventId({
+    workspaceId: "workspace-1",
+    sessionId: "session-main",
+    inputId: "input-1",
+  });
   const incremental = store.listOutputEvents({
+    workspaceId: "workspace-1",
     sessionId: "session-main",
     inputId: "input-1",
     afterEventId: 1
   });
   const tail = store.listOutputEvents({
+    workspaceId: "workspace-1",
     sessionId: "session-main",
     inputId: "input-1",
     includeHistory: false
@@ -1936,12 +2363,14 @@ test("terminal sessions support create update event append and list", () => {
   });
 
   const outputEvent = store.appendTerminalSessionEvent({
+    workspaceId: "workspace-1",
     terminalId: "term-1",
     eventType: "output",
     payload: { data: "ready\n" },
     status: "running",
   });
   const exitEvent = store.appendTerminalSessionEvent({
+    workspaceId: "workspace-1",
     terminalId: "term-1",
     eventType: "exit",
     payload: { exit_code: 0 },
@@ -1950,6 +2379,7 @@ test("terminal sessions support create update event append and list", () => {
     endedAt: "2026-01-01T00:00:10.000Z",
   });
   const updated = store.updateTerminalSession({
+    workspaceId: "workspace-1",
     terminalId: "term-1",
     title: "Dev Server Ready",
     metadata: { source: "test", ready: true },
@@ -1959,6 +2389,7 @@ test("terminal sessions support create update event append and list", () => {
     statuses: ["exited"],
   });
   const events = store.listTerminalSessionEvents({
+    workspaceId: "workspace-1",
     terminalId: "term-1",
   });
 
@@ -1974,7 +2405,12 @@ test("terminal sessions support create update event append and list", () => {
   assert.deepEqual(listed.map((record) => record.terminalId), ["term-1"]);
   assert.deepEqual(events.map((event) => event.eventType), ["output", "exit"]);
   assert.deepEqual(events[0]?.payload, { data: "ready\n" });
-  assert.deepEqual(store.listTerminalSessionEvents({ terminalId: "term-1", afterSequence: 1 }).map((event) => event.sequence), [2]);
+  assert.deepEqual(
+    store.listTerminalSessionEvents({ workspaceId: "workspace-1", terminalId: "term-1", afterSequence: 1 }).map(
+      (event) => event.sequence
+    ),
+    [2]
+  );
 
   store.close();
 });
@@ -2075,13 +2511,14 @@ test("turn results support upsert, lookup, count, and listing", () => {
   assert.deepEqual(updated.permissionDenials, [
     { tool_name: "deploy", tool_id: null, reason: "permission denied" }
   ]);
-  assert.deepEqual(store.getTurnResult({ inputId: "input-1" }), updated);
+  assert.deepEqual(store.getTurnResult({ workspaceId: "workspace-1", inputId: "input-1" }), updated);
   assert.equal(store.countTurnResults({ workspaceId: "workspace-1", sessionId: "session-main" }), 1);
   assert.equal(store.countTurnResults({ workspaceId: "workspace-1", sessionId: "session-main", status: "completed" }), 0);
   assert.equal(store.countTurnResults({ workspaceId: "workspace-1", sessionId: "session-main", status: "waiting_user" }), 1);
   assert.deepEqual(store.listTurnResults({ workspaceId: "workspace-1", sessionId: "session-main" }), [updated]);
   assert.deepEqual(store.listTurnResults({ workspaceId: "workspace-1", sessionId: "session-main", status: "waiting_user" }), [updated]);
   const telemetryOnlyUpdate = store.updateTurnResultContextBudgetDecisions({
+    workspaceId: "workspace-1",
     inputId: "input-1",
     contextBudgetDecisions: {
       mode: "observability_only",
@@ -2115,7 +2552,10 @@ test("turn request snapshots round trip", () => {
     },
   });
 
-  assert.deepEqual(store.getTurnRequestSnapshot({ inputId: "input-1" }), snapshot);
+  assert.deepEqual(
+    store.getTurnRequestSnapshot({ workspaceId: "workspace-1", inputId: "input-1" }),
+    snapshot
+  );
   assert.deepEqual(store.listTurnRequestSnapshots({ workspaceId: "workspace-1", sessionId: "session-main" }), [snapshot]);
   store.close();
 });
@@ -2184,8 +2624,21 @@ test("memory entries round trip and filter by workspace or scope", () => {
   ]);
   assert.deepEqual(
     store.listMemoryEntries({ status: "active" }).map((entry) => entry.memoryId),
-    [preference.memoryId, blocker.memoryId]
+    [blocker.memoryId, preference.memoryId]
   );
+
+  const controlPlaneDb = new Database(store.controlPlaneDbPath, { readonly: true });
+  const workspaceDb = new Database(workspaceRuntimeDbFile(store.workspaceRoot, "workspace-1"), { readonly: true });
+  assert.equal(
+    Number((controlPlaneDb.prepare("SELECT COUNT(*) AS count FROM memory_entries").get() as { count: number }).count),
+    1,
+  );
+  assert.equal(
+    Number((workspaceDb.prepare("SELECT COUNT(*) AS count FROM memory_entries").get() as { count: number }).count),
+    1,
+  );
+  controlPlaneDb.close();
+  workspaceDb.close();
   store.close();
 });
 
@@ -2254,7 +2707,7 @@ test("memory embedding index supports vector replacement, search, and delete", (
 
   store.deleteMemoryEmbeddingIndex("workspace-fact:workspace-1:deploy");
 
-  assert.equal(store.getMemoryEmbeddingIndexByMemoryId("workspace-fact:workspace-1:deploy"), null);
+  assert.equal(store.getMemoryEmbeddingIndexByMemoryId({ memoryId: "workspace-fact:workspace-1:deploy" }), null);
   assert.equal(
     store.searchWorkspaceMemoryRecallVectors({
       workspaceId: "workspace-1",
@@ -2321,6 +2774,130 @@ test("app build status round trip supports upsert, lookup, and delete", () => {
   store.close();
 });
 
+test("workspace-scoped runtime tables persist inside the workspace bundle and mirror runtime.db", () => {
+  const root = makeTempDir("hb-state-store-");
+  const dbPath = path.join(root, "runtime.db");
+  const workspaceRoot = path.join(root, "workspace");
+  const store = new RuntimeStateStore({
+    dbPath,
+    workspaceRoot
+  });
+
+  store.createWorkspace({
+    workspaceId: "workspace-1",
+    name: "Acme",
+    harness: "pi",
+    status: "active"
+  });
+  store.ensureSession({
+    workspaceId: "workspace-1",
+    sessionId: "session-1"
+  });
+  store.createOutput({
+    workspaceId: "workspace-1",
+    outputType: "report",
+    title: "Daily note"
+  });
+  store.upsertAppBuild({
+    workspaceId: "workspace-1",
+    appId: "app-a",
+    status: "building"
+  });
+  store.allocateAppPort({
+    workspaceId: "workspace-1",
+    appId: "app-a"
+  });
+  const cronjob = store.createCronjob({
+    workspaceId: "workspace-1",
+    initiatedBy: "workspace_agent",
+    cron: "0 9 * * *",
+    description: "Daily check",
+    instruction: "Say hello",
+    delivery: { mode: "announce", channel: "session_run", to: null }
+  });
+  store.createRuntimeNotification({
+    workspaceId: "workspace-1",
+    cronjobId: cronjob.id,
+    sourceType: "cronjob",
+    title: "Hydrate",
+    message: "Drink water."
+  });
+  store.createTaskProposal({
+    proposalId: "proposal-1",
+    workspaceId: "workspace-1",
+    taskName: "Daily summary",
+    taskPrompt: "Summarize the day.",
+    taskGenerationRationale: "Keep the team aligned.",
+    createdAt: "2026-05-06T00:00:00.000Z"
+  });
+  store.createEvolveSkillCandidate({
+    candidateId: "candidate-1",
+    workspaceId: "workspace-1",
+    sessionId: "session-1",
+    inputId: "input-1",
+    kind: "skill_create",
+    title: "Daily summary helper",
+    summary: "Creates a short summary skill.",
+    slug: "daily-summary-helper",
+    skillPath: "skills/daily-summary-helper/SKILL.md",
+    contentFingerprint: "fp-1"
+  });
+  store.createMemoryUpdateProposal({
+    proposalId: "memory-proposal-1",
+    workspaceId: "workspace-1",
+    sessionId: "session-1",
+    inputId: "input-1",
+    proposalKind: "preference",
+    targetKey: "workspace/daily-summary",
+    title: "Remember summary preference",
+    summary: "Store that daily summaries should stay short.",
+  });
+  store.close();
+
+  const workspaceDbPath = workspaceRuntimeDbFile(workspaceRoot, "workspace-1");
+  assert.equal(fs.existsSync(workspaceDbPath), true);
+
+  const workspaceDb = new Database(workspaceDbPath, { readonly: true });
+  const workspaceCounts = {
+    outputs: Number((workspaceDb.prepare("SELECT COUNT(*) AS count FROM outputs").get() as { count: number }).count),
+    appBuilds: Number((workspaceDb.prepare("SELECT COUNT(*) AS count FROM app_builds").get() as { count: number }).count),
+    appPorts: Number((workspaceDb.prepare("SELECT COUNT(*) AS count FROM app_ports").get() as { count: number }).count),
+    cronjobs: Number((workspaceDb.prepare("SELECT COUNT(*) AS count FROM cronjobs").get() as { count: number }).count),
+    notifications: Number((workspaceDb.prepare("SELECT COUNT(*) AS count FROM runtime_notifications").get() as { count: number }).count),
+    taskProposals: Number((workspaceDb.prepare("SELECT COUNT(*) AS count FROM task_proposals").get() as { count: number }).count),
+    evolveCandidates: Number((workspaceDb.prepare("SELECT COUNT(*) AS count FROM evolve_skill_candidates").get() as { count: number }).count),
+    memoryUpdateProposals: Number((workspaceDb.prepare("SELECT COUNT(*) AS count FROM memory_update_proposals").get() as { count: number }).count),
+  };
+  workspaceDb.close();
+
+  const runtimeDb = new Database(dbPath, { readonly: true });
+  const runtimeTables = new Set<string>(
+    (runtimeDb.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).map(
+      (row) => row.name,
+    ),
+  );
+  runtimeDb.close();
+
+  assert.deepEqual(workspaceCounts, {
+    outputs: 1,
+    appBuilds: 1,
+    appPorts: 1,
+    cronjobs: 1,
+    notifications: 1,
+    taskProposals: 1,
+    evolveCandidates: 1,
+    memoryUpdateProposals: 1,
+  });
+  assert.equal(runtimeTables.has("outputs"), false);
+  assert.equal(runtimeTables.has("app_builds"), false);
+  assert.equal(runtimeTables.has("app_ports"), false);
+  assert.equal(runtimeTables.has("cronjobs"), false);
+  assert.equal(runtimeTables.has("runtime_notifications"), false);
+  assert.equal(runtimeTables.has("task_proposals"), false);
+  assert.equal(runtimeTables.has("evolve_skill_candidates"), false);
+  assert.equal(runtimeTables.has("memory_update_proposals"), false);
+});
+
 test("cronjobs round trip supports create, list, update, get, and delete", () => {
   const root = makeTempDir("hb-state-store-");
   const store = new RuntimeStateStore({
@@ -2337,9 +2914,14 @@ test("cronjobs round trip supports create, list, update, get, and delete", () =>
     delivery: { mode: "announce", channel: "session_run", to: null }
   });
   const listed = store.listCronjobs({ workspaceId: "workspace-1" });
-  const fetched = store.getCronjob(job.id);
-  const updated = store.updateCronjob({ jobId: job.id, description: "Updated check", instruction: "Say hello loudly" });
-  const deleted = store.deleteCronjob(job.id);
+  const fetched = store.getCronjob({ workspaceId: "workspace-1", jobId: job.id });
+  const updated = store.updateCronjob({
+    workspaceId: "workspace-1",
+    jobId: job.id,
+    description: "Updated check",
+    instruction: "Say hello loudly"
+  });
+  const deleted = store.deleteCronjob({ workspaceId: "workspace-1", jobId: job.id });
 
   assert.equal(listed.length, 1);
   assert.ok(fetched);
@@ -2403,11 +2985,93 @@ test("cronjob schema migration backfills instruction from legacy description", (
   db.close();
 
   const store = new RuntimeStateStore({ dbPath, workspaceRoot });
-  const migrated = store.getCronjob("job-1");
+  const migrated = store.getCronjob({ workspaceId: "workspace-1", jobId: "job-1" });
 
   assert.ok(migrated);
   assert.equal(migrated.instruction, "Say hello every 5 minutes.");
   store.close();
+});
+
+test("workspace-scoped runtime db backfills legacy cronjobs from runtime.db on first access", () => {
+  const root = makeTempDir("hb-state-store-");
+  const dbPath = path.join(root, "runtime.db");
+  const workspaceRoot = path.join(root, "workspace");
+  const initialStore = new RuntimeStateStore({ dbPath, workspaceRoot });
+
+  initialStore.createWorkspace({
+    workspaceId: "workspace-1",
+    name: "Legacy",
+    harness: "pi",
+    status: "active"
+  });
+  initialStore.close();
+
+  const workspaceDbPath = workspaceRuntimeDbFile(workspaceRoot, "workspace-1");
+  assert.equal(fs.existsSync(workspaceDbPath), false);
+
+  const db = new Database(dbPath);
+  db.exec(`
+    CREATE TABLE cronjobs (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        initiated_by TEXT NOT NULL,
+        name TEXT NOT NULL DEFAULT '',
+        cron TEXT NOT NULL,
+        description TEXT NOT NULL,
+        instruction TEXT NOT NULL DEFAULT '',
+        enabled INTEGER NOT NULL DEFAULT 1,
+        delivery TEXT NOT NULL,
+        metadata TEXT NOT NULL DEFAULT '{}',
+        last_run_at TEXT,
+        next_run_at TEXT,
+        run_count INTEGER NOT NULL DEFAULT 0,
+        last_status TEXT,
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+  `);
+  db.prepare(`
+    INSERT INTO cronjobs (
+      id, workspace_id, initiated_by, name, cron, description, instruction, enabled, delivery, metadata,
+      last_run_at, next_run_at, run_count, last_status, last_error, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    "job-legacy",
+    "workspace-1",
+    "workspace_agent",
+    "Greeting",
+    "*/5 * * * *",
+    "Say hello every 5 minutes.",
+    "Say hello every 5 minutes.",
+    1,
+    JSON.stringify({ channel: "session_run" }),
+    "{}",
+    null,
+    null,
+    0,
+    null,
+    null,
+    "2026-01-01T00:00:00+00:00",
+    "2026-01-01T00:00:00+00:00"
+  );
+  db.close();
+
+  const store = new RuntimeStateStore({ dbPath, workspaceRoot });
+  const listed = store.listCronjobs({ workspaceId: "workspace-1" });
+  store.close();
+
+  assert.equal(listed.length, 1);
+  assert.equal(listed[0]?.id, "job-legacy");
+  assert.equal(fs.existsSync(workspaceDbPath), true);
+
+  const workspaceDb = new Database(workspaceDbPath, { readonly: true });
+  const mirrored = workspaceDb
+    .prepare<[string], { id: string }>("SELECT id FROM cronjobs WHERE id = ? LIMIT 1")
+    .get("job-legacy");
+  workspaceDb.close();
+
+  assert.equal(mirrored?.id, "job-legacy");
 });
 
 test("runtime notifications round trip supports create, list, update, get, and dismiss", () => {
@@ -2428,12 +3092,14 @@ test("runtime notifications round trip supports create, list, update, get, and d
     priority: "high"
   });
   const listed = store.listRuntimeNotifications({ workspaceId: "workspace-1" });
-  const fetched = store.getRuntimeNotification(created.id);
+  const fetched = store.getRuntimeNotification({ workspaceId: "workspace-1", notificationId: created.id });
   const updated = store.updateRuntimeNotification({
+    workspaceId: "workspace-1",
     notificationId: created.id,
     state: "read"
   });
   const dismissed = store.updateRuntimeNotification({
+    workspaceId: "workspace-1",
     notificationId: created.id,
     state: "dismissed"
   });
@@ -2519,8 +3185,12 @@ test("task proposals round trip supports create, list, unreviewed, get, and stat
   });
   const listed = store.listTaskProposals({ workspaceId: "workspace-1" });
   const unreviewed = store.listUnreviewedTaskProposals({ workspaceId: "workspace-1" });
-  const fetched = store.getTaskProposal("proposal-1");
-  const updated = store.updateTaskProposalState({ proposalId: "proposal-1", state: "accepted" });
+  const fetched = store.getTaskProposal({ workspaceId: "workspace-1", proposalId: "proposal-1" });
+  const updated = store.updateTaskProposalState({
+    workspaceId: "workspace-1",
+    proposalId: "proposal-1",
+    state: "accepted"
+  });
 
   assert.equal(proposal.proposalId, "proposal-1");
   assert.equal(proposal.proposalSource, "proactive");
@@ -2561,6 +3231,7 @@ test("task proposal acceptance fields and child session metadata round trip", ()
 
   const sessions = store.listSessions({ workspaceId: "workspace-1" });
   const updated = store.updateTaskProposal({
+    workspaceId: "workspace-1",
     proposalId: "proposal-1",
     fields: {
       state: "accepted",
@@ -2627,7 +3298,10 @@ test("task proposal round trip preserves explicit evolve source", () => {
   });
 
   assert.equal(proposal.proposalSource, "evolve");
-  assert.equal(store.getTaskProposal("proposal-evolve-1")?.proposalSource, "evolve");
+  assert.equal(
+    store.getTaskProposal({ workspaceId: "workspace-1", proposalId: "proposal-evolve-1" })?.proposalSource,
+    "evolve"
+  );
   store.close();
 });
 
@@ -2677,9 +3351,10 @@ test("evolve skill candidates round trip supports create, list, lookup, and upda
     evaluationNotes: "Existing skill is stale.",
     sourceTurnInputIds: ["input-2"],
   });
-  const fetched = store.getEvolveSkillCandidate("candidate-1");
+  const fetched = store.getEvolveSkillCandidate({ workspaceId: "workspace-1", candidateId: "candidate-1" });
   const listed = store.listEvolveSkillCandidates({ workspaceId: "workspace-1" });
   const updated = store.updateEvolveSkillCandidate({
+    workspaceId: "workspace-1",
     candidateId: "candidate-1",
     fields: {
       taskProposalId: "proposal-1",
@@ -2697,7 +3372,13 @@ test("evolve skill candidates round trip supports create, list, lookup, and upda
   assert.equal(listed.length, 2);
   assert.equal(updated?.taskProposalId, "proposal-1");
   assert.equal(updated?.status, "proposed");
-  assert.equal(store.getEvolveSkillCandidateByTaskProposalId("proposal-1")?.candidateId, "candidate-1");
+  assert.equal(
+    store.getEvolveSkillCandidateByTaskProposalId({
+      workspaceId: "workspace-1",
+      proposalId: "proposal-1"
+    })?.candidateId,
+    "candidate-1"
+  );
   store.close();
 });
 
@@ -2740,8 +3421,12 @@ test("memory update proposals round trip supports create list filter get and acc
     limit: 10,
     offset: 0
   });
-  const fetched = store.getMemoryUpdateProposal("memory-proposal-1");
+  const fetched = store.getMemoryUpdateProposal({
+    workspaceId: "workspace-1",
+    proposalId: "memory-proposal-1"
+  });
   const accepted = store.updateMemoryUpdateProposal({
+    workspaceId: "workspace-1",
     proposalId: "memory-proposal-1",
     fields: {
       summary: "Prefer concise responses.",

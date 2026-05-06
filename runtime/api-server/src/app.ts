@@ -85,6 +85,10 @@ import {
   type MemoryServiceLike
 } from "./memory.js";
 import {
+  migrateLegacyWorkspaceStatePath,
+  resolveMemoryFilePath,
+} from "./workspace-bundle-paths.js";
+import {
   FileRuntimeConfigService,
   RuntimeConfigServiceError,
   type RuntimeConfigServiceLike
@@ -445,17 +449,6 @@ function optionalDict(value: unknown): Record<string, unknown> | undefined {
   return isRecord(value) ? value : undefined;
 }
 
-function resolveMemoryRootDir(workspaceRoot: string): string {
-  const configured = (process.env.MEMORY_ROOT_DIR ?? "").trim();
-  if (!configured) {
-    return path.join(workspaceRoot, "memory");
-  }
-  if (path.isAbsolute(configured)) {
-    return path.resolve(configured);
-  }
-  return path.resolve(path.join(workspaceRoot, configured));
-}
-
 function sessionMemoryPath(workspaceId: string, sessionId: string): string {
   const sanitizedSessionId =
     sessionId
@@ -479,8 +472,12 @@ function loadSessionResumeContextForApi(params: {
   sessionId: string;
 }): { session_memory_path: string; session_memory_excerpt: string } | null {
   const relPath = sessionMemoryPath(params.workspaceId, params.sessionId);
-  const memoryRoot = resolveMemoryRootDir(params.workspaceRoot);
-  const targetPath = path.join(memoryRoot, relPath);
+  const targetPath = resolveMemoryFilePath({
+    workspaceRoot: params.workspaceRoot,
+    workspaceDir: path.join(params.workspaceRoot, params.workspaceId),
+    workspaceId: params.workspaceId,
+    relPath,
+  });
   if (
     !fs.existsSync(targetPath) ||
     !fs.statSync(targetPath, { throwIfNoEntry: false })?.isFile()
@@ -537,7 +534,7 @@ function requiredCapabilityWorkspaceId(params: {
 function requireTerminalSession(params: {
   manager: TerminalSessionManagerLike | null | undefined;
   terminalId: string;
-  workspaceId?: string;
+  workspaceId: string;
 }) {
   if (!params.manager) {
     throw new Error("terminal session capability is not available");
@@ -1309,7 +1306,11 @@ function workspaceLegacySessionHistoryDir(
 ): string | null {
   try {
     const workspaceDir = store.assertWorkspaceFolderHealthy(workspaceId);
-    return path.join(workspaceDir, ".holaboss", "legacy-session-histories");
+    return migrateLegacyWorkspaceStatePath({
+      workspaceDir,
+      relativeSegments: ["legacy-session-histories"],
+      legacyRelativeSegments: [".holaboss", "legacy-session-histories"],
+    });
   } catch {
     return null;
   }
@@ -1439,7 +1440,12 @@ function exportLegacySessionHistory(params: {
     .map((message) => {
       const inputId = message.role === "user" && message.id.startsWith("user-") ? message.id.slice(5) : "";
       const attachments = inputId
-        ? attachmentsFromInputPayload(params.store.getInput(inputId)?.payload.attachments)
+        ? attachmentsFromInputPayload(
+            params.store.getInput({
+              workspaceId: params.workspace.id,
+              inputId,
+            })?.payload.attachments
+          )
         : [];
       return {
         id: message.id,
@@ -1779,11 +1785,15 @@ function runtimeStateHasClaimedActiveInput(
   store: RuntimeStateStore,
   runtimeState: SessionRuntimeStateRecord | null,
 ): boolean {
+  const workspaceId = runtimeState?.workspaceId?.trim() ?? "";
   const currentInputId = runtimeState?.currentInputId?.trim() ?? "";
-  if (!currentInputId) {
+  if (!currentInputId || !workspaceId) {
     return false;
   }
-  return store.getInput(currentInputId)?.status === "CLAIMED";
+  return store.getInput({
+    workspaceId,
+    inputId: currentInputId,
+  })?.status === "CLAIMED";
 }
 
 function runnerOutputEventPayload(record: OutputEventRecord): Record<string, unknown> {
@@ -2624,7 +2634,10 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
   // race-write app.runtime.yaml producing corrupt state.
   const appInstallTasks = new Map<string, Promise<unknown>>();
   const appLifecycleExecutor = options.appLifecycleExecutor ?? new RuntimeAppLifecycleExecutor({ store });
-  const memoryService = options.memoryService ?? new FilesystemMemoryService({ workspaceRoot: store.workspaceRoot });
+  const memoryService = options.memoryService ?? new FilesystemMemoryService({
+    workspaceRoot: store.workspaceRoot,
+    resolveWorkspaceDir: (workspaceId) => store.workspaceDir(workspaceId),
+  });
   const runtimeConfigService = options.runtimeConfigService ?? new FileRuntimeConfigService();
   const browserToolService = options.browserToolService ?? new DesktopBrowserToolService({ artifactStore: store });
   const terminalSessionManager =
@@ -3569,11 +3582,13 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
     const params = request.params as { terminalId: string };
     const query = isRecord(request.query) ? request.query : {};
     try {
+      const workspaceId = requiredCapabilityWorkspaceId({
+        headers: request.headers as Record<string, unknown>,
+        query,
+      });
       const session = terminalSessionManager?.getSession({
         terminalId: requiredString(params.terminalId, "terminalId"),
-        workspaceId:
-          headerString(request.headers as Record<string, unknown>, "x-holaboss-workspace-id") ||
-          optionalString(query.workspace_id),
+        workspaceId,
       });
       if (!session) {
         return sendError(reply, 404, "terminal session not found");
@@ -3591,16 +3606,19 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
     const params = request.params as { terminalId: string };
     const query = isRecord(request.query) ? request.query : {};
     try {
+      const workspaceId = requiredCapabilityWorkspaceId({
+        headers: request.headers as Record<string, unknown>,
+        query,
+      });
       return {
         terminal:
           terminalSessionManager?.getSession({
             terminalId: requiredString(params.terminalId, "terminalId"),
-            workspaceId:
-              headerString(request.headers as Record<string, unknown>, "x-holaboss-workspace-id") ||
-              optionalString(query.workspace_id),
+            workspaceId,
           }) ?? null,
         events:
           terminalSessionManager?.listEvents({
+            workspaceId,
             terminalId: requiredString(params.terminalId, "terminalId"),
             afterSequence: optionalInteger(query.after_sequence, 0),
             limit: optionalInteger(query.limit, 0) || undefined,
@@ -3620,7 +3638,12 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
     }
     const params = request.params as { terminalId: string };
     try {
+      const workspaceId = requiredCapabilityWorkspaceId({
+        headers: request.headers as Record<string, unknown>,
+        body: request.body,
+      });
       return await terminalSessionManager?.sendInput({
+        workspaceId,
         terminalId: requiredString(params.terminalId, "terminalId"),
         data: requiredString(request.body.data, "data"),
       });
@@ -3638,7 +3661,12 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
     }
     const params = request.params as { terminalId: string };
     try {
+      const workspaceId = requiredCapabilityWorkspaceId({
+        headers: request.headers as Record<string, unknown>,
+        body: request.body,
+      });
       return await terminalSessionManager?.resize({
+        workspaceId,
         terminalId: requiredString(params.terminalId, "terminalId"),
         cols: optionalInteger(request.body.cols, DEFAULT_TERMINAL_COLS),
         rows: optionalInteger(request.body.rows, DEFAULT_TERMINAL_ROWS),
@@ -3657,7 +3685,12 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
     }
     const params = request.params as { terminalId: string };
     try {
+      const workspaceId = requiredCapabilityWorkspaceId({
+        headers: request.headers as Record<string, unknown>,
+        body: request.body,
+      });
       return await terminalSessionManager?.signal({
+        workspaceId,
         terminalId: requiredString(params.terminalId, "terminalId"),
         signal: nullableString(request.body.signal),
       });
@@ -3672,7 +3705,12 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
   app.post("/api/v1/terminal-sessions/:terminalId/close", async (request, reply) => {
     const params = request.params as { terminalId: string };
     try {
+      const workspaceId = requiredCapabilityWorkspaceId({
+        headers: request.headers as Record<string, unknown>,
+        body: isRecord(request.body) ? request.body : null,
+      });
       return await terminalSessionManager?.closeSession({
+        workspaceId,
         terminalId: requiredString(params.terminalId, "terminalId"),
       });
     } catch (error) {
@@ -3696,10 +3734,11 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
       wsHandler: (socket, request) => {
         const params = request.params as { terminalId: string };
         const query = isRecord(request.query) ? request.query : {};
-        const workspaceId =
-          headerString(request.headers as Record<string, unknown>, "x-holaboss-workspace-id") ||
-          optionalString(query.workspace_id);
         try {
+          const workspaceId = requiredCapabilityWorkspaceId({
+            headers: request.headers as Record<string, unknown>,
+            query,
+          });
           const terminal = requireTerminalSession({
             manager: terminalSessionManager,
             terminalId: requiredString(params.terminalId, "terminalId"),
@@ -3709,6 +3748,7 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
           const snapshotSequence = terminal.lastEventSeq;
           socket.send(JSON.stringify({ type: "connected", terminal }));
           const replayEvents = (terminalSessionManager?.listEvents({
+            workspaceId: terminal.workspaceId,
             terminalId: terminal.terminalId,
             afterSequence,
           }) ?? []).filter((event) => event.sequence <= snapshotSequence);
@@ -4930,7 +4970,7 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
     try {
       return runtimeAgentToolsService.getTerminalSession({
         terminalId: requiredString(params.terminalId, "terminalId"),
-        workspaceId: capabilityWorkspaceId({
+        workspaceId: requiredCapabilityWorkspaceId({
           headers: request.headers as Record<string, unknown>,
           query: isRecord(request.query) ? request.query : null,
         }),
@@ -4949,7 +4989,7 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
     }
     const params = request.params as { terminalId: string };
     try {
-      const workspaceId = capabilityWorkspaceId({
+      const requiredWorkspaceId = requiredCapabilityWorkspaceId({
         headers: request.headers as Record<string, unknown>,
         body: request.body,
       });
@@ -4959,7 +4999,7 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
       });
       const result = runtimeAgentToolsService.readTerminalSession({
         terminalId: requiredString(params.terminalId, "terminalId"),
-        workspaceId,
+        workspaceId: requiredWorkspaceId,
         afterSequence: hasOwn(request.body, "after_sequence")
           ? optionalInteger(request.body.after_sequence, 0)
           : undefined,
@@ -4971,7 +5011,7 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
         headers: request.headers as Record<string, unknown>,
         toolId: "terminal_session_read",
         payload: result,
-        workspaceId,
+        workspaceId: requiredWorkspaceId,
         sessionId,
       });
     } catch (error) {
@@ -4988,7 +5028,7 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
     }
     const params = request.params as { terminalId: string };
     try {
-      const workspaceId = capabilityWorkspaceId({
+      const workspaceId = requiredCapabilityWorkspaceId({
         headers: request.headers as Record<string, unknown>,
         body: request.body,
       });
@@ -5032,7 +5072,7 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
     try {
       return await runtimeAgentToolsService.sendTerminalSessionInput({
         terminalId: requiredString(params.terminalId, "terminalId"),
-        workspaceId: capabilityWorkspaceId({
+        workspaceId: requiredCapabilityWorkspaceId({
           headers: request.headers as Record<string, unknown>,
           body: request.body,
         }),
@@ -5054,7 +5094,7 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
     try {
       return await runtimeAgentToolsService.signalTerminalSession({
         terminalId: requiredString(params.terminalId, "terminalId"),
-        workspaceId: capabilityWorkspaceId({
+        workspaceId: requiredCapabilityWorkspaceId({
           headers: request.headers as Record<string, unknown>,
           body: request.body,
         }),
@@ -5073,7 +5113,7 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
     try {
       return await runtimeAgentToolsService.closeTerminalSession({
         terminalId: requiredString(params.terminalId, "terminalId"),
-        workspaceId: capabilityWorkspaceId({
+        workspaceId: requiredCapabilityWorkspaceId({
           headers: request.headers as Record<string, unknown>,
           body: isRecord(request.body) ? request.body : null,
         }),
@@ -5679,8 +5719,6 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
     const workspace = store.getWorkspace(params.workspaceId, { includeDeleted: true });
     if (!workspace || workspace.deletedAtUtc) {
       // Idempotent: workspace already gone or never existed — treat as success
-      const workspaceDir = store.workspaceDir(params.workspaceId);
-      fs.rmSync(workspaceDir, { recursive: true, force: true });
       return {
         workspace: {
           id: params.workspaceId,
@@ -5710,7 +5748,7 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
       });
       const deletedWorkspace = store.deleteWorkspace(params.workspaceId);
       // Decide whether to wipe the folder. Three cases:
-      //   keep_files=true  → never wipe, only remove .holaboss metadata
+      //   keep_files=true  → never wipe; preserve the full workspace bundle
       //   keep_files=false → always wipe the whole folder
       //   unspecified      → default: managed paths wipe, custom paths keep
       const isManagedPath = isPathWithinWorkspaceRoot(workspaceDir, store.workspaceRoot);
@@ -5722,9 +5760,6 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
             : isManagedPath;
       if (shouldWipe) {
         fs.rmSync(workspaceDir, { recursive: true, force: true });
-      } else {
-        const metadataDir = path.join(workspaceDir, ".holaboss");
-        fs.rmSync(metadataDir, { recursive: true, force: true });
       }
       return { workspace: workspaceRecordPayload(deletedWorkspace, workspaceDir, "missing") };
     } catch (error) {
@@ -5760,7 +5795,7 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
   });
 
   // Workspaces activated in the current runtime boot. First activation
-  // per workspace per boot reads the .holaboss/workspace_id identity file
+  // per workspace per boot reads the .holaboss/state/workspace_id identity file
   // to confirm the folder on disk really belongs to this workspace. We
   // don't re-check on every write — users are free to edit AGENTS.md,
   // skills, workspace.yaml, apps, etc.
@@ -6998,6 +7033,7 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
         existingSession?.kind ?? inferredKind,
       )
         ? store.listPendingMainSessionEvents({
+            workspaceId,
             ownerMainSessionId: resolvedSessionId,
             deliveryBucket: "background_update",
             limit: 200,
@@ -7033,6 +7069,7 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
     });
     if (inlineBackgroundUpdateIds.length > 0) {
       store.markMainSessionEventsMaterialized({
+        workspaceId,
         eventIds: inlineBackgroundUpdateIds,
         materializedInputId: record.inputId,
       });
@@ -7131,7 +7168,10 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
       return sendError(reply, 404, "workspace not found");
     }
 
-    const input = store.getInput(params.inputId);
+    const input = store.getInput({
+      workspaceId,
+      inputId: params.inputId,
+    });
     if (
       !input ||
       input.workspaceId !== workspaceId ||
@@ -7152,10 +7192,14 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
       return sendError(reply, 422, "text or attachments are required");
     }
 
-    const updated = store.updateInput(params.inputId, {
-      payload: {
-        ...existingPayload,
-        text: trimmedText,
+    const updated = store.updateInput({
+      workspaceId,
+      inputId: params.inputId,
+      fields: {
+        payload: {
+          ...existingPayload,
+          text: trimmedText,
+        },
       },
     });
     if (!updated) {
@@ -7203,6 +7247,9 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
       return sendError(reply, 422, "workspace_id and profile_id must match when both are provided");
     }
     const resolvedWorkspaceId = workspaceId ?? profileId;
+    if (!resolvedWorkspaceId) {
+      return sendError(reply, 422, "workspace_id or profile_id is required");
+    }
     const runtimeState = store.getRuntimeState({
       sessionId: params.sessionId,
       workspaceId: resolvedWorkspaceId
@@ -7274,7 +7321,14 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
       })
       .map((message: SessionMessageRecord) => {
         const inputId = message.role === "user" && message.id.startsWith("user-") ? message.id.slice(5) : "";
-        const inputAttachments = inputId ? attachmentsFromInputPayload(store.getInput(inputId)?.payload.attachments) : [];
+        const inputAttachments = inputId
+          ? attachmentsFromInputPayload(
+              store.getInput({
+                workspaceId,
+                inputId,
+              })?.payload.attachments
+            )
+          : [];
         const metadata = inputAttachments.length > 0 ? { ...message.metadata, attachments: inputAttachments } : message.metadata;
         return sessionMessagePayload(message, metadata);
       });
@@ -7448,13 +7502,12 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
       return sendError(reply, 422, "workspace_id and profile_id must match when both are provided");
     }
     const resolvedWorkspaceId = workspaceId ?? profileId;
-    const outputWorkspaceId = resolvedWorkspaceId ?? store.getRuntimeState({ sessionId: params.sessionId })?.workspaceId ?? null;
-    if (!outputWorkspaceId) {
-      return { items: [], count: 0 };
+    if (!resolvedWorkspaceId) {
+      return sendError(reply, 422, "workspace_id or profile_id is required");
     }
     const items = store
       .listOutputs({
-        workspaceId: outputWorkspaceId,
+        workspaceId: resolvedWorkspaceId,
         sessionId: params.sessionId,
         limit: 500,
         offset: 0,
@@ -7552,8 +7605,13 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
   });
 
   app.get("/api/v1/output-folders/:folderId", async (request, reply) => {
+    const query = isRecord(request.query) ? request.query : {};
+    const workspaceId = optionalString(query.workspace_id);
+    if (!workspaceId) {
+      return sendError(reply, 400, "workspace_id is required");
+    }
     const params = request.params as { folderId: string };
-    const folder = store.getOutputFolder(params.folderId);
+    const folder = store.getOutputFolder({ workspaceId, folderId: params.folderId });
     if (!folder) {
       return sendError(reply, 404, "Folder not found");
     }
@@ -7565,7 +7623,9 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
       return sendError(reply, 400, "request body must be an object");
     }
     const params = request.params as { folderId: string };
+    const workspaceId = requiredString(request.body.workspace_id, "workspace_id");
     const folder = store.updateOutputFolder({
+      workspaceId,
       folderId: params.folderId,
       name: nullableString(request.body.name),
       position:
@@ -7580,8 +7640,13 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
   });
 
   app.delete("/api/v1/output-folders/:folderId", async (request, reply) => {
+    const query = isRecord(request.query) ? request.query : {};
+    const workspaceId = optionalString(query.workspace_id);
+    if (!workspaceId) {
+      return sendError(reply, 400, "workspace_id is required");
+    }
     const params = request.params as { folderId: string };
-    const deleted = store.deleteOutputFolder(params.folderId);
+    const deleted = store.deleteOutputFolder({ workspaceId, folderId: params.folderId });
     if (!deleted) {
       return sendError(reply, 404, "Folder not found");
     }
@@ -7618,8 +7683,13 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
   });
 
   app.get("/api/v1/outputs/:outputId", async (request, reply) => {
+    const query = isRecord(request.query) ? request.query : {};
+    const workspaceId = optionalString(query.workspace_id);
+    if (!workspaceId) {
+      return sendError(reply, 400, "workspace_id is required");
+    }
     const params = request.params as { outputId: string };
-    const output = store.getOutput(params.outputId);
+    const output = store.getOutput({ workspaceId, outputId: params.outputId });
     if (!output) {
       return sendError(reply, 404, "Output not found");
     }
@@ -7659,12 +7729,13 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
       return sendError(reply, 400, "request body must be an object");
     }
     const params = request.params as { outputId: string };
+    const workspaceId = requiredString(request.body.workspace_id, "workspace_id");
     let patchMetadata: Record<string, unknown> | undefined;
     if (hasOwn(request.body, "metadata")) {
       const incoming = optionalDict(request.body.metadata) ?? {};
       // Preserve origin_type from existing output if not provided in the patch,
       // so that app updates don't accidentally strip it.
-      const existing = store.getOutput(params.outputId);
+      const existing = store.getOutput({ workspaceId, outputId: params.outputId });
       if (existing && !incoming.origin_type && existing.metadata.origin_type) {
         incoming.origin_type = existing.metadata.origin_type;
       }
@@ -7678,6 +7749,7 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
       patchMetadata = incoming;
     }
     const output = store.updateOutput({
+      workspaceId,
       outputId: params.outputId,
       title: nullableString(request.body.title),
       status: nullableString(request.body.status),
@@ -7694,8 +7766,13 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
   });
 
   app.delete("/api/v1/outputs/:outputId", async (request, reply) => {
+    const query = isRecord(request.query) ? request.query : {};
+    const workspaceId = optionalString(query.workspace_id);
+    if (!workspaceId) {
+      return sendError(reply, 400, "workspace_id is required");
+    }
     const params = request.params as { outputId: string };
-    const deleted = store.deleteOutput(params.outputId);
+    const deleted = store.deleteOutput({ workspaceId, outputId: params.outputId });
     if (!deleted) {
       return sendError(reply, 404, "Output not found");
     }
@@ -7728,7 +7805,9 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
       return sendError(reply, 400, "request body must be an object");
     }
     const params = request.params as { notificationId: string };
+    const workspaceId = requiredString(request.body.workspace_id, "workspace_id");
     const updated = store.updateRuntimeNotification({
+      workspaceId,
       notificationId: requiredString(params.notificationId, "notificationId"),
       state: nullableString(request.body.state) as "unread" | "read" | "dismissed" | null | undefined
     });
@@ -7777,8 +7856,13 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
   });
 
   app.get("/api/v1/cronjobs/:jobId", async (request, reply) => {
+    const query = isRecord(request.query) ? request.query : {};
+    const workspaceId = optionalString(query.workspace_id);
+    if (!workspaceId) {
+      return sendError(reply, 400, "workspace_id is required");
+    }
     const params = request.params as { jobId: string };
-    const job = store.getCronjob(params.jobId);
+    const job = store.getCronjob({ workspaceId, jobId: params.jobId });
     if (!job) {
       return sendError(reply, 404, "Cronjob not found");
     }
@@ -7786,8 +7870,13 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
   });
 
   app.post("/api/v1/cronjobs/:jobId/run", async (request, reply) => {
+    const query = isRecord(request.query) ? request.query : {};
+    const workspaceId = optionalString(query.workspace_id);
+    if (!workspaceId) {
+      return sendError(reply, 400, "workspace_id is required");
+    }
     const params = request.params as { jobId: string };
-    const job = store.getCronjob(params.jobId);
+    const job = store.getCronjob({ workspaceId, jobId: params.jobId });
     if (!job) {
       return sendError(reply, 404, "Cronjob not found");
     }
@@ -7801,6 +7890,7 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
         () => queueWorker?.wake(),
       );
       const updated = store.updateCronjob({
+        workspaceId,
         jobId: job.id,
         lastRunAt: now.toISOString(),
         nextRunAt: cronjobNextRunAt(job.cron, now),
@@ -7821,6 +7911,7 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
       const message =
         error instanceof Error ? error.message : "cronjob run failed";
       store.updateCronjob({
+        workspaceId,
         jobId: job.id,
         lastRunAt: now.toISOString(),
         nextRunAt: cronjobNextRunAt(job.cron, now),
@@ -7836,7 +7927,8 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
       return sendError(reply, 400, "request body must be an object");
     }
     const params = request.params as { jobId: string };
-    const existing = store.getCronjob(params.jobId);
+    const workspaceId = requiredString(request.body.workspace_id, "workspace_id");
+    const existing = store.getCronjob({ workspaceId, jobId: params.jobId });
     if (!existing) {
       return sendError(reply, 404, "Cronjob not found");
     }
@@ -7856,6 +7948,7 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
           ? description
           : undefined;
     const job = store.updateCronjob({
+      workspaceId,
       jobId: params.jobId,
       name: nullableString(request.body.name),
       cron,
@@ -7873,8 +7966,13 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
   });
 
   app.delete("/api/v1/cronjobs/:jobId", async (request, reply) => {
+    const query = isRecord(request.query) ? request.query : {};
+    const workspaceId = optionalString(query.workspace_id);
+    if (!workspaceId) {
+      return sendError(reply, 400, "workspace_id is required");
+    }
     const params = request.params as { jobId: string };
-    const deleted = store.deleteCronjob(params.jobId);
+    const deleted = store.deleteCronjob({ workspaceId, jobId: params.jobId });
     if (!deleted) {
       return sendError(reply, 404, "Cronjob not found");
     }
@@ -8098,7 +8196,8 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
     }
 
     const params = request.params as { proposalId: string };
-    const proposal = store.getTaskProposal(params.proposalId);
+    const workspaceId = requiredString(request.body.workspace_id, "workspace_id");
+    const proposal = store.getTaskProposal({ workspaceId, proposalId: params.proposalId });
     if (!proposal) {
       return sendError(reply, 404, "Task proposal not found");
     }
@@ -8149,7 +8248,12 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
     }
 
     const evolveCandidate =
-      proposal.proposalSource === "evolve" ? store.getEvolveSkillCandidateByTaskProposalId(proposal.proposalId) : null;
+      proposal.proposalSource === "evolve"
+        ? store.getEvolveSkillCandidateByTaskProposalId({
+            workspaceId: proposal.workspaceId,
+            proposalId: proposal.proposalId,
+          })
+        : null;
     let evolveCandidateMarkdown: string | null = null;
     if (evolveCandidate) {
       try {
@@ -8259,6 +8363,7 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
     });
 
     const updatedProposal = store.updateTaskProposal({
+      workspaceId: proposal.workspaceId,
       proposalId: proposal.proposalId,
       fields: {
         taskName,
@@ -8271,6 +8376,7 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
     });
     if (evolveCandidate) {
       store.updateEvolveSkillCandidate({
+        workspaceId: evolveCandidate.workspaceId,
         candidateId: evolveCandidate.candidateId,
         fields: {
           status: "accepted",
@@ -8292,8 +8398,13 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
   });
 
   app.get("/api/v1/task-proposals/:proposalId", async (request, reply) => {
+    const query = isRecord(request.query) ? request.query : {};
+    const workspaceId = optionalString(query.workspace_id);
+    if (!workspaceId) {
+      return sendError(reply, 400, "workspace_id is required");
+    }
     const params = request.params as { proposalId: string };
-    const proposal = store.getTaskProposal(params.proposalId);
+    const proposal = store.getTaskProposal({ workspaceId, proposalId: params.proposalId });
     if (!proposal) {
       return sendError(reply, 404, "Task proposal not found");
     }
@@ -8305,7 +8416,9 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
       return sendError(reply, 400, "request body must be an object");
     }
     const params = request.params as { proposalId: string };
+    const workspaceId = requiredString(request.body.workspace_id, "workspace_id");
     const proposal = store.updateTaskProposalState({
+      workspaceId,
       proposalId: params.proposalId,
       state: requiredString(request.body.state, "state")
     });
@@ -8313,9 +8426,13 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
       return sendError(reply, 404, "Task proposal not found");
     }
     if (proposal.proposalSource === "evolve" && proposal.state === "dismissed") {
-      const candidate = store.getEvolveSkillCandidateByTaskProposalId(proposal.proposalId);
+      const candidate = store.getEvolveSkillCandidateByTaskProposalId({
+        workspaceId: proposal.workspaceId,
+        proposalId: proposal.proposalId,
+      });
       if (candidate) {
         store.updateEvolveSkillCandidate({
+          workspaceId: candidate.workspaceId,
           candidateId: candidate.candidateId,
           fields: {
             status: "dismissed",
@@ -8351,7 +8468,8 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
   app.post("/api/v1/memory-update-proposals/:proposalId/accept", async (request, reply) => {
     const body = isRecord(request.body) ? request.body : {};
     const params = request.params as { proposalId: string };
-    const proposal = store.getMemoryUpdateProposal(params.proposalId);
+    const workspaceId = requiredString(body.workspace_id, "workspace_id");
+    const proposal = store.getMemoryUpdateProposal({ workspaceId, proposalId: params.proposalId });
     if (!proposal) {
       return sendError(reply, 404, "Memory update proposal not found");
     }
@@ -8401,6 +8519,7 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
     }
 
     const updatedProposal = store.updateMemoryUpdateProposal({
+      workspaceId: proposal.workspaceId,
       proposalId: proposal.proposalId,
       fields: {
         summary,
@@ -8416,8 +8535,10 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
   });
 
   app.post("/api/v1/memory-update-proposals/:proposalId/dismiss", async (request, reply) => {
+    const body = isRecord(request.body) ? request.body : {};
+    const workspaceId = requiredString(body.workspace_id, "workspace_id");
     const params = request.params as { proposalId: string };
-    const proposal = store.getMemoryUpdateProposal(params.proposalId);
+    const proposal = store.getMemoryUpdateProposal({ workspaceId, proposalId: params.proposalId });
     if (!proposal) {
       return sendError(reply, 404, "Memory update proposal not found");
     }
@@ -8428,6 +8549,7 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
       return sendError(reply, 409, "Memory update proposal has already been dismissed");
     }
     const updatedProposal = store.updateMemoryUpdateProposal({
+      workspaceId: proposal.workspaceId,
       proposalId: proposal.proposalId,
       fields: {
         state: "dismissed",
@@ -8439,9 +8561,13 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
     };
   });
 
-  app.get("/api/v1/agent-sessions/:sessionId/outputs/events", async (request) => {
+  app.get("/api/v1/agent-sessions/:sessionId/outputs/events", async (request, reply) => {
     const params = request.params as { sessionId: string };
     const query = isRecord(request.query) ? request.query : {};
+    const workspaceId = optionalString(query.workspace_id);
+    if (!workspaceId) {
+      return sendError(reply, 400, "workspace_id is required");
+    }
     const inputId = optionalString(query.input_id);
     const includeHistory = optionalBoolean(query.include_history, true);
     const includeNative = optionalBoolean(query.include_native, false);
@@ -8449,6 +8575,7 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
     let afterEventId = Math.max(0, optionalInteger(query.after_event_id, 0));
     if (!includeHistory && afterEventId <= 0) {
       afterEventId = store.latestOutputEventId({
+        workspaceId,
         sessionId: params.sessionId,
         inputId,
         excludedEventTypes
@@ -8457,6 +8584,7 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
 
     const items = store
       .listOutputEvents({
+        workspaceId,
         sessionId: params.sessionId,
         inputId,
         includeHistory: true,
@@ -8477,6 +8605,10 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
   app.get("/api/v1/agent-sessions/:sessionId/outputs/stream", async (request, reply) => {
     const params = request.params as { sessionId: string };
     const query = isRecord(request.query) ? request.query : {};
+    const workspaceId = optionalString(query.workspace_id);
+    if (!workspaceId) {
+      return sendError(reply, 400, "workspace_id is required");
+    }
     const inputId = optionalString(query.input_id);
     const includeHistory = optionalBoolean(query.include_history, true);
     const includeNative = optionalBoolean(query.include_native, false);
@@ -8493,6 +8625,7 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
         let lastEventId = includeHistory
           ? 0
           : store.latestOutputEventId({
+              workspaceId,
               sessionId: params.sessionId,
               inputId,
               excludedEventTypes
@@ -8501,6 +8634,7 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
 
         while (true) {
           const events = store.listOutputEvents({
+            workspaceId,
             sessionId: params.sessionId,
             inputId,
             includeHistory: true,

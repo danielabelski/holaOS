@@ -35,7 +35,12 @@ export function createEvolveTaskProposal(params: {
   createdAt?: string;
   state?: string;
 }): TaskProposalRecord {
-  const existing = params.proposalId ? params.store.getTaskProposal(params.proposalId) : null;
+  const existing = params.proposalId
+    ? params.store.getTaskProposal({
+        workspaceId: params.workspaceId,
+        proposalId: params.proposalId,
+      })
+    : null;
   if (existing) {
     return existing;
   }
@@ -95,9 +100,18 @@ export function enqueueEvolveJob(params: {
   const legacyReinforceIdempotencyKey = `${LEGACY_REINFORCE_MEMORY_WRITEBACK_JOB_TYPE}:${params.inputId}`;
   const legacyIdempotencyKey = `${LEGACY_DURABLE_MEMORY_WRITEBACK_JOB_TYPE}:${params.inputId}`;
   const existing =
-    params.store.getPostRunJobByIdempotencyKey(evolveIdempotencyKey) ??
-    params.store.getPostRunJobByIdempotencyKey(legacyReinforceIdempotencyKey) ??
-    params.store.getPostRunJobByIdempotencyKey(legacyIdempotencyKey);
+    params.store.getPostRunJobByIdempotencyKey({
+      workspaceId: params.workspaceId,
+      idempotencyKey: evolveIdempotencyKey,
+    }) ??
+    params.store.getPostRunJobByIdempotencyKey({
+      workspaceId: params.workspaceId,
+      idempotencyKey: legacyReinforceIdempotencyKey,
+    }) ??
+    params.store.getPostRunJobByIdempotencyKey({
+      workspaceId: params.workspaceId,
+      idempotencyKey: legacyIdempotencyKey,
+    });
   if (existing) {
     params.wakeWorker?.();
     return existing;
@@ -128,7 +142,10 @@ export async function processEvolveJob(params: {
   ) {
     throw new Error(`unsupported evolve job type: ${params.record.jobType}`);
   }
-  const turnResult = params.store.getTurnResult({ inputId: params.record.inputId });
+  const turnResult = params.store.getTurnResult({
+    workspaceId: params.record.workspaceId,
+    inputId: params.record.inputId,
+  });
   if (!turnResult) {
     throw new Error(`turn result not found for evolve job input ${params.record.inputId}`);
   }
@@ -182,6 +199,7 @@ export async function processEvolveJob(params: {
     sourceEventIds: candidate.sourceTurnInputIds,
   });
   params.store.updateEvolveSkillCandidate({
+    workspaceId: candidate.workspaceId,
     candidateId: candidate.candidateId,
     fields: {
       taskProposalId: proposal.proposalId,

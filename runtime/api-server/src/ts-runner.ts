@@ -6,7 +6,7 @@ import path from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { RuntimeStateStore } from "@holaboss/runtime-state-store";
+import { RuntimeStateStore, hostStateDbPath } from "@holaboss/runtime-state-store";
 
 import {
   RuntimeAppLifecycleExecutor,
@@ -63,6 +63,10 @@ import {
   readWorkspaceHarnessSessionId,
   workspaceDirForId,
 } from "./ts-runner-session-state.js";
+import {
+  migrateLegacyWorkspaceStatePath,
+  workspaceStateRelativePath,
+} from "./workspace-bundle-paths.js";
 import {
   prepareInstructionWithQuotedWorkspaceSkills,
   resolveWorkspaceSkills,
@@ -299,6 +303,10 @@ function turnRequestSnapshotFingerprint(
   return fingerprintJsonValue(sanitizeSnapshotValue(payload));
 }
 
+function defaultHostStateDbPathForSandbox(sandboxRoot: string): string {
+  return hostStateDbPath({ sandboxRoot });
+}
+
 function persistTurnRequestSnapshot(params: {
   workspaceRoot: string;
   workspaceId: string;
@@ -314,7 +322,7 @@ function persistTurnRequestSnapshot(params: {
   >;
   const fingerprint = fingerprintJsonValue(sanitizedPayload);
   const sandboxRoot = path.dirname(params.workspaceRoot);
-  const dbPath = path.join(sandboxRoot, "state", "runtime.db");
+  const dbPath = defaultHostStateDbPathForSandbox(sandboxRoot);
   try {
     fs.mkdirSync(path.dirname(dbPath), { recursive: true });
   } catch (error) {
@@ -521,7 +529,7 @@ async function loadRecalledMemoryContext(params: {
   logger?: LoggerLike;
 }): Promise<AgentRecalledMemoryContext | null> {
   const sandboxRoot = path.dirname(params.workspaceRoot);
-  const dbPath = path.join(sandboxRoot, "state", "runtime.db");
+  const dbPath = defaultHostStateDbPathForSandbox(sandboxRoot);
   const store = fs.existsSync(dbPath)
     ? new RuntimeStateStore({
         workspaceRoot: params.workspaceRoot,
@@ -668,7 +676,7 @@ function loadCurrentUserContext(params: {
   logger?: LoggerLike;
 }): AgentCurrentUserContext | null {
   const sandboxRoot = path.dirname(params.workspaceRoot);
-  const dbPath = path.join(sandboxRoot, "state", "runtime.db");
+  const dbPath = defaultHostStateDbPathForSandbox(sandboxRoot);
   const defaultContext: AgentCurrentUserContext = {
     profile_id: "default",
     name: null,
@@ -710,7 +718,7 @@ function loadPendingUserMemoryContext(params: {
   logger?: LoggerLike;
 }): AgentPendingUserMemoryContext | null {
   const sandboxRoot = path.dirname(params.workspaceRoot);
-  const dbPath = path.join(sandboxRoot, "state", "runtime.db");
+  const dbPath = defaultHostStateDbPathForSandbox(sandboxRoot);
   if (!fs.existsSync(dbPath)) {
     return null;
   }
@@ -816,7 +824,7 @@ function loadRecentRuntimeContext(params: {
     return null;
   }
   const sandboxRoot = path.dirname(params.workspaceRoot);
-  const dbPath = path.join(sandboxRoot, "state", "runtime.db");
+  const dbPath = defaultHostStateDbPathForSandbox(sandboxRoot);
   let staleBrowserRefusal = false;
 
   if (fs.existsSync(dbPath)) {
@@ -890,12 +898,12 @@ async function loadLegacySessionHistoryContext(params: {
   workspaceDir: string;
   logger?: LoggerLike;
 }): Promise<AgentLegacySessionHistoryContext | null> {
-  const manifestPath = path.join(
-    params.workspaceDir,
-    ".holaboss",
-    "legacy-session-histories",
-    "index.json",
-  );
+  const legacySessionHistoryDir = migrateLegacyWorkspaceStatePath({
+    workspaceDir: params.workspaceDir,
+    relativeSegments: ["legacy-session-histories"],
+    legacyRelativeSegments: [".holaboss", "legacy-session-histories"],
+  });
+  const manifestPath = path.join(legacySessionHistoryDir, "index.json");
   try {
     const raw = await fs.promises.readFile(manifestPath, "utf8");
     const parsed = JSON.parse(raw);
@@ -940,7 +948,7 @@ async function loadLegacySessionHistoryContext(params: {
         workspaceRelativePath({
           workspaceDir: params.workspaceDir,
           filePath: manifestPath,
-        }) ?? ".holaboss/legacy-session-histories/index.json",
+        }) ?? workspaceStateRelativePath("legacy-session-histories", "index.json"),
       legacy_session_count: entries.length,
       entries: entries.slice(0, 25),
     };
@@ -1660,7 +1668,7 @@ function resolveRegisteredWorkspaceDir(
 ): string {
   const workspaceRoot = managedWorkspaceRoot();
   const sandboxRoot = path.dirname(workspaceRoot);
-  const dbPath = path.join(sandboxRoot, "state", "runtime.db");
+  const dbPath = defaultHostStateDbPathForSandbox(sandboxRoot);
   if (!fs.existsSync(dbPath)) {
     return workspaceDirForId(workspaceId);
   }
