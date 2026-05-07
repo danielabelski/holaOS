@@ -304,7 +304,7 @@ export function BackgroundTasksPane({
 
     return (
       <div className="shrink-0 px-4 pt-3 sm:px-5">
-        <div className="overflow-hidden rounded-lg border border-border bg-background/80 shadow-subtle-sm backdrop-blur-xl">
+        <div className="overflow-hidden rounded-lg border border-border bg-background/80 shadow-xs backdrop-blur-xl">
           <button
             type="button"
             onClick={() => setInlineExpanded((value) => !value)}
@@ -473,7 +473,7 @@ export function BackgroundTasksPane({
               return (
                 <div
                   key={task.subagent_id}
-                  className="flex items-center gap-2 rounded-2xl border border-border bg-card/95 px-4 py-3 shadow-subtle-xs"
+                  className="flex items-center gap-2 rounded-2xl border border-border bg-card/95 px-4 py-3 shadow-2xs"
                 >
                   {canOpenTaskSession ? (
                     <button

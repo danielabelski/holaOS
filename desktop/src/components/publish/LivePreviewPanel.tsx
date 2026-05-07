@@ -98,7 +98,7 @@ function ListingMockup({ data }: { data: LivePreviewData }) {
     "Your description appears here. Keep it tight — installers skim.";
   return (
     <div className="w-full max-w-[440px]">
-      <div className="overflow-hidden rounded-2xl bg-background shadow-subtle-sm ring-1 ring-border/35">
+      <div className="overflow-hidden rounded-2xl bg-background shadow-xs ring-1 ring-border/35">
         {/* Cover hero */}
         {data.coverImage ? (
           <img
@@ -300,7 +300,7 @@ function BundleIllustration({
 
   return (
     <div className="w-full min-w-md">
-      <div className="overflow-hidden rounded-xl bg-background shadow-subtle-sm ring-1 ring-border/35">
+      <div className="overflow-hidden rounded-xl bg-background shadow-xs ring-1 ring-border/35">
         {/* Title strip */}
         <div className="flex items-center justify-between border-b border-border px-4 py-2.5">
           <div className="flex items-center gap-2">
@@ -478,7 +478,7 @@ function DocsMockup({ data }: { data: LivePreviewData }) {
     // first-run content. Was `w-full max-w-[560px]` which collapsed to the
     // empty-state's natural width when both tabs had no content.
     <div className="w-[560px] max-w-full">
-      <div className="overflow-hidden rounded-2xl bg-background shadow-subtle-sm ring-1 ring-border/35">
+      <div className="overflow-hidden rounded-2xl bg-background shadow-xs ring-1 ring-border/35">
         {/* Tab strip */}
         <div className="flex items-center border-b border-border px-3">
           <DocsTab active={tab === "readme"} hasContent={hasReadme} onClick={() => setTab("readme")}>

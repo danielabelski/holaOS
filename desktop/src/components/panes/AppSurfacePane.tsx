@@ -524,7 +524,7 @@ export function AppSurfacePane({
                   })()}
                   <SelectContent
                     align="end"
-                    className="min-w-[240px] gap-0 rounded-lg p-1 shadow-subtle-sm"
+                    className="min-w-[240px] gap-0 rounded-lg p-1 shadow-xs"
                   >
                     {candidates.map((conn, index) => {
                       const meta = accountMetadata.get(conn.connection_id);
@@ -611,7 +611,7 @@ export function AppSurfacePane({
               </DropdownMenuTrigger>
               <DropdownMenuContent
                 align="end"
-                className="min-w-[160px] rounded-lg p-1 shadow-subtle-sm"
+                className="min-w-[160px] rounded-lg p-1 shadow-xs"
               >
                 <DropdownMenuItem
                   variant="destructive"

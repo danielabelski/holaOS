@@ -33,6 +33,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { WorkspaceIcon } from "@/components/ui/workspace-icon";
 import { cn } from "@/lib/utils";
 
 const PREVIEW_HISTORY_LIMIT = 18;
@@ -1133,7 +1134,7 @@ const WorkspaceControlCenterCard = memo(function WorkspaceControlCenterCard({
         isDragging && "cursor-grabbing opacity-70",
         isDragTarget && "ring-2 ring-primary ring-inset",
         hasUnreadCompletionHighlight
-          ? "shadow-tinted-brand"
+          ? "ring-1 ring-primary/40 ring-inset"
           : isSelected && "ring-1 ring-border ring-inset",
       )}
     >
@@ -1152,13 +1153,15 @@ const WorkspaceControlCenterCard = memo(function WorkspaceControlCenterCard({
             >
               <GripVertical className="size-3.5" />
             </Button>
+            <WorkspaceIcon workspace={workspace} size="md" />
+            <span className="truncate">{workspace.name}</span>
             <span
+              aria-hidden="true"
               className={cn(
                 "inline-flex h-2 w-2 shrink-0 rounded-full",
                 statusAccentClassName(runtimeCardState),
               )}
             />
-            <span className="truncate">{workspace.name}</span>
             {workspace.folder_state === "missing" ? (
               <span className="inline-flex items-center gap-1 text-xs text-warning">
                 <TriangleAlert className="size-3.5" />

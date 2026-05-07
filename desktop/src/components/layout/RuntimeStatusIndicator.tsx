@@ -145,7 +145,7 @@ export function RuntimeStatusIndicator({
       />
       <PopoverContent
         align="end"
-        className="w-72 rounded-lg p-0 shadow-subtle-sm ring-0"
+        className="w-72 rounded-lg p-0 shadow-xs ring-0"
         side="bottom"
         sideOffset={8}
       >

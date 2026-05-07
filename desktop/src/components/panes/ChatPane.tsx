@@ -7671,7 +7671,7 @@ export function ChatPane({
 
         {isOnboardingVariant && selectedWorkspace ? (
           <div className="shrink-0 px-4 pt-4 sm:px-5">
-            <div className="bg-muted overflow-hidden rounded-2xl border border-primary/20 shadow-subtle-xs">
+            <div className="bg-muted overflow-hidden rounded-2xl border border-primary/20 shadow-2xs">
               <div className="bg-[radial-gradient(circle_at_top_left,rgba(247,90,84,0.12),transparent_42%),radial-gradient(circle_at_92%_12%,rgba(247,170,126,0.12),transparent_36%)] px-4 py-4 sm:px-5">
                 <div className="flex flex-wrap items-start justify-between gap-3">
                   <div className="min-w-0">
@@ -8051,7 +8051,7 @@ export function ChatPane({
             {hasMessages && isAwayFromChatBottom ? (
               <button
                 aria-label="Jump to latest message"
-                className="absolute bottom-3 left-1/2 z-30 grid size-8 -translate-x-1/2 place-items-center rounded-full border border-border bg-background text-foreground shadow-subtle-sm transition-colors hover:bg-muted animate-in fade-in-0 slide-in-from-bottom-1 duration-150"
+                className="absolute bottom-3 left-1/2 z-30 grid size-8 -translate-x-1/2 place-items-center rounded-full border border-border bg-background text-foreground shadow-xs transition-colors hover:bg-muted animate-in fade-in-0 slide-in-from-bottom-1 duration-150"
                 onClick={() => {
                   const container = messagesRef.current;
                   if (!container) return;
@@ -10709,7 +10709,7 @@ function ThinkingValueSelect({
         align="start"
         side="top"
         sideOffset={8}
-        className="max-w-40 gap-0 rounded-lg p-1 shadow-subtle-sm ring-0"
+        className="max-w-40 gap-0 rounded-lg p-1 shadow-xs ring-0"
       >
         <div className="px-2.5 pb-1 pt-1 text-[10px] font-medium uppercase text-muted-foreground">
           Reasoning effort
@@ -11435,7 +11435,7 @@ function Composer({
                 align="end"
                 side="top"
                 sideOffset={8}
-                className={`gap-0 rounded-xl border border-border bg-popover p-0 shadow-subtle-sm ring-0 ${
+                className={`gap-0 rounded-xl border border-border bg-popover p-0 shadow-xs ring-0 ${
                   composerActionsView === "skills" ? "w-[320px]" : "w-[224px]"
                 }`}
               >

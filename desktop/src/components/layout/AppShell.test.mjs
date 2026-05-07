@@ -137,13 +137,16 @@ test("app shell opens the centered add apps dialog from the applications explore
 test("app shell passes the current app version into the settings dialog", async () => {
   const source = await readFile(APP_SHELL_PATH, "utf8");
 
+  // Settings is now a full-screen route via SettingsScreenRoot (was
+  // SettingsDialog before #285). The mount lives behind a
+  // settingsDialogOpen guard inside the AppShell <main>.
   assert.match(
     source,
-    /<SettingsDialog[\s\S]*appVersion=\{effectiveAppUpdateStatus\?\.currentVersion \|\| ""\}/,
+    /<SettingsScreenRoot[\s\S]*appVersion=\{effectiveAppUpdateStatus\?\.currentVersion \|\| ""\}/,
   );
   assert.match(
     source,
-    /<SettingsDialog[\s\S]*workspaceCardsPerRow=\{controlCenterCardsPerRow\}[\s\S]*onWorkspaceCardsPerRowChange=\{setControlCenterCardsPerRow\}/,
+    /<SettingsScreenRoot[\s\S]*workspaceCardsPerRow=\{controlCenterCardsPerRow\}[\s\S]*onWorkspaceCardsPerRowChange=\{setControlCenterCardsPerRow\}/,
   );
   assert.match(
     source,

@@ -199,7 +199,7 @@ export function SubagentSessionsPane({
 
     return (
       <div className="shrink-0 px-4 pt-3 sm:px-5">
-        <div className="overflow-hidden rounded-lg border border-border bg-background/80 shadow-subtle-sm backdrop-blur-xl">
+        <div className="overflow-hidden rounded-lg border border-border bg-background/80 shadow-xs backdrop-blur-xl">
           <button
             type="button"
             onClick={() => setInlineExpanded((value) => !value)}
@@ -332,7 +332,7 @@ export function SubagentSessionsPane({
                 key={session.session_id}
                 type="button"
                 onClick={() => onOpenSession?.(session)}
-                className="flex w-full min-w-0 items-start gap-2 rounded-2xl border border-border bg-card/95 px-4 py-3 text-left shadow-subtle-xs transition hover:border-primary/40 hover:text-primary"
+                className="flex w-full min-w-0 items-start gap-2 rounded-2xl border border-border bg-card/95 px-4 py-3 text-left shadow-2xs transition hover:border-primary/40 hover:text-primary"
               >
                 <span className="mt-0.5 grid size-4 shrink-0 place-items-center text-muted-foreground">
                   {inspectableRunSessionCategory(session) === "task_proposal" ? (
