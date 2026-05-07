@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { ExternalLink, FileUp, LoaderCircle, Search } from "lucide-react";
+import { AppWindow, ExternalLink, FileUp, LoaderCircle, Search } from "lucide-react";
 import {
   getProviderForCatalogEntry,
   resolveAppDisplay,
@@ -12,6 +12,7 @@ import {
   CardFooter,
   CardHeader,
 } from "@/components/ui/card";
+import { EmptyState } from "@/components/ui/empty-state";
 import { Input } from "@/components/ui/input";
 import {
   Select,
@@ -312,7 +313,7 @@ export function AppsGallery() {
             role="dialog"
             aria-modal="true"
             aria-label="Connect account"
-            className="relative z-10 w-[min(440px,calc(100vw-32px))] rounded-2xl border border-border/55 bg-background p-5 shadow-2xl"
+            className="relative z-10 w-[min(440px,calc(100vw-32px))] rounded-2xl border border-border bg-background p-5 shadow-2xl"
           >
             <p className="text-base font-semibold text-foreground">
               Connect{" "}
@@ -365,25 +366,33 @@ export function AppsGallery() {
           ))}
         </div>
       ) : appCatalog.length === 0 ? (
-        <div className="mt-8 text-center text-xs text-muted-foreground">
-          No apps available.
-        </div>
+        <EmptyState
+          icon={AppWindow}
+          size="md"
+          title="No apps available."
+          className="mt-8"
+        />
       ) : filteredCatalog.length === 0 ? (
-        <div className="mt-8 flex flex-col items-center gap-2 text-center text-xs text-muted-foreground">
-          <span>No apps match the current filter.</span>
-          {(query.trim() || categoryFilter !== "all") && (
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => {
-                setQuery("");
-                setCategoryFilter("all");
-              }}
-            >
-              Clear filter
-            </Button>
-          )}
-        </div>
+        <EmptyState
+          icon={Search}
+          size="md"
+          title="No apps match the current filter."
+          className="mt-8"
+          action={
+            (query.trim() || categoryFilter !== "all") && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => {
+                  setQuery("");
+                  setCategoryFilter("all");
+                }}
+              >
+                Clear filter
+              </Button>
+            )
+          }
+        />
       ) : (
         <div className="mt-4 grid grid-cols-1 gap-2 pb-6 md:grid-cols-2 xl:grid-cols-3">
           {filteredCatalog.map((entry) => {
