@@ -230,7 +230,13 @@ test("composeAgentPrompt uses a conversational main-session prompt for workspace
     browserToolIds: ["browser_get_state"],
     runtimeToolIds: ["list_data_tables", "create_dashboard"],
     workspaceSkillIds: [],
-    resolvedMcpToolRefs: [],
+    resolvedMcpToolRefs: [
+      {
+        tool_id: "twitter.twitter_create_post",
+        server_id: "twitter",
+        tool_name: "twitter_create_post",
+      },
+    ],
     toolServerIdMap: {},
     sessionKind: "subagent",
   });
@@ -333,6 +339,16 @@ test("composeAgentPrompt uses a conversational main-session prompt for workspace
   assert.ok(
     prompt.contextMessages.some((message) =>
       /List Data Tables \(`list_data_tables`\)/.test(message),
+    ),
+  );
+  assert.ok(
+    prompt.contextMessages.some((message) =>
+      /Delegated MCP callable tool aliases for routing only:/.test(message),
+    ),
+  );
+  assert.ok(
+    prompt.contextMessages.some((message) =>
+      /`twitter\.twitter_create_post` -> call `mcp__twitter__twitter_create_post`/.test(message),
     ),
   );
   assert.doesNotMatch(prompt.systemPrompt, /small direct edits inline/);
