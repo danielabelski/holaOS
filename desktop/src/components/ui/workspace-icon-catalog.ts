@@ -109,44 +109,20 @@ export interface WorkspaceIconColor {
 }
 
 /**
- * WORKSPACE_ICON_COLORS — six muted Notion-style tints. Each entry refers
- * to CSS variables defined in tokens.css that compose hue anchors with
- * --background / --foreground via color-mix, so the palette auto-adapts
- * to dark/light without separate theme overrides. Keys are persisted
- * verbatim.
+ * WORKSPACE_ICON_COLORS — neutral tint used across every workspace identity.
+ * Color selection was deliberately removed: the glyph carries identity, and
+ * keeping a single tone keeps the workspace gallery visually calm. The map
+ * is preserved (rather than inlined) so WorkspaceIcon can keep its existing
+ * tint-lookup shape.
  */
 export const WORKSPACE_ICON_COLORS = {
   gray: {
     bg: "var(--workspace-color-gray-bg)",
     fg: "var(--workspace-color-gray-fg)",
   },
-  amber: {
-    bg: "var(--workspace-color-amber-bg)",
-    fg: "var(--workspace-color-amber-fg)",
-  },
-  rose: {
-    bg: "var(--workspace-color-rose-bg)",
-    fg: "var(--workspace-color-rose-fg)",
-  },
-  emerald: {
-    bg: "var(--workspace-color-emerald-bg)",
-    fg: "var(--workspace-color-emerald-fg)",
-  },
-  blue: {
-    bg: "var(--workspace-color-blue-bg)",
-    fg: "var(--workspace-color-blue-fg)",
-  },
-  violet: {
-    bg: "var(--workspace-color-violet-bg)",
-    fg: "var(--workspace-color-violet-fg)",
-  },
 } satisfies Record<string, WorkspaceIconColor>;
 
 export type WorkspaceIconColorKey = keyof typeof WORKSPACE_ICON_COLORS;
-
-export const WORKSPACE_ICON_COLOR_KEYS = Object.keys(
-  WORKSPACE_ICON_COLORS,
-) as WorkspaceIconColorKey[];
 
 /** Stable djb2-style hash so a workspace id always maps to the same bucket. */
 function hashString(value: string): number {
@@ -162,13 +138,6 @@ export function deterministicIconKey(workspaceId: string): WorkspaceIconKey {
   return WORKSPACE_ICON_KEYS[index]!;
 }
 
-export function deterministicColorKey(workspaceId: string): WorkspaceIconColorKey {
-  // Re-hash with a salt so icon and color buckets are independent — same
-  // workspace doesn't always pair the Nth icon with the Nth color.
-  const index = hashString(`color:${workspaceId}`) % WORKSPACE_ICON_COLOR_KEYS.length;
-  return WORKSPACE_ICON_COLOR_KEYS[index]!;
-}
-
 export function resolveWorkspaceIconKey(
   workspaceId: string,
   stored: string | null | undefined,
@@ -180,11 +149,8 @@ export function resolveWorkspaceIconKey(
 }
 
 export function resolveWorkspaceIconColorKey(
-  workspaceId: string,
-  stored: string | null | undefined,
+  _workspaceId: string,
+  _stored: string | null | undefined,
 ): WorkspaceIconColorKey {
-  if (stored && stored in WORKSPACE_ICON_COLORS) {
-    return stored as WorkspaceIconColorKey;
-  }
-  return deterministicColorKey(workspaceId);
+  return "gray";
 }

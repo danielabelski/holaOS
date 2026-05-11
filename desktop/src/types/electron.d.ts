@@ -1686,11 +1686,17 @@ interface RuntimeNotificationListOptionsPayload {
       showNativeNotification: (
         payload: DesktopNativeNotificationPayload
       ) => Promise<boolean>;
+      setBadgeCount: (count: number) => Promise<void>;
+      getNotificationsEnabled: () => Promise<boolean>;
+      setNotificationsEnabled: (enabled: boolean) => Promise<boolean>;
       openSettingsPane: (section?: UiSettingsPaneSection) => Promise<void>;
       openExternalUrl: (url: string) => Promise<void>;
       onWindowStateChange: (listener: (state: DesktopWindowStatePayload) => void) => () => void;
       onThemeChange: (listener: (theme: string) => void) => () => void;
       onOpenSettingsPane: (listener: (section: UiSettingsPaneSection) => void) => () => void;
+      onNotificationActivated: (
+        listener: (payload: { workspaceId: string; sessionId: string | null }) => void,
+      ) => () => void;
     };
     clipboard: {
       readImage: () => Promise<ClipboardImagePayload | null>;
