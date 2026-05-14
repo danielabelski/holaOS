@@ -684,6 +684,7 @@ jobs:
           $probeDir = Join-Path $env:RUNNER_TEMP "trusted-signing-probe"
           New-Item -ItemType Directory -Force -Path $probeDir | Out-Null
           $probePath = Join-Path $probeDir "trusted-signing-probe.exe"
+          $probeSourcePath = Join-Path $probeDir "TrustedSigningProbe.cs"
           $probeSource = @"
           public static class TrustedSigningProbe
           {
@@ -694,10 +695,20 @@ jobs:
           }
           "@
 
-          Add-Type `
-            -TypeDefinition $probeSource `
-            -OutputAssembly $probePath `
-            -OutputType ConsoleApplication
+          Set-Content -Path $probeSourcePath -Value $probeSource -Encoding UTF8
+          $cscCandidates = @(
+            (Join-Path $env:WINDIR "Microsoft.NET\Framework64\v4.0.30319\csc.exe"),
+            (Join-Path $env:WINDIR "Microsoft.NET\Framework\v4.0.30319\csc.exe")
+          )
+          $csc = $cscCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $csc) {
+            throw "Unable to create Azure Trusted Signing probe executable because csc.exe was not found on the Windows runner."
+          }
+
+          & $csc /nologo /target:exe /out:$probePath $probeSourcePath
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $probePath)) {
+            throw "Unable to create Azure Trusted Signing probe executable. csc.exe exited with code $LASTEXITCODE."
+          }
 
           try {
             Invoke-TrustedSigning `

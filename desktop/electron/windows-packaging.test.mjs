@@ -62,6 +62,8 @@ test("windows packaging config and CI workflow support optional signing and NSIS
   assert.match(workflowSource, /Update AZURE_CLIENT_SECRET to the client secret Value from Microsoft Entra, not the Secret ID/);
   assert.match(workflowSource, /- name: Validate Azure Trusted Signing authorization/);
   assert.match(workflowSource, /Install-Module -Name TrustedSigning -MinimumVersion 0\.5\.0/);
+  assert.match(workflowSource, /Microsoft\.NET\\Framework64\\v4\.0\.30319\\csc\.exe/);
+  assert.match(workflowSource, /Unable to create Azure Trusted Signing probe executable/);
   assert.match(workflowSource, /Invoke-TrustedSigning/);
   assert.match(workflowSource, /Azure Trusted Signing authorization probe failed with 403 Forbidden/);
   assert.match(workflowSource, /Get-AuthenticodeSignature -FilePath \$probePath/);
