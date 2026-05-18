@@ -1333,7 +1333,7 @@ test("runTsRunnerCli strips subagent orchestration tools from onboarding session
   );
 });
 
-test("runTsRunnerCli strips staged execution tools from front-of-house workspace sessions", async () => {
+test("runTsRunnerCli keeps staged execution tools on front-of-house workspace sessions", async () => {
   setTempSandboxRoot("hb-ts-runner-runtime-tools-");
   let capturedProjectRequest: AgentRuntimeConfigCliRequest | null = null;
 
@@ -1346,7 +1346,9 @@ test("runTsRunnerCli strips staged execution tools from front-of-house workspace
             stageBrowserTools: ({ sessionKind }) => ({
               changed: false,
               toolIds:
-                sessionKind === "subagent" ? ["browser_get_state"] : [],
+                sessionKind === "main_session" || sessionKind === "subagent"
+                  ? ["browser_get_state"]
+                  : [],
             }),
             stageRuntimeTools: () => ({
               changed: false,
@@ -1396,24 +1398,28 @@ test("runTsRunnerCli strips staged execution tools from front-of-house workspace
   assert.equal(
     (capturedProjectRequest as { browser_tools_available: boolean })
       .browser_tools_available,
-    false,
+    true,
   );
   assert.deepEqual(
     (capturedProjectRequest as { browser_tool_ids: string[] }).browser_tool_ids,
-    [],
+    ["browser_get_state"],
   );
   assert.deepEqual(
     (capturedProjectRequest as { runtime_tool_ids: string[] }).runtime_tool_ids,
-    [],
+    ["holaboss_onboarding_complete", "write_report"],
   );
   assert.deepEqual(
     (capturedProjectRequest as { default_tools: string[] }).default_tools,
     [
       "read",
+      "edit",
+      "bash",
       "grep",
       "glob",
       "list",
       "question",
+      "todowrite",
+      "todoread",
       "skill",
     ],
   );
@@ -1423,7 +1429,12 @@ test("runTsRunnerCli strips staged execution tools from front-of-house workspace
   );
   assert.deepEqual(
     (capturedProjectRequest as { extra_tools: string[] }).extra_tools,
-    [],
+    [
+      "web_search",
+      "browser_get_state",
+      "holaboss_onboarding_complete",
+      "write_report",
+    ],
   );
   assert.equal(
     (capturedProjectRequest as {
@@ -1616,7 +1627,7 @@ test("runTsRunnerCli keeps workspace-instructions updates out of onboarding sess
   );
 });
 
-test("runTsRunnerCli removes direct MCP tools from front-session requests", async () => {
+test("runTsRunnerCli keeps direct MCP tools on front-session requests", async () => {
   const sandboxRoot = fs.mkdtempSync(
     path.join(os.tmpdir(), "hb-ts-runner-front-mcp-filter-"),
   );
@@ -1698,7 +1709,18 @@ test("runTsRunnerCli removes direct MCP tools from front-session requests", asyn
         resolved_mcp_tool_refs: Array<Record<string, string>>;
       }
     ).resolved_mcp_tool_refs,
-    [],
+    [
+      {
+        tool_id: "docs.lookup",
+        server_id: "docs",
+        tool_name: "lookup",
+      },
+      {
+        tool_id: "workspace.write_report",
+        server_id: "workspace",
+        tool_name: "write_report",
+      },
+    ],
   );
   assert.deepEqual(
     (
@@ -4637,7 +4659,7 @@ test(
       assert.deepEqual(
         (capturedProjectRequest as { resolved_mcp_server_ids: string[] })
           .resolved_mcp_server_ids,
-        [],
+        ["context7"],
       );
       assert.deepEqual(
         (
@@ -4652,7 +4674,7 @@ test(
         (
           capturedHarnessRequest as { mcp_servers: Array<{ name: string }> }
         ).mcp_servers.map((server) => server.name),
-        [],
+        ["context7"],
       );
       assert.deepEqual(
         (capturedHarnessRequest as { mcp_tool_refs: unknown[] }).mcp_tool_refs,

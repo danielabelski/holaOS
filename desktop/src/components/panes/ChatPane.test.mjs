@@ -6,6 +6,17 @@ import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const sourcePath = path.join(__dirname, "ChatPane", "index.tsx");
+const conversationTurnsSourcePath = path.join(
+  __dirname,
+  "ChatPane",
+  "ConversationTurns.tsx",
+);
+const assistantTurnSourcePath = path.join(
+  __dirname,
+  "ChatPane",
+  "AssistantTurn",
+  "index.tsx",
+);
 
 test("chat pane surfaces workspace activation errors before generic app-starting copy", async () => {
   const source = await readFile(sourcePath, "utf8");
@@ -416,7 +427,7 @@ test("chat trace summary only surfaces terminal run failures in the summary labe
   );
 });
 
-test("chat history reconstructs claimed and started phase steps for inspection sessions", async () => {
+test("chat phase mapping still defines claimed and started bootstrap steps", async () => {
   const source = await readFile(sourcePath, "utf8");
 
   assert.match(source, /if \(eventType === "run_claimed"\) \{/);
@@ -514,11 +525,38 @@ test("chat trace collapsed summary surfaces the current active step", async () =
 });
 
 test("chat pane keeps compaction restore inside bootstrap status instead of a standalone phase card", async () => {
-  const source = await readFile(sourcePath, "utf8");
+  const [source, assistantTurnSource] = await Promise.all([
+    readFile(sourcePath, "utf8"),
+    readFile(assistantTurnSourcePath, "utf8"),
+  ]);
 
   assert.match(
     source,
     /eventType === "run_claimed" \|\|\s*eventType === "compaction_restored" \|\|\s*eventType === "run_started"[\s\S]*setLiveAgentStatus\("Checking workspace context"\);/,
+  );
+  assert.match(
+    source,
+    /function shouldShowBootstrapPhaseTraceForSession\(\s*sessionId: string \| null \| undefined,\s*\)\s*\{\s*void sessionId;\s*return false;\s*\}/,
+  );
+  assert.match(
+    source,
+    /showBootstrapPhaseTrace:\s*shouldShowBootstrapPhaseTraceForSession\(sessionId\),/,
+  );
+  assert.match(
+    source,
+    /function isBootstrapPhaseTraceStepId\(stepId: string\)\s*\{[\s\S]*stepId === "phase:run-claimed"[\s\S]*stepId === "phase:run-started"[\s\S]*\}/,
+  );
+  assert.match(
+    source,
+    /isBootstrapPhaseTraceStepId\(phaseStep\.id\) &&\s*options\?\.showBootstrapPhaseTrace !== true/,
+  );
+  assert.match(
+    source,
+    /!isBootstrapPhaseTraceStepId\(phaseStep\.id\) \|\|\s*shouldShowBootstrapPhaseTraceForSession\(eventSessionId\)/,
+  );
+  assert.match(
+    assistantTurnSource,
+    /normalizedStatus\.toLowerCase\(\) === "checking workspace context"[\s\S]*\?\s*"Working"\s*:\s*normalizedStatus;/,
   );
   assert.doesNotMatch(source, /Preparing workspace context\.\.\./);
   assert.doesNotMatch(source, /title:\s*"Restored compacted context"/);
@@ -642,40 +680,52 @@ test("chat pane renders an execution timeline that interleaves thinking segments
   assert.doesNotMatch(source, /onToggleThinking/);
 });
 
-test("main-session assistant turns suppress trace and thinking while onboarding and read-only inspection sessions keep internals", async () => {
-  const source = await readFile(sourcePath, "utf8");
+test("main-session assistant turns keep execution internals visible in the main chat pane", async () => {
+  const [source, conversationTurnsSource, assistantTurnSource] =
+    await Promise.all([
+      readFile(sourcePath, "utf8"),
+      readFile(conversationTurnsSourcePath, "utf8"),
+      readFile(assistantTurnSourcePath, "utf8"),
+    ]);
 
   assert.match(
     source,
-    /const showSessionExecutionInternals =\s*isReadOnlyInspectionSession \|\| isOnboardingVariant;/,
+    /function shouldShowExecutionInternalsForSession\(\s*sessionId: string \| null \| undefined,\s*\)\s*\{\s*void sessionId;\s*return true;\s*\}/,
   );
   assert.match(
     source,
-    /<AssistantTurn[\s\S]*showExecutionInternals=\{\s*showSessionExecutionInternals\s*\}[\s\S]*text=\{message\.text\}/,
+    /const showSessionExecutionInternals = shouldShowExecutionInternalsForSession\(\s*activeSessionId,\s*\);/,
   );
   assert.match(
     source,
-    /<AssistantTurn[\s\S]*showExecutionInternals=\{showSessionExecutionInternals\}[\s\S]*text=\{liveAssistantText\}/,
+    /<ConversationTurns[\s\S]*showExecutionInternals=\{\s*showSessionExecutionInternals\s*\}/,
   );
-  assert.match(source, /showExecutionInternals = true,/);
-  assert.match(source, /showExecutionInternals\?: boolean;/);
   assert.match(
-    source,
+    conversationTurnsSource,
+    /<AssistantTurn[\s\S]*showExecutionInternals=\{showExecutionInternals\}[\s\S]*text=\{message\.text\}/,
+  );
+  assert.match(
+    conversationTurnsSource,
+    /<AssistantTurn[\s\S]*showExecutionInternals=\{showExecutionInternals\}[\s\S]*text=\{liveAssistantTurn\.text\}/,
+  );
+  assert.match(assistantTurnSource, /showExecutionInternals = true,/);
+  assert.match(assistantTurnSource, /showExecutionInternals\?: boolean;/);
+  assert.match(
+    assistantTurnSource,
     /const normalizedStatus = \(\s*showExecutionInternals \? status : status \? "Working" : ""\s*\)/,
   );
   assert.match(
-    source,
-    /if \(!showExecutionInternals\) \{\s*return \(\s*<TypingStatusLine[\s\S]*statusAccessory=\{statusAccessory\}/,
-  );
-  assert.match(
-    source,
+    assistantTurnSource,
     /const visibleSegments = showExecutionInternals[\s\S]*segments\.filter\([\s\S]*segment\.kind === "output"/,
   );
   assert.match(
-    source,
+    assistantTurnSource,
     /const visibleExecutionItems = showExecutionInternals \? executionItems : \[\];/,
   );
-  assert.match(source, /function hasRenderableAssistantTurn\(\s*message: ChatMessage,\s*options\?: \{ showExecutionInternals\?: boolean \},/);
+  assert.match(
+    source,
+    /function hasRenderableAssistantTurn\(\s*message: ChatMessage,\s*options\?: \{ showExecutionInternals\?: boolean \},/,
+  );
   assert.match(
     source,
     /const hasExecutionOnlyContent =[\s\S]*segment\.kind === "execution" && segment\.items\.length > 0[\s\S]*\(message\.executionItems\?\.length \?\? 0\) > 0;/,
@@ -1479,11 +1529,14 @@ test("chat composer supports ctrl-c draft cancel and arrow-up recall", async () 
 });
 
 test("live assistant turn keeps a plain status placeholder before any trace or output arrives", async () => {
-  const source = await readFile(sourcePath, "utf8");
+  const [source, assistantTurnSource] = await Promise.all([
+    readFile(sourcePath, "utf8"),
+    readFile(assistantTurnSourcePath, "utf8"),
+  ]);
 
   assert.match(
     source,
-    /const hasVisibleLiveAssistantContent =[\s\S]*renderedLiveAssistantSegments\.some\([\s\S]*segment\.kind === "output" && Boolean\(segment\.text\.trim\(\)\)/,
+    /const hasVisibleLiveAssistantContent =\s*renderedLiveAssistantSegments\.length > 0;/,
   );
   assert.match(
     source,
@@ -1491,11 +1544,19 @@ test("live assistant turn keeps a plain status placeholder before any trace or o
   );
   assert.match(
     source,
-    /const showStatusPlaceholder =\s*live && Boolean\(normalizedStatus\) && renderedSegments\.length === 0;/,
+    /resetLiveTurn\(\);[\s\S]*setIsResponding\(true\);[\s\S]*setLiveAgentStatus\("Working"\);/,
   );
   assert.match(
-    source,
-    /\{showStatusPlaceholder \? renderStatusLine\(normalizedStatus\) : null\}/,
+    assistantTurnSource,
+    /const statusPlaceholderLabel =[\s\S]*normalizedStatus\.toLowerCase\(\) === "checking workspace context"[\s\S]*\?\s*"Working"\s*:\s*normalizedStatus;/,
+  );
+  assert.match(
+    assistantTurnSource,
+    /const showStatusPlaceholder =[\s\S]*live &&[\s\S]*Boolean\(statusPlaceholderLabel\) &&[\s\S]*renderedSegments\.length === 0;/,
+  );
+  assert.match(
+    assistantTurnSource,
+    /\{showStatusPlaceholder[\s\S]*renderStatusLine\(statusPlaceholderLabel\)[\s\S]*: null\}/,
   );
 });
 

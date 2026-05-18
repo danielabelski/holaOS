@@ -100,7 +100,7 @@ test("requireRuntimeHarnessPlugin uses extended timeouts for task proposal runs"
   );
 });
 
-test("requireRuntimeHarnessPlugin stages browser tools only for subagent sessions", () => {
+test("requireRuntimeHarnessPlugin stages browser tools for main and subagent sessions", () => {
   const plugin = requireRuntimeHarnessPlugin("pi");
   const browserConfig = {
     desktopBrowserEnabled: true,
@@ -116,7 +116,7 @@ test("requireRuntimeHarnessPlugin stages browser tools only for subagent session
     }),
     {
       changed: false,
-      toolIds: []
+      toolIds: [...DESKTOP_BROWSER_TOOL_IDS]
     }
   );
   assert.deepEqual(

@@ -3,7 +3,7 @@ import test from "node:test";
 
 import { piHarnessDefinition } from "./pi.js";
 
-test("pi harness enables browser tools only for subagent sessions", () => {
+test("pi harness enables browser tools for main and subagent sessions", () => {
   const buildHarnessHostRequest = piHarnessDefinition.runtimeAdapter.buildHarnessHostRequest;
   const baseParams = {
     request: {
@@ -71,7 +71,7 @@ test("pi harness enables browser tools only for subagent sessions", () => {
 
   assert.equal(subagentRequest.browser_tools_enabled, true);
   assert.equal(subagentRequest.browser_space, "user");
-  assert.equal(workspaceRequest.browser_tools_enabled, false);
+  assert.equal(workspaceRequest.browser_tools_enabled, true);
   assert.equal(workspaceRequest.browser_space, "user");
   assert.equal(onboardingRequest.browser_tools_enabled, false);
   assert.equal(onboardingRequest.browser_space, null);

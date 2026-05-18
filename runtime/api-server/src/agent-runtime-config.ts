@@ -203,39 +203,6 @@ const LEGACY_DIRECT_PROVIDER_MODEL_ALIASES: Record<
   },
 };
 
-function normalizedSessionKindValue(value: string | null | undefined): string {
-  const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
-  if (!normalized || normalized === "workspace_session" || normalized === "main") {
-    return "main_session";
-  }
-  return normalized;
-}
-
-function directMcpDisabledForSession(value: string | null | undefined): boolean {
-  const normalized = normalizedSessionKindValue(value);
-  return normalized === "main_session" || normalized === "onboarding";
-}
-
-function directResolvedMcpToolRefsForSession(
-  sessionKind: string | null | undefined,
-  toolRefs: AgentRuntimeConfigCliRequest["resolved_mcp_tool_refs"],
-): AgentRuntimeConfigCliRequest["resolved_mcp_tool_refs"] {
-  if (!directMcpDisabledForSession(sessionKind)) {
-    return toolRefs;
-  }
-  return [];
-}
-
-function directResolvedMcpServerIdsForSession(
-  sessionKind: string | null | undefined,
-  serverIds: string[] | null | undefined,
-): string[] {
-  if (!directMcpDisabledForSession(sessionKind)) {
-    return serverIds ?? [];
-  }
-  return [];
-}
-
 interface ConfiguredRuntimeProvider {
   id: string;
   kind: string;
@@ -1520,14 +1487,8 @@ export function projectAgentRuntimeConfig(
 ): AgentRuntimeConfigCliResponse {
   const selectedModel =
     request.selected_model?.trim() || defaultExecutionModel();
-  const directResolvedMcpToolRefs = directResolvedMcpToolRefsForSession(
-    request.session_kind ?? null,
-    request.resolved_mcp_tool_refs,
-  );
-  const directResolvedMcpServerIds = directResolvedMcpServerIdsForSession(
-    request.session_kind ?? null,
-    request.resolved_mcp_server_ids ?? null,
-  );
+  const directResolvedMcpToolRefs = request.resolved_mcp_tool_refs;
+  const directResolvedMcpServerIds = request.resolved_mcp_server_ids ?? [];
   const capabilityManifest = buildAgentCapabilityManifest({
     harnessId: request.harness_id ?? null,
     sessionKind: request.session_kind ?? null,

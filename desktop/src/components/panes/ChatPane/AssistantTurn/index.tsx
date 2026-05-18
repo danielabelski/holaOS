@@ -170,8 +170,14 @@ function AssistantTurnComponent({
               : []),
           ]
         : [];
+  const statusPlaceholderLabel =
+    showExecutionInternals &&
+    renderedSegments.length === 0 &&
+    normalizedStatus.toLowerCase() === "checking workspace context"
+      ? "Working"
+      : normalizedStatus;
   const showStatusPlaceholder =
-    live && Boolean(normalizedStatus) && renderedSegments.length === 0;
+    live && Boolean(statusPlaceholderLabel) && renderedSegments.length === 0;
   const lastSegmentIsOutput =
     renderedSegments.length > 0 &&
     renderedSegments[renderedSegments.length - 1]?.kind === "output";
@@ -235,7 +241,9 @@ function AssistantTurnComponent({
             : "min-w-0 w-full max-w-4xl rounded-lg bg-fg-6 dark:bg-card px-3 py-2"
         }
       >
-        {showStatusPlaceholder ? renderStatusLine(normalizedStatus) : null}
+        {showStatusPlaceholder
+          ? renderStatusLine(statusPlaceholderLabel)
+          : null}
 
         {renderedSegments.map((segment, index) =>
           segment.kind === "execution" ? (

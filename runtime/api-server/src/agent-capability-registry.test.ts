@@ -168,6 +168,23 @@ test("buildAgentCapabilityManifest includes staged browser tools for subagent se
   assert.equal(buildEnabledToolMapFromManifest(manifest).browser_get_state, true);
 });
 
+test("buildAgentCapabilityManifest includes staged browser tools for main sessions", () => {
+  const manifest = buildAgentCapabilityManifest({
+    harnessId: "pi",
+    sessionKind: "main_session",
+    browserToolsAvailable: true,
+    browserToolIds: ["browser_get_state"],
+    runtimeToolIds: [],
+    defaultTools: ["read"],
+    extraTools: ["browser_get_state"],
+    workspaceSkillIds: [],
+    resolvedMcpToolRefs: [],
+  });
+
+  assert.equal(manifest.inspect.some((capability) => capability.callable_name === "browser_get_state"), true);
+  assert.equal(buildEnabledToolMapFromManifest(manifest).browser_get_state, true);
+});
+
 test("buildAgentCapabilityManifest excludes browser tools for onboarding sessions even when staged", () => {
   const manifest = buildAgentCapabilityManifest({
     harnessId: "pi",
@@ -208,7 +225,7 @@ test("buildAgentCapabilityManifest includes native web search as a runtime tool"
   assert.equal(buildEnabledToolMapFromManifest(manifest).web_search, true);
 });
 
-test("renderCapabilityToolRoutingPromptSection tells main sessions to delegate when direct capability is missing", () => {
+test("renderCapabilityToolRoutingPromptSection lets main sessions execute directly and delegate when useful", () => {
   const manifest = buildAgentCapabilityManifest({
     harnessId: "pi",
     sessionKind: "main_session",
@@ -223,17 +240,18 @@ test("renderCapabilityToolRoutingPromptSection tells main sessions to delegate w
 
   const section = renderCapabilityToolRoutingPromptSection(manifest);
   assert.match(section, /Delegation routing:/);
-  assert.match(section, /use `holaboss_delegate_task` instead of carrying out that task in this session/i);
-  assert.match(section, /main session as a coordinator first/i);
-  assert.match(section, /if the request requires task execution, route it to a delegated subagent/i);
+  assert.match(section, /use `holaboss_delegate_task` when work is long-running, parallelizable, blocking, risky, or better isolated than this session/i);
+  assert.match(section, /Direct execution is allowed in this session when the surfaced tools can satisfy the request cleanly/i);
   assert.match(section, /Treat user requests as workspace-native by default/i);
-  assert.match(section, /delegate the workspace execution path unless the user explicitly asks for non-workspace handling/i);
-  assert.match(section, /Do not turn a named app or product request into a desktop install, browser-open, manual setup, or generic option list before delegation has checked the workspace-native route/i);
+  assert.match(section, /Prefer the direct surfaced workspace route first/i);
+  assert.match(section, /Do not turn a named app or product request into a desktop install, browser-open, manual setup, or generic option list before checking the direct workspace-native route or delegated workspace route/i);
   assert.match(section, /Ground clarification in current workspace\/session context or a concrete tool\/subagent result/i);
+  assert.match(section, /inspect, execute, or delegate first when context is insufficient/i);
   assert.match(section, /Do not ask abstract option-list questions or introduce unsupported alternatives from general product knowledge/i);
   assert.match(section, /Available-tool fallback:/);
   assert.match(section, /missing the ideal MCP, API, browser, web, terminal, or file tool is not enough to stop/i);
   assert.match(section, /choose another viable direct or delegated route/i);
+  assert.match(section, /Treat delegated subagents as overflow execution capacity, not as the only execution surface for this workspace/i);
   assert.match(section, /Deliverable routing: when the user asks for a report, brief, memo, digest, recap, or other long-form deliverable, prefer `holaboss_delegate_task`/);
   assert.match(section, /Do not lead with a capability apology, manual workaround, or "I can't do that here" answer when delegation is available/i);
   assert.match(section, /trust the current run and retry the tool when it is the right path/i);
@@ -241,6 +259,7 @@ test("renderCapabilityToolRoutingPromptSection tells main sessions to delegate w
   assert.match(section, /Continuation routing:/);
   assert.match(section, /use `holaboss_continue_subagent` on the relevant completed child session instead of creating a brand-new delegated task/i);
   assert.match(section, /ask which one the user means before continuing/i);
+  assert.doesNotMatch(section, /main session as a coordinator first/i);
 });
 
 test("renderCapabilityToolRoutingPromptSection prefers surfaced MCP tools before diagnostic fallbacks in executor sessions", () => {
@@ -311,7 +330,7 @@ test("renderDelegatedCapabilityAvailabilityContextPromptSection exposes backstag
     delegatedManifest,
   );
   assert.match(section, /Delegated executor capability snapshot:/);
-  assert.match(section, /do not expand your own direct authority in this front session/i);
+  assert.match(section, /complement your direct authority in this front session/i);
   assert.match(section, /Delegated browser tools: available \(1 enabled\)\./);
   assert.match(section, /Delegated runtime tools: available \(2 enabled\)\./);
   assert.match(section, /Delegated connected MCP\/app access: available\./);
@@ -690,9 +709,9 @@ test("renderCapabilityPolicyPromptSection summarizes grouped capabilities", () =
   assert.match(section, /Workspace commands: available \(1 enabled\)\./);
   assert.match(section, /Workspace skills: available \(1 enabled\)\./);
   assert.match(section, /Browser tools: none\./);
-  assert.match(section, /Use surfaced capabilities to inspect, route, or verify before making claims about workspace, app, browser, or runtime state whenever possible\./);
-  assert.match(section, /If state-changing work happens in this run or through a delegated child, verify the result before claiming success or completion\./);
-  assert.match(section, /Use coordination capabilities to track progress, consult available skills, route execution, or ask for clarification instead of keeping hidden state\./);
+  assert.match(section, /Use surfaced capabilities to inspect before mutating workspace, app, browser, or runtime state whenever possible\./);
+  assert.match(section, /After edits, shell commands, browser actions, MCP mutations, or runtime mutations, run a follow-up inspection or verification step before claiming success\./);
+  assert.match(section, /Use coordination capabilities to track progress, consult available skills, delegate long-running or parallel work, or ask for clarification instead of keeping hidden state\./);
   assert.match(section, /Connected MCP access: available\./);
   assert.match(section, /Use surfaced MCP tools when relevant/);
   assert.match(
@@ -708,7 +727,7 @@ test("renderCapabilityPolicyPromptSection summarizes grouped capabilities", () =
   assert.doesNotMatch(section, /Connected MCP tools available now:/);
 });
 
-test("renderCapabilityPolicyPromptSection surfaces front-session delegation semantics", () => {
+test("renderCapabilityPolicyPromptSection surfaces full-capability front-session semantics", () => {
   const manifest = buildAgentCapabilityManifest({
     harnessId: "pi",
     sessionKind: "main_session",
@@ -723,7 +742,7 @@ test("renderCapabilityPolicyPromptSection surfaces front-session delegation sema
 
   const section = renderCapabilityPolicyPromptSection(manifest);
   assert.match(section, /Browser tools: none\./);
-  assert.match(section, /This front session is intentionally capability-incomplete\./);
-  assert.match(section, /Treat the surfaced tools above as your full direct capability set for this run/i);
-  assert.match(section, /if the request needs more and `holaboss_delegate_task` is available, delegate it/i);
+  assert.match(section, /This front session can execute directly with the surfaced tools above\./);
+  assert.match(section, /Use `holaboss_delegate_task` when the work is better handled as background, parallel, or isolated execution/i);
+  assert.doesNotMatch(section, /intentionally capability-incomplete/i);
 });
