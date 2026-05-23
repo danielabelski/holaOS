@@ -9985,6 +9985,48 @@ async function listIntegrationBindings(
   );
 }
 
+interface WorkspaceDefaultAccountResponsePayload {
+  connection_id: string | null;
+}
+
+interface SetWorkspaceDefaultAccountResponsePayload {
+  connection_id: string;
+}
+
+// Layer 2 of the four-layer account-resolution model — "when this
+// workspace makes a direct (non-app) Composio call for provider X,
+// use this connection by default". REST routes are on the runtime
+// API server; these IPC wrappers exist so the Settings UI + the
+// IntegrationsPane connect flow can read / write them. See
+// active-account-resolver.ts for the full resolution stack.
+async function getWorkspaceDefaultAccount(
+  workspaceId: string,
+  providerId: string,
+): Promise<WorkspaceDefaultAccountResponsePayload> {
+  return requestWorkspaceRuntimeJson<WorkspaceDefaultAccountResponsePayload>(
+    workspaceId,
+    {
+      method: "GET",
+      path: `/api/v1/workspaces/${encodeURIComponent(workspaceId)}/integrations/${encodeURIComponent(providerId)}/default-account`,
+    },
+  );
+}
+
+async function setWorkspaceDefaultAccount(
+  workspaceId: string,
+  providerId: string,
+  connectionId: string,
+): Promise<SetWorkspaceDefaultAccountResponsePayload> {
+  return requestWorkspaceRuntimeJson<SetWorkspaceDefaultAccountResponsePayload>(
+    workspaceId,
+    {
+      method: "PUT",
+      path: `/api/v1/workspaces/${encodeURIComponent(workspaceId)}/integrations/${encodeURIComponent(providerId)}/default-account`,
+      payload: { connection_id: connectionId },
+    },
+  );
+}
+
 async function upsertIntegrationBinding(
   workspaceId: string,
   targetType: string,
@@ -10569,6 +10611,22 @@ type IntegrationContextFetchStatusListResponsePayload = {
   statuses: IntegrationContextFetchStatusPayload[];
 };
 
+type IntegrationMemoryClearResponsePayload = {
+  ok: true;
+  provider_id: string;
+  connection_id: string;
+  cleared: boolean;
+  tree_ids: string[];
+  deleted_trees: number;
+  deleted_leaves: number;
+  deleted_summary_nodes: number;
+  deleted_tree_edges: number;
+  deleted_canonical_nodes: number;
+  deleted_canonical_edges: number;
+  deleted_relations: number;
+  deleted_embeddings: number;
+  deleted_files: number;
+};
 async function fetchIntegrationContext(
   connectionId: string,
 ): Promise<IntegrationContextFetchStartResponsePayload> {
@@ -10602,6 +10660,21 @@ async function listIntegrationContextFetchStatuses(
   });
 }
 
+async function clearIntegrationMemory(
+  connectionId: string,
+): Promise<IntegrationMemoryClearResponsePayload> {
+  const trimmed = typeof connectionId === "string" ? connectionId.trim() : "";
+  if (!trimmed) {
+    throw new Error("clearIntegrationMemory: connection_id required");
+  }
+  return requestRuntimeJson<IntegrationMemoryClearResponsePayload>({
+    method: "POST",
+    path: "/api/v1/integrations/memory-clear",
+    payload: {
+      connection_id: trimmed,
+    },
+  });
+}
 // Single entry point for "desktop directly calls a Composio action via
 // the new /api/composio/internal/tools/execute surface."
 //
@@ -14525,6 +14598,19 @@ async function listOutputs(
       (item) => !shouldHideWorkspaceManagedArtifactOutput(item),
     ),
   };
+}
+
+async function listOutputFolders(
+  workspaceId: string,
+): Promise<WorkspaceOutputFolderListResponsePayload> {
+  return requestWorkspaceRuntimeJson<WorkspaceOutputFolderListResponsePayload>(
+    workspaceId,
+    {
+      method: "GET",
+      path: "/api/v1/output-folders",
+      params: { workspace_id: workspaceId },
+    },
+  );
 }
 
 function normalizeWorkspaceSkillId(value: unknown): string | null {
@@ -23418,6 +23504,11 @@ app.whenReady().then(async () => {
       listOutputs(payload),
   );
   handleTrustedIpc(
+    "workspace:listOutputFolders",
+    ["main"],
+    async (_event, workspaceId: string) => listOutputFolders(workspaceId),
+  );
+  handleTrustedIpc(
     "workspace:listSkills",
     ["main"],
     async (_event, workspaceId: string) => listWorkspaceSkills(workspaceId),
@@ -23735,6 +23826,22 @@ app.whenReady().then(async () => {
     async (_event, workspaceId: string) => listIntegrationBindings(workspaceId),
   );
   handleTrustedIpc(
+    "workspace:getWorkspaceDefaultAccount",
+    ["main"],
+    async (_event, workspaceId: string, providerId: string) =>
+      getWorkspaceDefaultAccount(workspaceId, providerId),
+  );
+  handleTrustedIpc(
+    "workspace:setWorkspaceDefaultAccount",
+    ["main"],
+    async (
+      _event,
+      workspaceId: string,
+      providerId: string,
+      connectionId: string,
+    ) => setWorkspaceDefaultAccount(workspaceId, providerId, connectionId),
+  );
+  handleTrustedIpc(
     "workspace:upsertIntegrationBinding",
     ["main"],
     async (
@@ -23931,6 +24038,11 @@ app.whenReady().then(async () => {
       listIntegrationContextFetchStatuses(
         Array.isArray(connectionIds) ? connectionIds : [],
       ),
+  );
+  handleTrustedIpc(
+    "workspace:clearIntegrationMemory",
+    ["main"],
+    async (_event, connectionId: string) => clearIntegrationMemory(connectionId),
   );
   handleTrustedIpc(
     "workspace:composioConnect",

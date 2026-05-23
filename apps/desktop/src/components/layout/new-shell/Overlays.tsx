@@ -2,58 +2,29 @@ import { Dialog as DialogPrimitive } from "@base-ui/react/dialog";
 import { useAtom, useSetAtom, type PrimitiveAtom } from "jotai";
 import { X } from "lucide-react";
 import type { ReactNode } from "react";
-import { useEffect, useState } from "react";
-import { OperationsInboxPane } from "@/components/layout/OperationsDrawer";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { SettingsScreenRoot } from "@/components/layout/SettingsScreenRoot";
-import { ArtifactsPane } from "@/components/panes/ArtifactsPane";
 import { AutomationsPane } from "@/components/panes/AutomationsPane";
 import { MarketplacePane } from "@/components/panes/MarketplacePane";
-import { SubagentSessionsPane } from "@/components/panes/SubagentSessionsPane";
 import { Button } from "@/components/ui/button";
 import { useWorkspaceSelection } from "@/lib/workspaceSelection";
 import {
-  artifactsOpenAtom,
   automationsOpenAtom,
-  inboxOpenAtom,
+  chatComposerPrefillAtom,
+  focusModeAtom,
   marketplaceOpenAtom,
-  sessionsOpenAtom,
   settingsOpenAtom,
   settingsSectionAtom,
 } from "./state/ui";
 import { useSettingsState } from "./useSettingsState";
-import { useTaskProposals } from "./useTaskProposals";
 
 export function Overlays() {
   return (
     <>
-      <InboxOverlay />
-      <ArtifactsOverlay />
       <AutomationsOverlay />
-      <SessionsOverlay />
       <MarketplaceOverlay />
       <SettingsOverlay />
     </>
-  );
-}
-
-function InboxOverlay() {
-  const { selectedWorkspaceId } = useWorkspaceSelection();
-  const { proposals, isLoading, statusMessage, action, accept, dismiss } =
-    useTaskProposals(selectedWorkspaceId || null);
-  return (
-    <PaneOverlay openAtom={inboxOpenAtom} title="Inbox" size="md">
-      <div className="h-full overflow-y-auto">
-        <OperationsInboxPane
-          proposals={proposals}
-          isLoadingProposals={isLoading}
-          proposalStatusMessage={statusMessage}
-          proposalAction={action}
-          onAcceptProposal={accept}
-          onDismissProposal={dismiss}
-          hasWorkspace={Boolean(selectedWorkspaceId)}
-        />
-      </div>
-    </PaneOverlay>
   );
 }
 
@@ -110,40 +81,56 @@ function PaneOverlay({
   );
 }
 
-function ArtifactsOverlay() {
-  const { selectedWorkspaceId } = useWorkspaceSelection();
-  return (
-    <PaneOverlay openAtom={artifactsOpenAtom} title="Artifacts">
-      <ArtifactsPane workspaceId={selectedWorkspaceId || null} />
-    </PaneOverlay>
-  );
-}
-
 function AutomationsOverlay() {
   const { selectedWorkspaceId } = useWorkspaceSelection();
+  const setAutomationsOpen = useSetAtom(automationsOpenAtom);
+  const setFocusMode = useSetAtom(focusModeAtom);
+  const setComposerPrefill = useSetAtom(chatComposerPrefillAtom);
+  const prefillKeyRef = useRef(0);
+
+  // Route schedule create/edit through the chat composer, matching the
+  // legacy AppShell behavior. We close the overlay + exit focus so the
+  // user lands in chat with the prefill text ready to edit.
+  const sendChatPrefill = useCallback(
+    (text: string) => {
+      prefillKeyRef.current += 1;
+      setComposerPrefill({
+        text,
+        requestKey: prefillKeyRef.current,
+        mode: "replace",
+      });
+      setFocusMode(false);
+      setAutomationsOpen(false);
+    },
+    [setAutomationsOpen, setComposerPrefill, setFocusMode],
+  );
+
+  const handleCreateSchedule = useCallback(() => {
+    sendChatPrefill("Create a schedule for ");
+  }, [sendChatPrefill]);
+
+  const handleEditSchedule = useCallback(
+    (job: CronjobRecordPayload) => {
+      const label = job.name?.trim() || job.cron;
+      sendChatPrefill(`Edit the "${label}" schedule: `);
+    },
+    [sendChatPrefill],
+  );
+
   return (
     <PaneOverlay
       openAtom={automationsOpenAtom}
       title="Automations"
       size="md"
     >
-      <AutomationsPane workspaceId={selectedWorkspaceId || null} />
-    </PaneOverlay>
-  );
-}
-
-function SessionsOverlay() {
-  const { selectedWorkspaceId } = useWorkspaceSelection();
-  return (
-    <PaneOverlay openAtom={sessionsOpenAtom} title="Sessions">
-      <SubagentSessionsPane
+      <AutomationsPane
         workspaceId={selectedWorkspaceId || null}
-        variant="full"
+        onCreateSchedule={handleCreateSchedule}
+        onEditSchedule={handleEditSchedule}
       />
     </PaneOverlay>
   );
 }
-
 
 function MarketplaceOverlay() {
   return (

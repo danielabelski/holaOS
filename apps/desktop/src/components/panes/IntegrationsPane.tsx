@@ -6,6 +6,7 @@ import {
   Plus,
   RefreshCw,
   ShieldAlert,
+  Trash2,
   Unplug,
 } from "lucide-react";
 import { AddIntegrationDialog } from "@/components/panes/AddIntegrationDialog";
@@ -18,6 +19,13 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { useDesktopAuthSession } from "@/lib/auth/authClient";
 import { accountDisplayLabel } from "@/lib/integrationDisplay";
 import { useWorkspaceDesktop } from "@/lib/workspaceDesktop";
@@ -149,6 +157,20 @@ function composioFallbackLogo(slug: string): string | null {
   return `https://logos.composio.dev/api/${cleaned}`;
 }
 
+// Composio's logo CDN returns wide wordmark SVGs (and sometimes a pure
+// white fill) for a handful of providers, so the square thumbnail in
+// the integrations grid renders as a sliver-in-a-banner or invisibly
+// white-on-white. Simple Icons publishes a square monochrome SVG per
+// brand at a stable unpkg URL — short-circuit just those slugs.
+const BRAND_LOGO_OVERRIDES: Record<string, string> = {
+  github: "https://unpkg.com/simple-icons@16.20.0/icons/github.svg",
+  linear: "https://unpkg.com/simple-icons@16.20.0/icons/linear.svg",
+};
+
+function brandLogoOverride(slug: string): string | null {
+  return BRAND_LOGO_OVERRIDES[slug.trim().toLowerCase()] ?? null;
+}
+
 function mergeIntegrationCards(
   catalogProviders: IntegrationCatalogProviderPayload[],
   toolkits: ComposioToolkit[],
@@ -185,7 +207,10 @@ function mergeIntegrationCards(
         normalizedText(provider.description) ||
         normalizedText(provider.display_name) ||
         providerId,
-      logo: toolkit?.logo ?? composioFallbackLogo(providerId),
+      logo:
+        brandLogoOverride(providerId) ??
+        toolkit?.logo ??
+        composioFallbackLogo(providerId),
       authSchemes: uniqueStrings([
         ...(toolkit?.auth_schemes || []),
         ...(provider.auth_modes || []),
@@ -205,7 +230,7 @@ function mergeIntegrationCards(
       providerId,
       name: normalizedText(toolkit.name) || providerId,
       description: normalizedText(toolkit.description) || providerId,
-      logo: toolkit.logo,
+      logo: brandLogoOverride(providerId) ?? toolkit.logo,
       authSchemes: uniqueStrings(toolkit.auth_schemes || []),
       categories: toolkitCategories.length > 0 ? toolkitCategories : ["other"],
       supportsManaged: true,
@@ -227,6 +252,9 @@ export function IntegrationsPane({ embedded }: { embedded?: boolean } = {}) {
     string | null
   >(null);
   const [disconnectingConnectionId, setDisconnectingConnectionId] = useState<
+    string | null
+  >(null);
+  const [clearingIntegrationMemoryConnectionId, setClearingIntegrationMemoryConnectionId] = useState<
     string | null
   >(null);
   const [refreshingConnectionId, setRefreshingConnectionId] = useState<
@@ -252,7 +280,8 @@ export function IntegrationsPane({ embedded }: { embedded?: boolean } = {}) {
   >(new Map());
   const [expandedProviderId, setExpandedProviderId] = useState<string | null>(null);
   const [mutatingOverrideKey, setMutatingOverrideKey] = useState<string | null>(null);
-  const { workspaces } = useWorkspaceDesktop();
+  const { workspaces, selectedWorkspace } = useWorkspaceDesktop();
+  const selectedWorkspaceId = selectedWorkspace?.id ?? null;
   const accountMetadata = useIntegrationAccountMetadata(connections);
 
   const loadData = useCallback(async () => {
@@ -705,6 +734,35 @@ export function IntegrationsPane({ embedded }: { embedded?: boolean } = {}) {
           owner_user_id: userId,
           account_label: `${integration.name} (Managed)`,
         });
+        // Layer-2 auto-default: when the user explicitly connects an
+        // account from Settings AND the selected workspace has no
+        // workspace_default set for this provider yet, the just-
+        // connected account becomes the workspace's default. This
+        // satisfies the common single-account case (one Gmail, one
+        // GitHub) without an extra step, AND seeds first-connect for
+        // multi-account users. Never overrides an existing default —
+        // a workspace that already chose work-gmail keeps it even if
+        // the user adds a second personal-gmail from Settings.
+        if (selectedWorkspaceId) {
+          try {
+            const existing = await window.electronAPI.workspace.getWorkspaceDefaultAccount(
+              selectedWorkspaceId,
+              integration.providerId,
+            );
+            if (!existing.connection_id) {
+              await window.electronAPI.workspace.setWorkspaceDefaultAccount(
+                selectedWorkspaceId,
+                integration.providerId,
+                connectedAccountId,
+              );
+            }
+          } catch {
+            // Auto-default is a convenience; failure does not block
+            // the connect flow. The user can still call
+            // `set_default_account` via chat or wait for the runtime
+            // resolver to fall back to first-active.
+          }
+        }
         setStatusMessage("");
         void loadData();
         return;
@@ -722,6 +780,10 @@ export function IntegrationsPane({ embedded }: { embedded?: boolean } = {}) {
     connectionId: string;
     label: string;
     workspaceCount: number;
+  } | null>(null);
+  const [pendingMemoryClear, setPendingMemoryClear] = useState<{
+    connectionId: string;
+    label: string;
   } | null>(null);
 
   function handleDisconnect(connectionId: string) {
@@ -882,6 +944,30 @@ export function IntegrationsPane({ embedded }: { embedded?: boolean } = {}) {
       setStatusMessage(contextFetchDisplayMessage(result.status));
     } catch (error) {
       setStatusMessage(normalizeErrorMessage(error));
+    }
+  }
+
+  async function performClearIntegrationMemory(connectionId: string) {
+    setClearingIntegrationMemoryConnectionId(connectionId);
+    setStatusMessage("");
+    try {
+      const result =
+        await window.electronAPI.workspace.clearIntegrationMemory(connectionId);
+      setContextFetchStatusByConnectionId((prev) => {
+        const next = { ...prev };
+        delete next[connectionId];
+        return next;
+      });
+      await loadData();
+      setStatusMessage(
+        result.cleared
+          ? `Cleared ${result.provider_id} memory: ${result.deleted_trees} tree${result.deleted_trees === 1 ? "" : "s"}, ${result.deleted_leaves} leaves, ${result.deleted_summary_nodes} summaries.`
+          : "No stored integration memory found for this account.",
+      );
+    } catch (error) {
+      setStatusMessage(normalizeErrorMessage(error));
+    } finally {
+      setClearingIntegrationMemoryConnectionId(null);
     }
   }
 
@@ -1071,6 +1157,9 @@ export function IntegrationsPane({ embedded }: { embedded?: boolean } = {}) {
                 onFetchContext={(connectionId) =>
                   void handleFetchContext(connectionId)
                 }
+                onClearIntegrationMemory={(connectionId, label) =>
+                  setPendingMemoryClear({ connectionId, label })
+                }
                 onToggleContextAutoFetch={(connectionId, enabled) =>
                   void handleToggleContextAutoFetch(connectionId, enabled)
                 }
@@ -1091,6 +1180,9 @@ export function IntegrationsPane({ embedded }: { embedded?: boolean } = {}) {
                 refreshingConnectionId={refreshingConnectionId}
                 togglingContextAutoFetchConnectionId={
                   togglingContextAutoFetchConnectionId
+                }
+                clearingIntegrationMemoryConnectionId={
+                  clearingIntegrationMemoryConnectionId
                 }
                 contextFetchStatusByConnectionId={
                   contextFetchStatusByConnectionId
@@ -1178,6 +1270,26 @@ export function IntegrationsPane({ embedded }: { embedded?: boolean } = {}) {
         open={Boolean(pendingDisconnect)}
         title="Disconnect this account?"
       />
+      <ConfirmDialog
+        confirmLabel="Clear memory"
+        description={
+          pendingMemoryClear
+            ? `${pendingMemoryClear.label} memory will be deleted from the integration tree. The account stays connected, and you can fetch again to rebuild it.`
+            : ""
+        }
+        destructive
+        onConfirm={() => {
+          if (pendingMemoryClear) {
+            void performClearIntegrationMemory(pendingMemoryClear.connectionId);
+            setPendingMemoryClear(null);
+          }
+        }}
+        onOpenChange={(open) => {
+          if (!open) setPendingMemoryClear(null);
+        }}
+        open={Boolean(pendingMemoryClear)}
+        title="Clear this account's memory?"
+      />
     </>
   );
 
@@ -1262,6 +1374,9 @@ export function IntegrationsPane({ embedded }: { embedded?: boolean } = {}) {
                   onFetchContext={(connectionId) =>
                     void handleFetchContext(connectionId)
                   }
+                  onClearIntegrationMemory={(connectionId, label) =>
+                    setPendingMemoryClear({ connectionId, label })
+                  }
                   onToggleContextAutoFetch={(connectionId, enabled) =>
                     void handleToggleContextAutoFetch(connectionId, enabled)
                   }
@@ -1282,6 +1397,9 @@ export function IntegrationsPane({ embedded }: { embedded?: boolean } = {}) {
                   refreshingConnectionId={refreshingConnectionId}
                   togglingContextAutoFetchConnectionId={
                     togglingContextAutoFetchConnectionId
+                  }
+                  clearingIntegrationMemoryConnectionId={
+                    clearingIntegrationMemoryConnectionId
                   }
                   contextFetchStatusByConnectionId={
                     contextFetchStatusByConnectionId
@@ -1365,7 +1483,30 @@ export function IntegrationsPane({ embedded }: { embedded?: boolean } = {}) {
           open={Boolean(pendingDisconnect)}
           title="Disconnect this account?"
         />
-        <ComposioRuntimeDebugRow />
+        <ConfirmDialog
+          confirmLabel="Clear memory"
+          description={
+            pendingMemoryClear
+              ? `${pendingMemoryClear.label} memory will be deleted from the integration tree. The account stays connected, and you can fetch again to rebuild it.`
+              : ""
+          }
+          destructive
+          onConfirm={() => {
+            if (pendingMemoryClear) {
+              void performClearIntegrationMemory(pendingMemoryClear.connectionId);
+              setPendingMemoryClear(null);
+            }
+          }}
+          onOpenChange={(open) => {
+            if (!open) setPendingMemoryClear(null);
+          }}
+          open={Boolean(pendingMemoryClear)}
+          title="Clear this account's memory?"
+        />
+        <ComposioRuntimeDebugRow
+          capabilitiesByToolkit={capabilitiesByToolkit}
+          connections={connections}
+        />
       </div>
     );
   }
@@ -1406,9 +1547,11 @@ function ConnectedProviderCard({
   onDisconnect,
   onRefresh,
   onFetchContext,
+  onClearIntegrationMemory,
   onToggleContextAutoFetch,
   refreshingConnectionId,
   togglingContextAutoFetchConnectionId,
+  clearingIntegrationMemoryConnectionId,
   contextFetchStatusByConnectionId,
   connecting,
   disconnectingConnectionId,
@@ -1431,12 +1574,14 @@ function ConnectedProviderCard({
   onDisconnect: (connectionId: string) => void;
   onRefresh: (connectionId: string) => void;
   onFetchContext: (connectionId: string) => void;
+  onClearIntegrationMemory: (connectionId: string, label: string) => void;
   onToggleContextAutoFetch: (
     connectionId: string,
     enabled: boolean,
   ) => void;
   refreshingConnectionId: string | null;
   togglingContextAutoFetchConnectionId: string | null;
+  clearingIntegrationMemoryConnectionId: string | null;
   contextFetchStatusByConnectionId: Record<
     string,
     IntegrationContextFetchStatusPayload
@@ -1525,6 +1670,8 @@ function ConnectedProviderCard({
           const contextFetchSupported = supportsContextFetchProvider(conn.provider_id);
           const togglingContextAutoFetch =
             togglingContextAutoFetchConnectionId === conn.connection_id;
+          const clearingIntegrationMemory =
+            clearingIntegrationMemoryConnectionId === conn.connection_id;
           const fetchProgressPercent = contextFetchStatus
             ? contextFetchProgressPercent(contextFetchStatus)
             : 0;
@@ -1579,6 +1726,7 @@ function ConnectedProviderCard({
                   className="h-6 px-1.5 text-[10px] text-muted-foreground hover:text-foreground"
                   disabled={
                     disconnecting ||
+                    clearingIntegrationMemory ||
                     fetchingContext ||
                     !contextFetchSupported
                   }
@@ -1599,11 +1747,30 @@ function ConnectedProviderCard({
                   )}
                 </Button>
                 <Button
+                  aria-label={`Clear ${label} memory`}
+                  className="h-6 px-1.5 text-[10px] text-muted-foreground hover:text-destructive"
+                  disabled={disconnecting || clearingIntegrationMemory || fetchingContext}
+                  onClick={() =>
+                    onClearIntegrationMemory(conn.connection_id, label)
+                  }
+                  title="Delete the stored memory tree for this account without disconnecting it"
+                  size="sm"
+                  type="button"
+                  variant="ghost"
+                >
+                  {clearingIntegrationMemory ? (
+                    <Loader2 className="size-3 animate-spin" />
+                  ) : (
+                    <Trash2 className="size-3" />
+                  )}
+                </Button>
+                <Button
                   aria-label={`Refresh ${label} identity`}
                   title="Refetch handle, email, and avatar from the provider"
                   className="text-muted-foreground hover:text-foreground"
                   disabled={
                     disconnecting ||
+                    clearingIntegrationMemory ||
                     refreshingConnectionId === conn.connection_id
                   }
                   onClick={() => onRefresh(conn.connection_id)}
@@ -1620,7 +1787,7 @@ function ConnectedProviderCard({
                 <Button
                   aria-label={`Disconnect ${label}`}
                   className="text-muted-foreground hover:text-destructive"
-                  disabled={disconnecting}
+                  disabled={disconnecting || clearingIntegrationMemory}
                   onClick={() => onDisconnect(conn.connection_id)}
                   size="icon-xs"
                   type="button"
@@ -1650,7 +1817,7 @@ function ConnectedProviderCard({
                     <Switch
                       aria-label={`Auto-fetch ${label} context every 30 minutes`}
                       checked={conn.context_cron_auto_fetch_enabled !== false}
-                      disabled={disconnecting || togglingContextAutoFetch}
+                      disabled={disconnecting || clearingIntegrationMemory || togglingContextAutoFetch}
                       onCheckedChange={(checked) =>
                         onToggleContextAutoFetch(conn.connection_id, checked)
                       }
@@ -1845,12 +2012,56 @@ function WorkspaceScopeSection({
 // feature lands. Editable provider + tool slug + args via small inputs;
 // defaults are the canonical Gmail fetch case. Safe to delete alongside
 // the runtime endpoint once a real consumer is in product.
-function ComposioRuntimeDebugRow() {
+function ComposioRuntimeDebugRow({
+  connections,
+  capabilitiesByToolkit,
+}: {
+  connections: IntegrationConnectionPayload[];
+  capabilitiesByToolkit: Record<string, ComposioToolkitCapability[]>;
+}) {
   const [providerSlug, setProviderSlug] = useState("gmail");
   const [toolSlug, setToolSlug] = useState("GMAIL_FETCH_EMAILS");
   const [argsText, setArgsText] = useState(
     JSON.stringify({ max_results: 5 }, null, 2),
   );
+
+  // One preset per connected provider whose toolkit catalog has at
+  // least one capability. Picking a preset fills all three inputs
+  // together so we never end up with e.g. linkedin + GMAIL_FETCH_EMAILS,
+  // which is the failure mode that made every non-gmail probe error.
+  const presets = useMemo(() => {
+    const seen = new Set<string>();
+    const list: {
+      providerSlug: string;
+      label: string;
+      toolSlug: string;
+      args: string;
+    }[] = [];
+    for (const c of connections) {
+      const slug = c.provider_id.trim().toLowerCase();
+      if (!slug || seen.has(slug)) continue;
+      seen.add(slug);
+      const caps = capabilitiesByToolkit[slug] ?? [];
+      const preferred = caps.find((cap) => cap.read_only) ?? caps[0];
+      if (!preferred) continue;
+      list.push({
+        providerSlug: slug,
+        label: `${slug} — ${preferred.tool_slug}`,
+        toolSlug: preferred.tool_slug,
+        args: slug === "gmail" ? JSON.stringify({ max_results: 5 }, null, 2) : "{}",
+      });
+    }
+    return list;
+  }, [connections, capabilitiesByToolkit]);
+
+  function applyPreset(value: string | null) {
+    if (!value) return;
+    const preset = presets.find((p) => p.providerSlug === value);
+    if (!preset) return;
+    setProviderSlug(preset.providerSlug);
+    setToolSlug(preset.toolSlug);
+    setArgsText(preset.args);
+  }
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<unknown>(null);
   const [errorMessage, setErrorMessage] = useState("");
@@ -1912,6 +2123,25 @@ function ComposioRuntimeDebugRow() {
           {busy ? "Running…" : "Run probe"}
         </Button>
       </div>
+      {presets.length > 0 ? (
+        <label className="mt-3 flex flex-col gap-1">
+          <span className="text-[11px] text-muted-foreground">
+            preset (connected provider → first cataloged tool)
+          </span>
+          <Select onValueChange={applyPreset} value={providerSlug}>
+            <SelectTrigger className="h-7 text-xs">
+              <SelectValue placeholder="Pick a connected provider…" />
+            </SelectTrigger>
+            <SelectContent>
+              {presets.map((preset) => (
+                <SelectItem key={preset.providerSlug} value={preset.providerSlug}>
+                  {preset.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </label>
+      ) : null}
       <div className="mt-3 grid grid-cols-2 gap-2">
         <label className="flex flex-col gap-1">
           <span className="text-[11px] text-muted-foreground">
