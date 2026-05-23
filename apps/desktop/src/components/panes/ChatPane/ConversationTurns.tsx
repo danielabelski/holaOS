@@ -24,18 +24,12 @@ export function ConversationTurns<Message extends ChatMessage>({
   onToggleTraceStep,
   onLinkClick,
   onLocalLinkClick,
-  memoryProposalAction,
-  editingMemoryProposalId,
-  memoryProposalDrafts,
-  onEditMemoryProposal,
-  onMemoryProposalDraftChange,
-  onAcceptMemoryProposal,
-  onDismissMemoryProposal,
   assistantFooterAccessoryMessageId = null,
   assistantFooterAccessory = null,
   getMessageWrapperClassName,
   liveAssistantTurn = null,
   onAfterIntegrationBind,
+  onAfterIntegrationProposalConnected,
 }: {
   messages: Message[];
   assistantLabel: string;
@@ -50,18 +44,6 @@ export function ConversationTurns<Message extends ChatMessage>({
   onToggleTraceStep: (stepId: string) => void;
   onLinkClick?: (url: string) => void;
   onLocalLinkClick?: (href: string) => void;
-  memoryProposalAction: {
-    proposalId: string;
-    action: "accept" | "dismiss";
-  } | null;
-  editingMemoryProposalId: string | null;
-  memoryProposalDrafts: Record<string, string>;
-  onEditMemoryProposal: (message: Message, proposalId: string) => void;
-  onMemoryProposalDraftChange: (proposalId: string, value: string) => void;
-  onAcceptMemoryProposal: (proposal: MemoryUpdateProposalRecordPayload) => void;
-  onDismissMemoryProposal: (
-    proposal: MemoryUpdateProposalRecordPayload,
-  ) => void;
   assistantFooterAccessoryMessageId?: string | null;
   assistantFooterAccessory?: ReactNode;
   getMessageWrapperClassName?: (message: Message) => string | undefined;
@@ -75,7 +57,27 @@ export function ConversationTurns<Message extends ChatMessage>({
     footerAccessory?: ReactNode;
   } | null;
   onAfterIntegrationBind?: () => void;
+  onAfterIntegrationProposalConnected?: (toolkitSlug: string) => void;
 }) {
+  // Cross-turn dedup of pending-integration cards. A long-running build
+  // session re-emits `pending_integrations` on every workspace_apps_*
+  // tool call, so the same `(provider, app_id)` pair appears across
+  // many assistant turns. Without dedup, the chat ends up with stacks
+  // of stale Connect / Pick-account cards from earlier turns even
+  // after the user has already authorized — exactly the failure mode
+  // in the duplicate-Connect-card report. Only the latest assistant
+  // turn that introduced a given `(provider, app_id)` should keep the
+  // interactive card; earlier turns drop that entry.
+  const latestPendingIntegrationIndexByKey = new Map<string, number>();
+  for (let i = 0; i < messages.length; i += 1) {
+    const m = messages[i];
+    if (!m || m.role !== "assistant") continue;
+    for (const entry of m.pendingIntegrations ?? []) {
+      const key = `${entry.provider_id.trim().toLowerCase()}|${entry.app_id.trim().toLowerCase()}`;
+      if (!key) continue;
+      latestPendingIntegrationIndexByKey.set(key, i);
+    }
+  }
   return (
     <>
       {messages.map((message, index) => {
@@ -109,19 +111,16 @@ export function ConversationTurns<Message extends ChatMessage>({
               tone={message.tone ?? "default"}
               segments={message.segments ?? []}
               executionItems={message.executionItems ?? []}
-              memoryProposals={message.memoryProposals ?? []}
               outputs={message.outputs ?? []}
-              pendingIntegrations={message.pendingIntegrations ?? []}
+              pendingIntegrations={(message.pendingIntegrations ?? []).filter(
+                (entry) => {
+                  const key = `${entry.provider_id.trim().toLowerCase()}|${entry.app_id.trim().toLowerCase()}`;
+                  return latestPendingIntegrationIndexByKey.get(key) === index;
+                },
+              )}
+              proposedIntegrations={message.proposedIntegrations ?? []}
               onAfterIntegrationBind={onAfterIntegrationBind}
-              memoryProposalAction={memoryProposalAction}
-              editingMemoryProposalId={editingMemoryProposalId}
-              memoryProposalDrafts={memoryProposalDrafts}
-              onEditMemoryProposal={(proposalId) =>
-                onEditMemoryProposal(message, proposalId)
-              }
-              onMemoryProposalDraftChange={onMemoryProposalDraftChange}
-              onAcceptMemoryProposal={onAcceptMemoryProposal}
-              onDismissMemoryProposal={onDismissMemoryProposal}
+              onAfterIntegrationProposalConnected={onAfterIntegrationProposalConnected}
               onOpenOutput={onOpenOutput}
               onOpenAllArtifacts={onOpenAllArtifacts}
               collapsedTraceByStepId={collapsedTraceByStepId}
@@ -159,15 +158,7 @@ export function ConversationTurns<Message extends ChatMessage>({
           tone={liveAssistantTurn.tone ?? "default"}
           segments={liveAssistantTurn.segments}
           executionItems={liveAssistantTurn.executionItems}
-          memoryProposals={[]}
           outputs={[]}
-          memoryProposalAction={memoryProposalAction}
-          editingMemoryProposalId={editingMemoryProposalId}
-          memoryProposalDrafts={memoryProposalDrafts}
-          onEditMemoryProposal={() => undefined}
-          onMemoryProposalDraftChange={onMemoryProposalDraftChange}
-          onAcceptMemoryProposal={onAcceptMemoryProposal}
-          onDismissMemoryProposal={onDismissMemoryProposal}
           onOpenOutput={onOpenOutput}
           onOpenAllArtifacts={onOpenAllArtifacts}
           collapsedTraceByStepId={collapsedTraceByStepId}

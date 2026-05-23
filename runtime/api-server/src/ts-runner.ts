@@ -80,9 +80,7 @@ import {
   type WorkspaceMcpSidecarCliRequest,
 } from "./workspace-mcp-sidecar.js";
 import type { CompiledWorkspaceRuntimePlan } from "./workspace-runtime-plan.js";
-import { createBackgroundTaskMemoryModelClient } from "./background-task-model.js";
-import { recalledMemoryContextFromManifest } from "./memory-recall-manifest.js";
-import { createRecallEmbeddingModelClient } from "./recall-embedding-model.js";
+import { buildRecalledWorkspaceMemoryContext } from "./workspace-memory.js";
 import { readSessionScratchpad } from "./session-scratchpad.js";
 import { pendingUserMemoryContextFromProposals } from "./user-memory-proposals.js";
 import { NATIVE_WEB_SEARCH_TOOL_IDS } from "../../harnesses/src/native-web-search-tools.js";
@@ -98,7 +96,6 @@ const RUNTIME_EXEC_CONTEXT_KEY = "_sandbox_runtime_exec_v1";
 const DEFAULT_SESSION_MODE = "code";
 const DEFAULT_PROVIDER_ID = "openai";
 const WORKSPACE_MCP_READY_TIMEOUT_S = 10;
-const RECALL_SCOPE_ENTRY_LIMIT = 200;
 const MAIN_SESSION_DEFAULT_TOOLS = [
   "read",
   "edit",
@@ -152,7 +149,7 @@ const ONBOARDING_SESSION_RUNTIME_TOOL_IDS = new Set([
       !MAIN_SESSION_ONLY_RUNTIME_TOOL_IDS.has(toolId),
   ),
   "onboarding_status",
-  "onboarding_complete",
+  "holaboss_onboarding_complete",
 ]);
 const BROWSER_RETRY_REQUEST_PATTERN = /\b(?:try again|retry|do it again|again)\b/i;
 const BROWSER_ACTION_REQUEST_PATTERN =
@@ -543,72 +540,18 @@ async function loadRecalledMemoryContext(params: {
         dbPath,
       })
     : null;
+  if (!store) {
+    return null;
+  }
   try {
-    const workspaceEntries = store
-      ? store.listMemoryEntries({
-          workspaceId: params.workspaceId,
-          status: "active",
-          limit: RECALL_SCOPE_ENTRY_LIMIT,
-          offset: 0,
-        })
-      : [];
-    const userEntries = store
-      ? store.listMemoryEntries({
-          scope: "user",
-          status: "active",
-          limit: RECALL_SCOPE_ENTRY_LIMIT,
-          offset: 0,
-        })
-      : [];
-    const byMemoryId = new Map<string, (typeof workspaceEntries)[number]>();
-    for (const entry of [...workspaceEntries, ...userEntries]) {
-      const existing = byMemoryId.get(entry.memoryId);
-      if (!existing) {
-        byMemoryId.set(entry.memoryId, entry);
-        continue;
-      }
-      const existingTime = Date.parse(existing.updatedAt);
-      const nextTime = Date.parse(entry.updatedAt);
-      if (
-        Number.isFinite(nextTime) &&
-        (!Number.isFinite(existingTime) || nextTime > existingTime)
-      ) {
-        byMemoryId.set(entry.memoryId, entry);
-      }
-    }
-    const entries = [...byMemoryId.values()].sort((left, right) => {
-      const updatedDiff =
-        Date.parse(right.updatedAt) - Date.parse(left.updatedAt);
-      if (updatedDiff !== 0 && Number.isFinite(updatedDiff)) {
-        return updatedDiff;
-      }
-      const createdDiff =
-        Date.parse(right.createdAt) - Date.parse(left.createdAt);
-      if (createdDiff !== 0 && Number.isFinite(createdDiff)) {
-        return createdDiff;
-      }
-      return left.memoryId.localeCompare(right.memoryId);
-    });
-    return await recalledMemoryContextFromManifest({
-      query: params.instruction,
-      workspaceRoot: params.workspaceRoot,
-      workspaceId: params.workspaceId,
-      entries,
+    return await buildRecalledWorkspaceMemoryContext({
       store,
-      maxEntries: 5,
-      modelClient: selectorModelClientFromRequest({
-        request: params.request,
-        workspaceId: params.workspaceId,
-        sessionId: params.sessionId,
-        inputId: params.inputId,
-      }),
-      embeddingClient: createRecallEmbeddingModelClient({
-        selectedModel: params.request.model,
-        defaultProviderId: defaultProviderId(),
-        workspaceId: params.workspaceId,
-        sessionId: params.sessionId,
-        inputId: params.inputId,
-      }),
+      workspaceId: params.workspaceId,
+      query: params.instruction,
+      selectedModel: params.request.model,
+      sessionId: params.sessionId,
+      inputId: params.inputId,
+      maxResults: 5,
     });
   } catch (error) {
     params.logger?.warn?.(
@@ -1152,37 +1095,6 @@ function defaultSessionMode(): string {
   );
 }
 
-function selectorModelClientFromRequest(params: {
-  request: TsRunnerRequest;
-  workspaceId: string;
-  sessionId: string;
-  inputId: string;
-}) {
-  const runtimeExecContext = isRecord(
-    params.request.context[RUNTIME_EXEC_CONTEXT_KEY],
-  )
-    ? (params.request.context[RUNTIME_EXEC_CONTEXT_KEY] as Record<
-        string,
-        unknown
-      >)
-    : {};
-  return createBackgroundTaskMemoryModelClient({
-    workspaceId: params.workspaceId,
-    sessionId: params.sessionId,
-    inputId: params.inputId,
-    selectedModel: firstNonEmptyString(
-      typeof params.request.model === "string" ? params.request.model : "",
-      null,
-    ),
-    defaultProviderId: defaultProviderId(),
-    runtimeExecModelProxyApiKey: firstNonEmptyString(
-      runtimeExecContext.model_proxy_api_key,
-    ),
-    runtimeExecSandboxId: firstNonEmptyString(runtimeExecContext.sandbox_id),
-    runtimeExecRunId: firstNonEmptyString(runtimeExecContext.run_id),
-  });
-}
-
 function defaultExtraTools(harnessId?: string | null): string[] {
   const configured = (process.env.HOLABOSS_EXTRA_TOOLS ?? "")
     .split(",")
@@ -1243,6 +1155,11 @@ function projectRuntimeToolIdsForSession(params: {
   if (normalized === "main_session") {
     return [...params.runtimeToolIds];
   }
+  if (normalized === "subagent") {
+    return params.runtimeToolIds.filter(
+      (toolId) => !SUBAGENT_ORCHESTRATION_RUNTIME_TOOL_IDS.has(toolId),
+    );
+  }
   return params.runtimeToolIds.filter(
     (toolId) =>
       !SUBAGENT_ORCHESTRATION_RUNTIME_TOOL_IDS.has(toolId) &&
@@ -1263,6 +1180,16 @@ function projectExtraToolIdsForSession(params: {
   if (normalized === "main_session") {
     return Array.from(
       new Set([...defaultExtraTools(params.harnessId), ...params.extraToolIds]),
+    );
+  }
+  if (normalized === "subagent") {
+    return Array.from(
+      new Set([
+        ...defaultExtraTools(params.harnessId),
+        ...params.extraToolIds.filter(
+          (toolId) => !SUBAGENT_ORCHESTRATION_RUNTIME_TOOL_IDS.has(toolId),
+        ),
+      ]),
     );
   }
   return Array.from(
@@ -1507,6 +1434,7 @@ function buildAgentRuntimeConfigRequest(params: {
   extraToolIds: string[];
   delegatedExtraToolIds?: string[] | null;
   workspaceSkillIds: string[];
+  workspaceSkillDescriptions: Record<string, string>;
   workspaceCommandIds: string[];
   toolServerIdMap: Readonly<Record<string, string>>;
   resolvedMcpToolRefs: CompiledWorkspaceRuntimePlan["resolved_mcp_tool_refs"];
@@ -1600,6 +1528,7 @@ function buildAgentRuntimeConfigRequest(params: {
     session_mode: defaultSessionMode(),
     workspace_config_checksum: params.compiledPlan.config_checksum,
     workspace_skill_ids: [...params.workspaceSkillIds],
+    workspace_skill_descriptions: { ...params.workspaceSkillDescriptions },
     workspace_command_ids: [...params.workspaceCommandIds],
     default_tools: frontSession
       ? defaultToolsForSessionKind(normalizedSessionKind)
@@ -2424,6 +2353,9 @@ export async function executeTsRunnerRequest(
               ...stagedRuntimeTools.toolIds,
             ],
             workspaceSkillIds: workspaceSkills.map((skill) => skill.skill_id),
+            workspaceSkillDescriptions: Object.fromEntries(
+              workspaceSkills.map((skill) => [skill.skill_id, skill.description]),
+            ),
             workspaceCommandIds: stagedCommands.commandIds,
             toolServerIdMap: serverIdMap,
             resolvedMcpToolRefs,

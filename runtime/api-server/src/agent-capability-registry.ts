@@ -171,6 +171,7 @@ export interface BuildAgentCapabilityManifestParams {
   defaultTools: string[];
   extraTools: string[];
   workspaceSkillIds: string[];
+  workspaceSkillDescriptions?: Readonly<Record<string, string>> | null;
   resolvedMcpToolRefs: AgentCapabilityMcpToolRef[];
   resolvedMcpServerIds?: string[] | null;
   toolServerIdMap?: Readonly<Record<string, string>> | null;
@@ -179,6 +180,7 @@ export interface BuildAgentCapabilityManifestParams {
 interface CapabilityAvailabilityRules {
   harnessIds?: string[];
   sessionKinds?: string[];
+  excludedSessionKinds?: string[];
 }
 
 type ToolCapabilityDefinition = {
@@ -364,6 +366,20 @@ const BUILTIN_CAPABILITY_DEFINITIONS: Record<string, ToolCapabilityDefinition> =
   },
 };
 
+function runtimeToolAvailability(toolId: string): CapabilityAvailabilityRules | undefined {
+  if (
+    toolId === "holaboss_create_alignment_question" ||
+    toolId === "holaboss_create_alignment_report" ||
+    toolId === "holaboss_create_verification_report"
+  ) {
+    return { sessionKinds: ["workspace_onboarding"] };
+  }
+  if (toolId === "holaboss_onboarding_complete") {
+    return { excludedSessionKinds: ["workspace_onboarding"] };
+  }
+  return undefined;
+}
+
 const RUNTIME_TOOL_DEFINITIONS = new Map<string, ToolCapabilityDefinition>(
   RUNTIME_AGENT_TOOL_DEFINITIONS.map((toolDef) => [
     toolDef.id,
@@ -372,6 +388,7 @@ const RUNTIME_TOOL_DEFINITIONS = new Map<string, ToolCapabilityDefinition>(
       policy: toolDef.policy,
       title: titleFromToken(toolDef.id),
       description: toolDef.description,
+      availability: runtimeToolAvailability(toolDef.id),
     },
   ])
 );
@@ -545,6 +562,16 @@ function definitionAllowedInContext(
       reason: "session_kind_not_allowed",
     };
   }
+  if (
+    availability.excludedSessionKinds &&
+    normalizedSessionKind &&
+    availability.excludedSessionKinds.includes(normalizedSessionKind)
+  ) {
+    return {
+      allowed: false,
+      reason: "session_kind_not_allowed",
+    };
+  }
 
   return { allowed: true, reason: null };
 }
@@ -579,7 +606,7 @@ function executionSemanticsForDescriptor(params: {
       concurrency: "serial_only",
       requires_runtime_service: true,
       requires_browser: false,
-      requires_user_confirmation: normalizedId === "onboarding_complete",
+      requires_user_confirmation: normalizedId === "holaboss_onboarding_complete",
     };
   }
   if (params.kind === "workspace_command") {
@@ -755,17 +782,25 @@ function buildToolDescriptor(
   };
 }
 
-function buildSkillDescriptor(skillId: string): StaticAgentCapabilityDescriptor | null {
+function buildSkillDescriptor(
+  skillId: string,
+  skillDescription?: string | null,
+): StaticAgentCapabilityDescriptor | null {
   const trimmed = skillId.trim();
   if (!trimmed) {
     return null;
   }
+  const cleanedDescription =
+    typeof skillDescription === "string" ? skillDescription.trim() : "";
   return {
     id: trimmed,
     kind: "skill",
     policy: "coordinate",
     title: titleFromToken(trimmed),
-    description: `Skill '${trimmed}' is available for domain-specific guidance.`,
+    description:
+      cleanedDescription !== ""
+        ? cleanedDescription
+        : `Skill '${trimmed}' is available for domain-specific guidance.`,
     source: "workspace_skill",
     callable_spec: null,
     visibility_surface: "metadata",
@@ -936,8 +971,11 @@ function buildStaticCapabilityRegistry(
   if (workspaceSkills.length > 0) {
     upsertDescriptor(buildToolDescriptor("read", "implied_tool"));
     upsertDescriptor(buildToolDescriptor("skill", "implied_tool"));
+    const skillDescriptions = params.workspaceSkillDescriptions ?? {};
     for (const skillId of workspaceSkills) {
-      upsertDescriptor(buildSkillDescriptor(skillId));
+      upsertDescriptor(
+        buildSkillDescriptor(skillId, skillDescriptions[skillId] ?? null),
+      );
     }
   }
 
@@ -1472,6 +1510,15 @@ export function renderCapabilityAvailabilityContextPromptSection(
     summarizeAvailability("Workspace commands", manifest.workspace_commands.length),
     summarizeAvailability("Workspace skills", manifest.workspace_skills.length),
   ];
+  if (manifest.skills.length > 0) {
+    lines.push("Workspace skill catalog (id — when to use):");
+    for (const skill of manifest.skills) {
+      lines.push(`- ${skill.id} — ${skill.description}`);
+    }
+    lines.push(
+      "Invoke a relevant skill via the `skill` tool whenever the user request matches its description. Do not improvise when a listed skill fits the task.",
+    );
+  }
   if (manifest.mcp_tools.length > 0 || (manifest.context.mcp_server_ids?.length ?? 0) > 0) {
     lines.push("Connected MCP access: available.");
     lines.push("Use surfaced MCP tools when relevant; tool names may be resolved dynamically by the runtime.");

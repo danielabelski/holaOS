@@ -16,10 +16,10 @@ test("buildAgentCapabilityManifest classifies tools, skills, and MCP aliases", (
     sessionKind: "subagent",
     browserToolsAvailable: true,
     browserToolIds: ["browser_get_state"],
-    runtimeToolIds: ["onboarding_complete", "todoread", "todowrite"],
+    runtimeToolIds: ["holaboss_onboarding_complete", "todoread", "todowrite"],
     workspaceCommandIds: ["hello"],
     defaultTools: ["read", "edit", "question", "todoread", "todowrite"],
-    extraTools: ["browser_get_state", "onboarding_complete", "todoread", "todowrite"],
+    extraTools: ["browser_get_state", "holaboss_onboarding_complete", "todoread", "todowrite"],
     workspaceSkillIds: ["skill-creator"],
     resolvedMcpToolRefs: [
       {
@@ -35,7 +35,7 @@ test("buildAgentCapabilityManifest classifies tools, skills, and MCP aliases", (
     session_kind: "subagent",
     browser_tools_available: true,
     browser_tool_ids: ["browser_get_state"],
-    runtime_tool_ids: ["onboarding_complete", "todoread", "todowrite"],
+    runtime_tool_ids: ["holaboss_onboarding_complete", "todoread", "todowrite"],
     workspace_command_ids: ["hello"],
     workspace_commands_available: true,
     workspace_skills_available: true,
@@ -46,7 +46,7 @@ test("buildAgentCapabilityManifest classifies tools, skills, and MCP aliases", (
   assert.deepEqual(manifest.browser_tools.map((capability) => capability.callable_name), ["browser_get_state"]);
   assert.deepEqual(
     manifest.runtime_tools.map((capability) => capability.callable_name).sort(),
-    ["onboarding_complete", "todoread", "todowrite"]
+    ["holaboss_onboarding_complete", "todoread", "todowrite"]
   );
   assert.ok(manifest.inspect.some((capability) => capability.callable_name === "read"));
   assert.ok(manifest.inspect.some((capability) => capability.callable_name === "browser_get_state"));
@@ -57,7 +57,7 @@ test("buildAgentCapabilityManifest classifies tools, skills, and MCP aliases", (
   );
   assert.ok(manifest.mutate.some((capability) => capability.callable_name === "edit"));
   assert.ok(
-    manifest.mutate.some((capability) => capability.callable_name === "onboarding_complete")
+    manifest.mutate.some((capability) => capability.callable_name === "holaboss_onboarding_complete")
   );
   assert.ok(manifest.coordinate.some((capability) => capability.callable_name === "question"));
   assert.ok(manifest.coordinate.some((capability) => capability.callable_name === "skill"));
@@ -89,6 +89,44 @@ test("buildAgentCapabilityManifest classifies tools, skills, and MCP aliases", (
   assert.equal(toolMap.browser_get_state, true);
   assert.equal(toolMap.mcp__workspace__lookup, true);
   assert.equal(toolMap.skill, true);
+});
+
+test("buildAgentCapabilityManifest keeps workspace-onboarding review mutations out of the model surface", () => {
+  const manifest = buildAgentCapabilityManifest({
+    harnessId: "pi",
+    sessionKind: "workspace_onboarding",
+    browserToolsAvailable: false,
+    runtimeToolIds: [
+      "holaboss_create_alignment_question",
+      "holaboss_create_alignment_report",
+      "holaboss_create_verification_report",
+      "holaboss_onboarding_complete",
+    ],
+    defaultTools: ["read", "edit"],
+    extraTools: [
+      "holaboss_create_alignment_question",
+      "holaboss_create_alignment_report",
+      "holaboss_create_verification_report",
+      "holaboss_onboarding_complete",
+    ],
+    workspaceSkillIds: [],
+    resolvedMcpToolRefs: [],
+  });
+
+  assert.deepEqual(
+    manifest.runtime_tools.map((capability) => capability.callable_name).sort(),
+    [
+      "holaboss_create_alignment_question",
+      "holaboss_create_alignment_report",
+      "holaboss_create_verification_report",
+    ],
+  );
+  assert.equal(
+    manifest.capabilities.some(
+      (capability) => capability.callable_name === "holaboss_onboarding_complete",
+    ),
+    false,
+  );
 });
 
 test("buildAgentCapabilityManifest applies tool server id mappings to MCP callable names", () => {
@@ -128,9 +166,9 @@ test("buildAgentCapabilityManifest filters browser tools when policy context doe
     sessionKind: "task_proposal",
     browserToolsAvailable: true,
     browserToolIds: ["browser_get_state"],
-    runtimeToolIds: ["onboarding_complete"],
+    runtimeToolIds: ["holaboss_onboarding_complete"],
     defaultTools: ["read"],
-    extraTools: ["browser_get_state", "onboarding_complete"],
+    extraTools: ["browser_get_state", "holaboss_onboarding_complete"],
     workspaceSkillIds: [],
     resolvedMcpToolRefs: [],
   });
@@ -140,14 +178,17 @@ test("buildAgentCapabilityManifest filters browser tools when policy context doe
     session_kind: "task_proposal",
     browser_tools_available: true,
     browser_tool_ids: ["browser_get_state"],
-    runtime_tool_ids: ["onboarding_complete"],
+    runtime_tool_ids: ["holaboss_onboarding_complete"],
     workspace_command_ids: [],
     workspace_commands_available: false,
     workspace_skills_available: false,
     mcp_tools_available: false,
   });
   assert.equal(manifest.inspect.some((capability) => capability.callable_name === "browser_get_state"), false);
-  assert.equal(manifest.mutate.some((capability) => capability.callable_name === "onboarding_complete"), true);
+  assert.equal(
+    manifest.mutate.some((capability) => capability.callable_name === "holaboss_onboarding_complete"),
+    true,
+  );
   assert.equal(buildEnabledToolMapFromManifest(manifest).browser_get_state, undefined);
 });
 
@@ -191,15 +232,18 @@ test("buildAgentCapabilityManifest excludes browser tools for onboarding session
     sessionKind: "onboarding",
     browserToolsAvailable: true,
     browserToolIds: ["browser_get_state"],
-    runtimeToolIds: ["onboarding_complete"],
+    runtimeToolIds: ["holaboss_onboarding_complete"],
     defaultTools: ["read"],
-    extraTools: ["browser_get_state", "onboarding_complete"],
+    extraTools: ["browser_get_state", "holaboss_onboarding_complete"],
     workspaceSkillIds: [],
     resolvedMcpToolRefs: [],
   });
 
   assert.equal(manifest.inspect.some((capability) => capability.callable_name === "browser_get_state"), false);
-  assert.equal(manifest.mutate.some((capability) => capability.callable_name === "onboarding_complete"), true);
+  assert.equal(
+    manifest.mutate.some((capability) => capability.callable_name === "holaboss_onboarding_complete"),
+    true,
+  );
   assert.equal(buildEnabledToolMapFromManifest(manifest).browser_get_state, undefined);
 });
 
@@ -483,10 +527,10 @@ test("evaluateAgentCapabilities keeps command and skill surfaces while excluding
     sessionKind: "subagent",
     browserToolsAvailable: true,
     browserToolIds: [],
-    runtimeToolIds: ["onboarding_complete"],
+    runtimeToolIds: ["holaboss_onboarding_complete"],
     workspaceCommandIds: ["hello"],
     defaultTools: ["read"],
-    extraTools: ["browser_get_state", "onboarding_complete"],
+    extraTools: ["browser_get_state", "holaboss_onboarding_complete"],
     workspaceSkillIds: ["skill-creator"],
     resolvedMcpToolRefs: [],
   });
@@ -549,9 +593,9 @@ test("evaluateAgentCapabilities includes richer execution and authority metadata
     sessionKind: "subagent",
     browserToolsAvailable: true,
     browserToolIds: ["browser_get_state"],
-    runtimeToolIds: ["onboarding_complete"],
+    runtimeToolIds: ["holaboss_onboarding_complete"],
     defaultTools: ["bash", "question"],
-    extraTools: ["browser_get_state", "onboarding_complete"],
+    extraTools: ["browser_get_state", "holaboss_onboarding_complete"],
     workspaceSkillIds: [],
     resolvedMcpToolRefs: [],
   });
@@ -572,7 +616,9 @@ test("evaluateAgentCapabilities includes richer execution and authority metadata
     runtime_state: false,
   });
 
-  const runtimeCapability = evaluation.capabilities.find((capability) => capability.id === "onboarding_complete");
+  const runtimeCapability = evaluation.capabilities.find(
+    (capability) => capability.id === "holaboss_onboarding_complete",
+  );
   assert.ok(runtimeCapability);
   assert.deepEqual(runtimeCapability.execution_semantics, {
     concurrency: "serial_only",
@@ -646,10 +692,10 @@ test("evaluateAgentCapabilities fingerprints the run snapshot", () => {
     sessionKind: "subagent",
     browserToolsAvailable: true,
     browserToolIds: ["browser_get_state"],
-    runtimeToolIds: ["onboarding_complete"],
+    runtimeToolIds: ["holaboss_onboarding_complete"],
     workspaceCommandIds: ["hello"],
     defaultTools: ["read"],
-    extraTools: ["browser_get_state", "onboarding_complete"],
+    extraTools: ["browser_get_state", "holaboss_onboarding_complete"],
     workspaceSkillIds: ["skill-creator"],
     resolvedMcpToolRefs: [],
   });
@@ -658,10 +704,10 @@ test("evaluateAgentCapabilities fingerprints the run snapshot", () => {
     sessionKind: "subagent",
     browserToolsAvailable: true,
     browserToolIds: ["browser_get_state"],
-    runtimeToolIds: ["onboarding_complete"],
+    runtimeToolIds: ["holaboss_onboarding_complete"],
     workspaceCommandIds: ["hello"],
     defaultTools: ["read"],
-    extraTools: ["browser_get_state", "onboarding_complete"],
+    extraTools: ["browser_get_state", "holaboss_onboarding_complete"],
     workspaceSkillIds: ["skill-creator"],
     resolvedMcpToolRefs: [],
   });
@@ -670,10 +716,10 @@ test("evaluateAgentCapabilities fingerprints the run snapshot", () => {
     sessionKind: "subagent",
     browserToolsAvailable: true,
     browserToolIds: ["browser_get_state"],
-    runtimeToolIds: ["onboarding_complete"],
+    runtimeToolIds: ["holaboss_onboarding_complete"],
     workspaceCommandIds: ["hello"],
     defaultTools: ["read"],
-    extraTools: ["browser_get_state", "onboarding_complete"],
+    extraTools: ["browser_get_state", "holaboss_onboarding_complete"],
     workspaceSkillIds: ["skill-creator", "extra-skill"],
     resolvedMcpToolRefs: [],
   });
@@ -687,10 +733,10 @@ test("renderCapabilityPolicyPromptSection summarizes grouped capabilities", () =
     harnessId: "pi",
     sessionKind: "main_session",
     browserToolsAvailable: false,
-    runtimeToolIds: ["onboarding_complete"],
+    runtimeToolIds: ["holaboss_onboarding_complete"],
     workspaceCommandIds: ["hello"],
     defaultTools: ["read", "edit", "question"],
-    extraTools: ["browser_get_state", "onboarding_complete"],
+    extraTools: ["browser_get_state", "holaboss_onboarding_complete"],
     workspaceSkillIds: ["skill-creator"],
     resolvedMcpToolRefs: [
       {

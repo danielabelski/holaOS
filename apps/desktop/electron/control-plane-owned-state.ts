@@ -87,6 +87,10 @@ export interface LocalIntegrationConnectionRecord {
   account_external_id: string | null
   account_handle: string | null
   account_email: string | null
+  context_cron_auto_fetch_enabled: boolean
+  last_context_fetch_attempted_at: string | null
+  last_context_fetch_completed_at: string | null
+  last_context_fetch_status: string | null
   auth_mode: string
   granted_scopes: string[]
   status: string
@@ -109,6 +113,7 @@ export interface LocalIntegrationConnectionCreatePayload {
   account_external_id?: string | null
   account_handle?: string | null
   account_email?: string | null
+  context_cron_auto_fetch_enabled?: boolean
   status?: string
 }
 
@@ -119,6 +124,10 @@ export interface LocalIntegrationConnectionUpdatePayload {
   granted_scopes?: string[]
   account_handle?: string | null
   account_email?: string | null
+  context_cron_auto_fetch_enabled?: boolean
+  last_context_fetch_attempted_at?: string | null
+  last_context_fetch_completed_at?: string | null
+  last_context_fetch_status?: string | null
 }
 
 export interface LocalIntegrationMergeConnectionsResult {
@@ -152,6 +161,16 @@ export interface LocalOAuthAppConfigUpsertPayload {
   redirect_port?: number
 }
 
+export interface LocalConnectionWorkspaceUsage {
+  connection_id: string
+  workspaces: Array<{
+    workspace_id: string
+    target_type: string
+    target_id: string
+    integration_key: string
+  }>
+}
+
 export interface LocalIntegrationMetadataStore {
   listConnections(params?: {
     providerId?: string
@@ -169,6 +188,9 @@ export interface LocalIntegrationMetadataStore {
     keepConnectionId: string,
     removeConnectionIds: string[],
   ): Promise<LocalIntegrationMergeConnectionsResult>
+  listConnectionWorkspaceUsage(): Promise<{
+    usage: LocalConnectionWorkspaceUsage[]
+  }>
   listOAuthConfigs(): Promise<LocalOAuthAppConfigListResponse>
   upsertOAuthConfig(
     providerId: string,
@@ -296,6 +318,10 @@ function ensureControlPlaneDatabaseSchema(database: Database.Database): void {
       account_external_id TEXT,
       account_handle TEXT,
       account_email TEXT,
+      context_cron_auto_fetch_enabled INTEGER NOT NULL DEFAULT 1,
+      last_context_fetch_attempted_at TEXT,
+      last_context_fetch_completed_at TEXT,
+      last_context_fetch_status TEXT,
       auth_mode TEXT NOT NULL,
       granted_scopes TEXT NOT NULL DEFAULT '[]',
       status TEXT NOT NULL,
@@ -357,6 +383,33 @@ function ensureControlPlaneDatabaseSchema(database: Database.Database): void {
       updated_at TEXT NOT NULL
     );
   `)
+
+  const integrationConnectionColumns = new Set(
+    (database
+      .prepare("PRAGMA table_info(integration_connections)")
+      .all() as Array<{ name: string }>)
+      .map((row) => row.name),
+  )
+  if (!integrationConnectionColumns.has("context_cron_auto_fetch_enabled")) {
+    database.exec(
+      "ALTER TABLE integration_connections ADD COLUMN context_cron_auto_fetch_enabled INTEGER NOT NULL DEFAULT 1",
+    )
+  }
+  if (!integrationConnectionColumns.has("last_context_fetch_attempted_at")) {
+    database.exec(
+      "ALTER TABLE integration_connections ADD COLUMN last_context_fetch_attempted_at TEXT",
+    )
+  }
+  if (!integrationConnectionColumns.has("last_context_fetch_completed_at")) {
+    database.exec(
+      "ALTER TABLE integration_connections ADD COLUMN last_context_fetch_completed_at TEXT",
+    )
+  }
+  if (!integrationConnectionColumns.has("last_context_fetch_status")) {
+    database.exec(
+      "ALTER TABLE integration_connections ADD COLUMN last_context_fetch_status TEXT",
+    )
+  }
 }
 
 function ensureAppCatalogProviderColumns(database: Database.Database): void {
@@ -553,6 +606,22 @@ function mapIntegrationConnectionRow(
     account_handle:
       row.account_handle == null ? null : String(row.account_handle),
     account_email: row.account_email == null ? null : String(row.account_email),
+    context_cron_auto_fetch_enabled:
+      row.context_cron_auto_fetch_enabled === false
+        ? false
+        : Number(row.context_cron_auto_fetch_enabled ?? 1) !== 0,
+    last_context_fetch_attempted_at:
+      row.last_context_fetch_attempted_at == null
+        ? null
+        : String(row.last_context_fetch_attempted_at),
+    last_context_fetch_completed_at:
+      row.last_context_fetch_completed_at == null
+        ? null
+        : String(row.last_context_fetch_completed_at),
+    last_context_fetch_status:
+      row.last_context_fetch_status == null
+        ? null
+        : String(row.last_context_fetch_status),
     auth_mode: String(row.auth_mode ?? ""),
     granted_scopes: parseStoredStringArray(row.granted_scopes),
     status: String(row.status ?? ""),
@@ -746,13 +815,17 @@ export function bootstrapLocalControlPlaneDatabase(
             account_external_id,
             account_handle,
             account_email,
+            context_cron_auto_fetch_enabled,
+            last_context_fetch_attempted_at,
+            last_context_fetch_completed_at,
+            last_context_fetch_status,
             auth_mode,
             granted_scopes,
             status,
             secret_ref,
             created_at,
             updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `)
         for (const row of rows) {
           insert.run(
@@ -763,6 +836,10 @@ export function bootstrapLocalControlPlaneDatabase(
             row.account_external_id ?? null,
             row.account_handle ?? null,
             row.account_email ?? null,
+            row.context_cron_auto_fetch_enabled ?? 1,
+            row.last_context_fetch_attempted_at ?? null,
+            row.last_context_fetch_completed_at ?? null,
+            row.last_context_fetch_status ?? null,
             row.auth_mode,
             row.granted_scopes ?? "[]",
             row.status,
@@ -946,6 +1023,10 @@ function upsertIntegrationConnectionRecord(
     accountExternalId?: string | null
     accountHandle?: string | null
     accountEmail?: string | null
+    contextCronAutoFetchEnabled?: boolean
+    lastContextFetchAttemptedAt?: string | null
+    lastContextFetchCompletedAt?: string | null
+    lastContextFetchStatus?: string | null
     authMode: string
     grantedScopes: string[]
     status: string
@@ -963,13 +1044,17 @@ function upsertIntegrationConnectionRecord(
         account_external_id,
         account_handle,
         account_email,
+        context_cron_auto_fetch_enabled,
+        last_context_fetch_attempted_at,
+        last_context_fetch_completed_at,
+        last_context_fetch_status,
         auth_mode,
         granted_scopes,
         status,
         secret_ref,
         created_at,
         updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(connection_id) DO UPDATE SET
         provider_id = excluded.provider_id,
         owner_user_id = excluded.owner_user_id,
@@ -977,6 +1062,10 @@ function upsertIntegrationConnectionRecord(
         account_external_id = excluded.account_external_id,
         account_handle = excluded.account_handle,
         account_email = excluded.account_email,
+        context_cron_auto_fetch_enabled = excluded.context_cron_auto_fetch_enabled,
+        last_context_fetch_attempted_at = excluded.last_context_fetch_attempted_at,
+        last_context_fetch_completed_at = excluded.last_context_fetch_completed_at,
+        last_context_fetch_status = excluded.last_context_fetch_status,
         auth_mode = excluded.auth_mode,
         granted_scopes = excluded.granted_scopes,
         status = excluded.status,
@@ -991,6 +1080,14 @@ function upsertIntegrationConnectionRecord(
       params.accountExternalId ?? null,
       normalizeIdentityValue(params.accountHandle),
       normalizeIdentityValue(params.accountEmail),
+      params.contextCronAutoFetchEnabled === undefined
+        ? 1
+        : params.contextCronAutoFetchEnabled
+          ? 1
+          : 0,
+      params.lastContextFetchAttemptedAt ?? null,
+      params.lastContextFetchCompletedAt ?? null,
+      params.lastContextFetchStatus ?? null,
       params.authMode,
       JSON.stringify(params.grantedScopes ?? []),
       params.status,
@@ -1316,6 +1413,8 @@ export function createLocalIntegrationMetadataStore(
           accountExternalId: normalizeOptionalString(payload.account_external_id),
           accountHandle: payload.account_handle ?? null,
           accountEmail: payload.account_email ?? null,
+          contextCronAutoFetchEnabled:
+            payload.context_cron_auto_fetch_enabled ?? true,
           authMode,
           grantedScopes: Array.isArray(payload.granted_scopes)
             ? payload.granted_scopes.filter(
@@ -1359,6 +1458,22 @@ export function createLocalIntegrationMetadataStore(
             payload.account_email !== undefined
               ? payload.account_email
               : existing.account_email,
+          contextCronAutoFetchEnabled:
+            payload.context_cron_auto_fetch_enabled !== undefined
+              ? payload.context_cron_auto_fetch_enabled
+              : existing.context_cron_auto_fetch_enabled,
+          lastContextFetchAttemptedAt:
+            payload.last_context_fetch_attempted_at !== undefined
+              ? payload.last_context_fetch_attempted_at
+              : existing.last_context_fetch_attempted_at,
+          lastContextFetchCompletedAt:
+            payload.last_context_fetch_completed_at !== undefined
+              ? payload.last_context_fetch_completed_at
+              : existing.last_context_fetch_completed_at,
+          lastContextFetchStatus:
+            payload.last_context_fetch_status !== undefined
+              ? payload.last_context_fetch_status
+              : existing.last_context_fetch_status,
           authMode: existing.auth_mode,
           grantedScopes: Array.isArray(payload.granted_scopes)
             ? payload.granted_scopes.filter(
@@ -1512,6 +1627,37 @@ export function createLocalIntegrationMetadataStore(
           removed_count: removeRows.length,
           repointed_bindings: repointedBindings,
         }
+      })
+    },
+
+    async listConnectionWorkspaceUsage(): Promise<{
+      usage: LocalConnectionWorkspaceUsage[]
+    }> {
+      return withDatabase((database) => {
+        const rows = database
+          .prepare(
+            `SELECT connection_id, workspace_id, target_type, target_id, integration_key
+               FROM integration_bindings
+               ORDER BY connection_id, workspace_id`,
+          )
+          .all() as Array<Record<string, unknown>>
+        const byConnection = new Map<string, LocalConnectionWorkspaceUsage>()
+        for (const row of rows) {
+          const connectionId = typeof row.connection_id === "string" ? row.connection_id : ""
+          if (!connectionId) continue
+          let entry = byConnection.get(connectionId)
+          if (!entry) {
+            entry = { connection_id: connectionId, workspaces: [] }
+            byConnection.set(connectionId, entry)
+          }
+          entry.workspaces.push({
+            workspace_id: String(row.workspace_id ?? ""),
+            target_type: String(row.target_type ?? ""),
+            target_id: String(row.target_id ?? ""),
+            integration_key: String(row.integration_key ?? ""),
+          })
+        }
+        return { usage: Array.from(byConnection.values()) }
       })
     },
 

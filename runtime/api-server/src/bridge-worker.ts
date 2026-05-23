@@ -2,8 +2,6 @@ import { setTimeout as sleep } from "node:timers/promises";
 
 import type { RuntimeStateStore } from "@holaboss/runtime-state-store";
 
-import { MemoryServiceError, type MemoryServiceLike } from "./memory.js";
-import { captureWorkspaceContext } from "./proactive-context.js";
 import { runtimeConfigHeaders } from "./runtime-config.js";
 import {
   captureRuntimeException,
@@ -264,9 +262,8 @@ function taskProposalPayload(payload: Record<string, unknown>): TaskProposalCrea
 export async function executeBridgeJobNatively(params: {
   job: ProactiveBridgeJob;
   store: RuntimeStateStore;
-  memoryService: MemoryServiceLike;
 }): Promise<ProactiveBridgeJobResult> {
-  const { job, store, memoryService } = params;
+  const { job, store } = params;
   const workspace = store.getWorkspace(job.workspace_id);
   if (!workspace || workspace.deletedAtUtc) {
     return failedJobResult(job, "workspace_not_found", `Workspace '${job.workspace_id}' was not found`);
@@ -288,74 +285,7 @@ export async function executeBridgeJobNatively(params: {
       });
       return succeededJobResult(job, { proposal_id: proposal.proposalId });
     }
-
-    if (job.job_type === "workspace.context.capture") {
-      return succeededJobResult(job, {
-        context: await captureWorkspaceContext({
-          store,
-          memoryService,
-          workspaceId: requiredStringField(job.payload, "workspace_id")
-        })
-      });
-    }
-
-    if (job.job_type === "workspace.memory.status") {
-      return succeededJobResult(job, {
-        status: await memoryService.status({ workspace_id: requiredStringField(job.payload, "workspace_id") })
-      });
-    }
-
-    if (job.job_type === "workspace.memory.search") {
-      return succeededJobResult(
-        job,
-        await memoryService.search({
-          workspace_id: requiredStringField(job.payload, "workspace_id"),
-          query: requiredStringField(job.payload, "query"),
-          max_results: optionalIntegerField(job.payload, "max_results", 6),
-          min_score: optionalNumberField(job.payload, "min_score", 0.0)
-        })
-      );
-    }
-
-    if (job.job_type === "workspace.memory.get") {
-      return succeededJobResult(
-        job,
-        await memoryService.get({
-          workspace_id: requiredStringField(job.payload, "workspace_id"),
-          path: requiredStringField(job.payload, "path"),
-          from_line: job.payload.from_line,
-          lines: job.payload.lines
-        })
-      );
-    }
-
-    if (job.job_type === "workspace.memory.upsert") {
-      return succeededJobResult(
-        job,
-        await memoryService.upsert({
-          workspace_id: requiredStringField(job.payload, "workspace_id"),
-          path: requiredStringField(job.payload, "path"),
-          content: typeof job.payload.content === "string" ? job.payload.content : "",
-          append: optionalBooleanField(job.payload, "append", false)
-        })
-      );
-    }
-
-    if (job.job_type === "workspace.memory.sync" || job.job_type === "workspace.memory.refresh") {
-      const sync = await memoryService.sync({
-        workspace_id: requiredStringField(job.payload, "workspace_id"),
-        reason: optionalStringField(job.payload, "reason") ?? "bridge_sync",
-        force: optionalBooleanField(job.payload, "force", false)
-      });
-      return succeededJobResult(
-        job,
-        job.job_type === "workspace.memory.refresh" ? { sync, alias: "workspace.memory.sync" } : { sync }
-      );
-    }
   } catch (error) {
-    if (error instanceof MemoryServiceError) {
-      return failedJobResult(job, "invalid_payload", error.message);
-    }
     if (error instanceof Error && /is required$/.test(error.message)) {
       return invalidPayloadResult(job, job.job_type);
     }
@@ -374,7 +304,6 @@ export interface RuntimeRemoteBridgeWorkerOptions {
   logger?: LoggerLike;
   executeJob?: (job: ProactiveBridgeJob) => Promise<ProactiveBridgeJobResult>;
   store?: RuntimeStateStore;
-  memoryService?: MemoryServiceLike;
   captureRuntimeException?: typeof captureRuntimeException;
   fetchImpl?: typeof fetch;
   baseUrl?: string;
@@ -474,10 +403,10 @@ export class RuntimeRemoteBridgeWorker implements BridgeWorkerLike {
     this.#logger = options.logger;
     this.#executeJob =
       options.executeJob ??
-      (options.store && options.memoryService
-        ? (job) => executeBridgeJobNatively({ job, store: options.store as RuntimeStateStore, memoryService: options.memoryService as MemoryServiceLike })
+      (options.store
+        ? (job) => executeBridgeJobNatively({ job, store: options.store as RuntimeStateStore })
         : (() => {
-            throw new Error("bridge worker requires executeJob or store+memoryService");
+            throw new Error("bridge worker requires executeJob or store");
           }));
     this.#captureRuntimeException =
       options.captureRuntimeException ?? captureRuntimeException;

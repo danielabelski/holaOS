@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { lstatSync, readdirSync, rmSync } from "node:fs";
+import { lstatSync, readdirSync, rmSync, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -56,8 +56,17 @@ function countFiles(rootPath) {
   return count;
 }
 
-function shouldPruneFile(fileName) {
+function isEmbeddedSkillSupportPath(filePath) {
+  const normalized = filePath.split(path.sep).join("/");
+  return normalized.includes("/embedded-skills/");
+}
+
+function shouldPruneFile(filePath) {
+  const fileName = path.basename(filePath);
   if (fileName === "SKILL.md") {
+    return false;
+  }
+  if (isEmbeddedSkillSupportPath(filePath) && (fileName.endsWith(".md") || fileName.endsWith(".markdown"))) {
     return false;
   }
   return FILE_SUFFIXES_TO_PRUNE.some((suffix) => fileName.endsWith(suffix));
@@ -80,7 +89,7 @@ function pruneCommonRuntimeFiles(rootPath, insideNodeModules = false) {
       continue;
     }
 
-    if (entry.isFile() && shouldPruneFile(entry.name)) {
+    if (entry.isFile() && shouldPruneFile(entryPath)) {
       rmSync(entryPath, { force: true });
     }
   }
@@ -144,6 +153,23 @@ function pruneNodePackageBinaryMirrors(rootPath) {
   }
 }
 
+function pruneDanglingSymlinks(rootPath) {
+  for (const entry of readdirSync(rootPath, { withFileTypes: true })) {
+    const entryPath = path.join(rootPath, entry.name);
+    if (entry.isSymbolicLink()) {
+      try {
+        statSync(entryPath);
+      } catch {
+        rmSync(entryPath, { force: true });
+      }
+      continue;
+    }
+    if (entry.isDirectory()) {
+      pruneDanglingSymlinks(entryPath);
+    }
+  }
+}
+
 function hasAnyNodeExecutable(nodeBinDir) {
   try {
     for (const entry of readdirSync(nodeBinDir, { withFileTypes: true })) {
@@ -171,6 +197,7 @@ export function prunePackagedTree(targetRoot, targetPlatform = "") {
   if (targetPlatform) {
     pruneKoffiBinaries(resolvedRoot, targetPlatform);
   }
+  pruneDanglingSymlinks(resolvedRoot);
   const afterCount = countFiles(resolvedRoot);
   console.error(`pruned packaged tree at ${resolvedRoot} (${beforeCount} -> ${afterCount} files)`);
 }

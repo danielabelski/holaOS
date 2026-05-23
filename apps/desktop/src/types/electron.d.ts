@@ -155,7 +155,64 @@ declare global {
     height: number;
   }
 
-  type UiSettingsPaneSection = "account" | "billing" | "providers" | "integrations" | "submissions" | "settings" | "experimental";
+  type UiSettingsPaneSection = "account" | "billing" | "providers" | "integrations" | "memory" | "submissions" | "settings" | "experimental";
+
+  interface MemoryBrowserTreeNodePayload {
+    name: string;
+    path: string;
+    kind: "directory" | "file";
+    size_bytes: number | null;
+    modified_at: string | null;
+    children?: MemoryBrowserTreeNodePayload[];
+  }
+
+  interface MemoryBrowserTreeResponsePayload {
+    workspace_id: string;
+    root: MemoryBrowserTreeNodePayload;
+    counts: {
+      directories: number;
+      files: number;
+    };
+  }
+
+  interface MemoryBrowserFileResponsePayload {
+    workspace_id: string;
+    path: string;
+    name: string;
+    size_bytes: number;
+    modified_at: string;
+    content: string;
+  }
+
+  type MemoryBrowserGraphForestPayload = "workspace" | "integrations";
+  type MemoryBrowserGraphNodeKindPayload = "root" | "tree" | "entity" | "branch" | "summary" | "leaf";
+
+  interface MemoryBrowserGraphNodePayload {
+    id: string;
+    kind: MemoryBrowserGraphNodeKindPayload;
+    category: "interaction" | "integration";
+    tree_id: string | null;
+    label: string;
+    subtitle: string | null;
+    status: string | null;
+    level: number | null;
+    child_count: number | null;
+    path: string | null;
+  }
+
+  interface MemoryBrowserGraphEdgePayload {
+    from: string;
+    to: string;
+    kind: "contains" | "parent_child" | "reference";
+  }
+
+  interface MemoryBrowserGraphResponsePayload {
+    workspace_id: string;
+    forest: MemoryBrowserGraphForestPayload;
+    focus_tree_id: string | null;
+    nodes: MemoryBrowserGraphNodePayload[];
+    edges: MemoryBrowserGraphEdgePayload[];
+  }
 
   interface BrowserStatePayload {
     id: string;
@@ -473,7 +530,11 @@ interface RuntimeNotificationListOptionsPayload {
     harness: string | null;
     error_message: string | null;
     onboarding_status: string;
+    onboarding_state?: string | null;
     onboarding_session_id: string | null;
+    alignment_question?: Record<string, unknown> | null;
+    alignment_report?: Record<string, unknown> | null;
+    verification_report?: Record<string, unknown> | null;
     onboarding_completed_at: string | null;
     onboarding_completion_summary: string | null;
     onboarding_requested_at: string | null;
@@ -483,6 +544,10 @@ interface RuntimeNotificationListOptionsPayload {
     deleted_at_utc: string | null;
     icon?: string | null;
     icon_color?: string | null;
+    workspace_role?: string | null;
+    source_workspace_id?: string | null;
+    lab_purpose?: string | null;
+    lab_status?: string | null;
     workspace_path?: string | null;
     folder_state?: "healthy" | "missing" | null;
   }
@@ -491,11 +556,34 @@ interface RuntimeNotificationListOptionsPayload {
     workspace: WorkspaceRecordPayload;
   }
 
+  interface WorkspaceLabResponsePayload {
+    lab: WorkspaceRecordPayload | null;
+    source: WorkspaceRecordPayload | null;
+    session: AgentSessionRecordPayload | null;
+    created?: boolean;
+  }
+
   interface WorkspaceListResponsePayload {
     items: WorkspaceRecordPayload[];
     total: number;
     limit: number;
     offset: number;
+  }
+
+  interface WorkspaceOnboardingStatusPayload {
+    workspace_id: string;
+    onboarding_status: string;
+    onboarding_state: string | null;
+    alignment_question: Record<string, unknown> | null;
+    alignment_report: Record<string, unknown> | null;
+    verification_report: Record<string, unknown> | null;
+    onboarding_completed_at: string | null;
+    onboarding_completion_summary: string | null;
+    onboarding_requested_at: string | null;
+    onboarding_requested_by: string | null;
+    lab_workspace_id?: string | null;
+    lab_purpose?: string | null;
+    lab_status?: string | null;
   }
 
   type BrowserImportSource = "chrome" | "chromium" | "arc" | "safari";
@@ -703,58 +791,6 @@ interface RuntimeNotificationListOptionsPayload {
     proposal: TaskProposalRecordPayload;
     session: AgentSessionRecordPayload;
     input: EnqueueSessionInputResponsePayload;
-  }
-
-  type MemoryUpdateProposalKind = "preference" | "identity" | "profile";
-  type MemoryUpdateProposalState = "pending" | "accepted" | "dismissed";
-
-  interface MemoryUpdateProposalRecordPayload {
-    proposal_id: string;
-    workspace_id: string;
-    session_id: string;
-    input_id: string;
-    proposal_kind: MemoryUpdateProposalKind;
-    target_key: string;
-    title: string;
-    summary: string;
-    payload: Record<string, unknown>;
-    evidence: string | null;
-    confidence: number | null;
-    source_message_id: string | null;
-    state: MemoryUpdateProposalState;
-    persisted_memory_id: string | null;
-    created_at: string;
-    updated_at: string;
-    accepted_at: string | null;
-    dismissed_at: string | null;
-  }
-
-  interface MemoryUpdateProposalListRequestPayload {
-    workspaceId: string;
-    sessionId?: string | null;
-    inputId?: string | null;
-    state?: MemoryUpdateProposalState | null;
-    limit?: number;
-    offset?: number;
-  }
-
-  interface MemoryUpdateProposalListResponsePayload {
-    proposals: MemoryUpdateProposalRecordPayload[];
-    count: number;
-  }
-
-  interface MemoryUpdateProposalAcceptPayload {
-    proposalId: string;
-    workspaceId: string;
-    summary?: string | null;
-  }
-
-  interface MemoryUpdateProposalAcceptResponsePayload {
-    proposal: MemoryUpdateProposalRecordPayload;
-  }
-
-  interface MemoryUpdateProposalDismissResponsePayload {
-    proposal: MemoryUpdateProposalRecordPayload;
   }
 
   interface CronjobDeliveryPayload {
@@ -990,6 +1026,13 @@ interface RuntimeNotificationListOptionsPayload {
     session_id: string;
     status: string;
     text: string;
+    updated_at: string;
+  }
+
+  interface CancelQueuedSessionInputResponsePayload {
+    input_id: string;
+    session_id: string;
+    status: string;
     updated_at: string;
   }
 
@@ -1282,6 +1325,8 @@ interface RuntimeNotificationListOptionsPayload {
     template_ref?: string | null;
     template_commit?: string | null;
     template_apps?: string[];
+    workspace_onboarding_mode?: "start" | "skip" | null;
+    workspace_onboarding_engine?: "deterministic" | "agentic" | null;
     workspace_path?: string | null;
   }
 
@@ -1327,6 +1372,12 @@ interface RuntimeNotificationListOptionsPayload {
     session_id: string;
     input_id: string;
     text: string;
+  }
+
+  interface HolabossCancelQueuedSessionInputPayload {
+    workspace_id: string;
+    session_id: string;
+    input_id: string;
   }
 
   interface HolabossSessionStreamHandlePayload {
@@ -1376,6 +1427,10 @@ interface RuntimeNotificationListOptionsPayload {
     account_handle: string | null;
     /** Provider-side email from whoami (e.g. josh@example.com) — used for re-auth dedupe. */
     account_email: string | null;
+    context_cron_auto_fetch_enabled: boolean;
+    last_context_fetch_attempted_at: string | null;
+    last_context_fetch_completed_at: string | null;
+    last_context_fetch_status: string | null;
     auth_mode: string;
     granted_scopes: string[];
     status: string;
@@ -1409,6 +1464,124 @@ interface RuntimeNotificationListOptionsPayload {
     is_default?: boolean;
   }
 
+  interface ConnectionWorkspaceUsageEntry {
+    connection_id: string;
+    workspaces: Array<{
+      workspace_id: string;
+      target_type: string;
+      target_id: string;
+      integration_key: string;
+    }>;
+  }
+
+  interface ConnectionWorkspaceUsagePayload {
+    usage: ConnectionWorkspaceUsageEntry[];
+  }
+
+  interface ComposioToolkitCapability {
+    name: string;
+    description: string;
+    tool_slug: string;
+    read_only: boolean;
+  }
+
+  interface ComposioToolkitCapabilitiesPayload {
+    toolkits: Record<string, ComposioToolkitCapability[]>;
+  }
+
+  interface IntegrationStoreCatalogEntry {
+    slug: string;
+    tier: "hero" | "supported";
+    category: string;
+  }
+
+  interface IntegrationStoreCatalogPayload {
+    entries: IntegrationStoreCatalogEntry[];
+  }
+
+  interface IntegrationContextFetchStatusPayload {
+    connection_id: string;
+    provider_id: string;
+    run_id: string;
+    supported: boolean;
+    status: "running" | "completed" | "failed" | "unsupported";
+    account_key: string | null;
+    account_label: string | null;
+    tree_id: string | null;
+    current_chunk_label: string | null;
+    chunks_total: number;
+    chunks_completed: number;
+    messages_seen: number;
+    messages_persisted: number;
+    leaves_created: number;
+    leaves_superseding: number;
+    leaves_unchanged: number;
+    summary_nodes: number;
+    actions: string[];
+    started_at: string | null;
+    updated_at: string;
+    completed_at: string | null;
+    fetched_at: string | null;
+    error_message: string | null;
+    reason: string | null;
+  }
+
+  interface IntegrationContextFetchStartResponsePayload {
+    ok: true;
+    started: boolean;
+    deduped: boolean;
+    status: IntegrationContextFetchStatusPayload;
+  }
+
+  interface IntegrationContextFetchStatusListResponsePayload {
+    ok: true;
+    statuses: IntegrationContextFetchStatusPayload[];
+  }
+
+  interface AllWorkspaceIntegrationOverridesPayload {
+    overrides: Array<{
+      workspace_id: string;
+      toolkit_slug: string;
+      state: "disabled" | "pinned";
+      pinned_connection_id: string | null;
+      created_at: string;
+      updated_at: string;
+    }>;
+  }
+
+  interface WorkspaceIntegrationConnectionPayload {
+    connected_account_id: string;
+    status: string;
+    user_id: string;
+    created_at: string;
+  }
+
+  interface WorkspaceIntegrationPayload {
+    toolkit_slug: string;
+    toolkit_name: string;
+    toolkit_logo: string | null;
+    supported: boolean;
+    tier: "hero" | "auto";
+    effective_state: "auto" | "disabled" | "pinned";
+    effective_connection_id: string | null;
+    pinned_connection_id: string | null;
+    connections: WorkspaceIntegrationConnectionPayload[];
+  }
+
+  interface WorkspaceIntegrationsListResponsePayload {
+    workspace_id: string;
+    integrations: WorkspaceIntegrationPayload[];
+  }
+
+  interface WorkspaceIntegrationOverridePayload {
+    workspace_id: string;
+    toolkit_slug: string;
+    state: "disabled" | "pinned";
+    pinned_connection_id: string | null;
+    created_at: string;
+    updated_at: string;
+  }
+
   interface IntegrationCreateConnectionPayload {
     provider_id: string;
     owner_user_id: string;
@@ -1425,6 +1598,10 @@ interface RuntimeNotificationListOptionsPayload {
     /** Backfill provider-side identity. `null` clears, omit to leave alone. */
     account_handle?: string | null;
     account_email?: string | null;
+    context_cron_auto_fetch_enabled?: boolean;
+    last_context_fetch_attempted_at?: string | null;
+    last_context_fetch_completed_at?: string | null;
+    last_context_fetch_status?: string | null;
   }
 
   interface IntegrationMergeConnectionsResult {
@@ -1765,6 +1942,10 @@ interface RuntimeNotificationListOptionsPayload {
       listSkills: (workspaceId: string) => Promise<WorkspaceSkillListResponsePayload>;
       getWorkspaceRoot: (workspaceId: string) => Promise<string>;
       createWorkspace: (payload: HolabossCreateWorkspacePayload) => Promise<WorkspaceResponsePayload>;
+      createWorkspaceLab: (
+        workspaceId: string,
+        purpose: "workspace_onboarding" | "meeting_mode",
+      ) => Promise<WorkspaceLabResponsePayload>;
       deleteWorkspace: (workspaceId: string, keepFiles?: boolean) => Promise<WorkspaceResponsePayload>;
       updateAppearance: (
         workspaceId: string,
@@ -1793,13 +1974,6 @@ interface RuntimeNotificationListOptionsPayload {
         payload: ArchiveBackgroundTaskPayload
       ) => Promise<ArchiveBackgroundTaskResponsePayload>;
       acceptTaskProposal: (payload: TaskProposalAcceptPayload) => Promise<TaskProposalAcceptResponsePayload>;
-      listMemoryUpdateProposals: (
-        payload: MemoryUpdateProposalListRequestPayload
-      ) => Promise<MemoryUpdateProposalListResponsePayload>;
-      acceptMemoryUpdateProposal: (
-        payload: MemoryUpdateProposalAcceptPayload
-      ) => Promise<MemoryUpdateProposalAcceptResponsePayload>;
-      dismissMemoryUpdateProposal: (workspaceId: string, proposalId: string) => Promise<MemoryUpdateProposalDismissResponsePayload>;
       updateTaskProposalState: (
         workspaceId: string,
         proposalId: string,
@@ -1818,10 +1992,43 @@ interface RuntimeNotificationListOptionsPayload {
         payload: StageSessionAttachmentPathsPayload
       ) => Promise<StageSessionAttachmentsResponsePayload>;
       queueSessionInput: (payload: HolabossQueueSessionInputPayload) => Promise<EnqueueSessionInputResponsePayload>;
+      getOnboardingStatus: (workspaceId: string) => Promise<WorkspaceOnboardingStatusPayload>;
+      continueDeterministicOnboarding: (
+        workspaceId: string
+      ) => Promise<WorkspaceResponsePayload>;
+      skipWorkspaceOnboarding: (
+        workspaceId: string
+      ) => Promise<WorkspaceResponsePayload>;
+      answerOnboardingAlignmentQuestion: (
+        workspaceId: string,
+        payload: {
+          model?: string | null;
+          thinkingValue?: string | null;
+          optionId?: string | null;
+          responseText?: string | null;
+          notes?: string | null;
+          answers?: Array<{
+            questionId?: string | null;
+            optionId?: string | null;
+            responseText?: string | null;
+            notes?: string | null;
+          }>;
+        }
+      ) => Promise<WorkspaceOnboardingStatusPayload>;
+      approveOnboardingAlignment: (workspaceId: string) => Promise<WorkspaceOnboardingStatusPayload>;
+      requestOnboardingAlignmentRevision: (workspaceId: string) => Promise<WorkspaceOnboardingStatusPayload>;
+      requestOnboardingVerificationRevision: (workspaceId: string) => Promise<WorkspaceOnboardingStatusPayload>;
+      completeOnboarding: (
+        workspaceId: string,
+        payload: { summary: string; requestedBy?: string | null }
+      ) => Promise<WorkspaceOnboardingStatusPayload | WorkspaceLabResponsePayload>;
       pauseSessionRun: (payload: HolabossPauseSessionRunPayload) => Promise<PauseSessionRunResponsePayload>;
       updateQueuedSessionInput: (
         payload: HolabossUpdateQueuedSessionInputPayload
       ) => Promise<UpdateQueuedSessionInputResponsePayload>;
+      cancelQueuedSessionInput: (
+        payload: HolabossCancelQueuedSessionInputPayload
+      ) => Promise<CancelQueuedSessionInputResponsePayload>;
       openSessionOutputStream: (payload: HolabossStreamSessionOutputsPayload) => Promise<HolabossSessionStreamHandlePayload>;
       closeSessionOutputStream: (streamId: string, reason?: string) => Promise<void>;
       getSessionStreamDebug: () => Promise<HolabossSessionStreamDebugEntry[]>;
@@ -1838,12 +2045,51 @@ interface RuntimeNotificationListOptionsPayload {
         removeConnectionIds: string[]
       ) => Promise<IntegrationMergeConnectionsResult>;
       deleteIntegrationBinding: (bindingId: string, workspaceId: string) => Promise<{ deleted: boolean }>;
+      listConnectionWorkspaceUsage: () => Promise<ConnectionWorkspaceUsagePayload>;
+      listComposioToolkitCapabilities: () => Promise<ComposioToolkitCapabilitiesPayload>;
+      listIntegrationStoreCatalog: () => Promise<IntegrationStoreCatalogPayload>;
+      listAllWorkspaceIntegrationOverrides: () => Promise<AllWorkspaceIntegrationOverridesPayload>;
+      listWorkspaceIntegrations: (workspaceId: string) => Promise<WorkspaceIntegrationsListResponsePayload>;
+      listMemoryBrowserTree: (workspaceId: string) => Promise<MemoryBrowserTreeResponsePayload>;
+      readMemoryBrowserFile: (
+        workspaceId: string,
+        targetPath: string
+      ) => Promise<MemoryBrowserFileResponsePayload>;
+      listMemoryBrowserGraph: (
+        workspaceId: string,
+        params: { forest: MemoryBrowserGraphForestPayload; treeId?: string | null }
+      ) => Promise<MemoryBrowserGraphResponsePayload>;
+      setWorkspaceIntegrationOverride: (
+        workspaceId: string,
+        toolkitSlug: string,
+        payload: { state: "disabled" | "pinned"; pinned_connection_id?: string | null }
+      ) => Promise<WorkspaceIntegrationOverridePayload>;
+      clearWorkspaceIntegrationOverride: (
+        workspaceId: string,
+        toolkitSlug: string
+      ) => Promise<{ deleted: boolean }>;
       listOAuthConfigs: () => Promise<OAuthAppConfigListResponsePayload>;
       upsertOAuthConfig: (providerId: string, payload: OAuthAppConfigUpsertPayload) => Promise<OAuthAppConfigPayload>;
       deleteOAuthConfig: (providerId: string) => Promise<{ deleted: boolean }>;
       startOAuthFlow: (provider: string) => Promise<OAuthAuthorizeResponsePayload>;
       composioListToolkits: () => Promise<{ toolkits: Array<{ slug: string; name: string; description: string; logo: string | null; auth_schemes: string[]; categories: string[] }> }>;
       composioListConnections: () => Promise<{ connections: Array<{ id: string; toolkitSlug: string; toolkitName: string; toolkitLogo: string | null; userId: string; createdAt: string }> }>;
+      composioExecute: (params: {
+        providerSlug: string;
+        toolSlug: string;
+        arguments?: Record<string, unknown>;
+      }) => Promise<unknown>;
+      debugComposioRuntimeTest: (params?: {
+        providerSlug?: string;
+        toolSlug?: string;
+        arguments?: Record<string, unknown>;
+      }) => Promise<unknown>;
+      fetchIntegrationContext: (
+        connectionId: string
+      ) => Promise<IntegrationContextFetchStartResponsePayload>;
+      listIntegrationContextFetchStatuses: (
+        connectionIds?: string[]
+      ) => Promise<IntegrationContextFetchStatusListResponsePayload>;
       restartApp: (workspaceId: string, appId: string) => Promise<{
         workspace_id: string;
         app_id: string;
@@ -1877,6 +2123,11 @@ interface RuntimeNotificationListOptionsPayload {
         changed: boolean;
         reason?: "no_external_id" | "account_missing" | "no_new_identity";
       }>;
+      composioDeleteUpstream: (connectedAccountId: string) => Promise<{
+        deleted: boolean;
+        missing: boolean;
+      }>;
+      composioMcpEnsureRunning: (workspaceId: string) => Promise<unknown>;
       resolveTemplateIntegrations: (payload: HolabossCreateWorkspacePayload) => Promise<ResolveTemplateIntegrationsResult>;
       generateTemplateContent(params: {
         contentType: "onboarding" | "readme";

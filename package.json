@@ -1,27 +1,7 @@
 {
   "name": "hola-boss-oss",
-  "private": true,
   "packageManager": "bun@1.3.6",
-  "workspaces": [
-    "apps/desktop",
-    "runtime/api-server",
-    "runtime/harness-host",
-    "runtime/harnesses",
-    "runtime/state-store",
-    "sdk/app-builder-sdk",
-    "sdk/app-sdk",
-    "sdk/editor",
-    "sdk/runtime-client",
-    "website/docs"
-  ],
-  "trustedDependencies": [
-    "@electron/rebuild",
-    "@parcel/watcher",
-    "better-sqlite3",
-    "electron",
-    "electron-builder",
-    "esbuild"
-  ],
+  "private": true,
   "scripts": {
     "clean": "node scripts/remove-paths.mjs out apps/desktop/build runtime/out",
     "dev": "bun run desktop:dev",
@@ -43,6 +23,8 @@
     "desktop:prepare-runtime:local": "bun --filter=holaboss-local run prepare:runtime:local",
     "desktop:dist:mac:local": "bun --filter=holaboss-local run dist:mac:local",
     "desktop:dist:win:local": "bun --filter=holaboss-local run dist:win:local",
+    "memory:cleanup": "node scripts/memory-cleanup.mjs",
+    "memory:eval": "node scripts/memory-eval.mjs",
     "runtime:start:isolated": "node scripts/runtime-start-isolated.mjs",
     "runtime:start:evals": "node scripts/runtime-start-isolated.mjs --namespace evals --default-name memory-evals",
     "runtime:harnesses:install": "bun install",
@@ -65,5 +47,26 @@
     "sdk:app-sdk:test": "bun --filter=@holaboss/app-sdk run test",
     "sdk:app-sdk:typecheck": "bun --filter=@holaboss/app-sdk run typecheck",
     "sdk:app-sdk:codegen": "bun --filter=@holaboss/app-sdk run codegen"
-  }
+  },
+  "trustedDependencies": [
+    "@electron/rebuild",
+    "@parcel/watcher",
+    "better-sqlite3",
+    "electron",
+    "electron-builder",
+    "esbuild"
+  ],
+  "workspaces": [
+    "apps/desktop",
+    "runtime/api-server",
+    "runtime/harness-host",
+    "runtime/harnesses",
+    "runtime/state-store",
+    "sdk/app-builder-sdk",
+    "sdk/app-sdk",
+    "sdk/editor",
+    "sdk/runtime-client",
+    "sdk/ui",
+    "website/docs"
+  ]
 }

@@ -24,6 +24,7 @@ import { AuthPanel } from "@/components/auth/AuthPanel";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { BillingSettingsPanel } from "@/components/billing/BillingSettingsPanel";
 import { IntegrationsPane } from "@/components/panes/IntegrationsPane";
+import { MemoryPane } from "@/components/panes/MemoryPane";
 import {
   SettingsCard,
   SettingsMenuSelectRow,
@@ -57,6 +58,11 @@ import {
 } from "@/components/ui/tooltip";
 import { WorkspaceIcon } from "@/components/ui/workspace-icon";
 import { useIsDarkTheme } from "@/lib/themeAttr";
+import {
+  loadWorkspaceOnboardingPreference,
+  persistWorkspaceOnboardingPreference,
+  type WorkspaceOnboardingPreference,
+} from "@/features/workspace-onboarding/preferences";
 import { useWorkspaceDesktop } from "@/lib/workspaceDesktop";
 
 import type {
@@ -118,6 +124,7 @@ const SETTINGS_NAV: ReadonlyArray<SettingsScreenNavEntry<UiSettingsPaneSection>>
   { id: "billing", label: "Billing", icon: CreditCard },
   { id: "providers", label: "Providers", icon: Waypoints },
   { id: "integrations", label: "Integrations", icon: Plug },
+  { id: "memory", label: "Memory", icon: FolderOpen },
   { id: "submissions", label: "Submissions", icon: Send },
   { id: "experimental", label: "Experimental", icon: FlaskConical },
 ];
@@ -153,6 +160,8 @@ function pageTitle(section: UiSettingsPaneSection): string {
       return "Providers";
     case "integrations":
       return "Integrations";
+    case "memory":
+      return "Memory";
     case "submissions":
       return "Submissions";
     case "experimental":
@@ -173,7 +182,9 @@ function pageDescription(section: UiSettingsPaneSection): string | undefined {
     case "providers":
       return "Default models, providers, and per-workspace overrides.";
     case "integrations":
-      return "Manage connections to third-party services your apps depend on.";
+      return "Your toolkit pool. Connect once, use across workspaces.";
+    case "memory":
+      return "Browse the current workspace memory filesystem.";
     case "submissions":
       return "Review templates and apps you've submitted for marketplace listing.";
     case "experimental":
@@ -541,6 +552,8 @@ export function SettingsScreenRoot({
           <IntegrationsPane embedded />
         ) : null}
 
+        {activeSection === "memory" ? <MemoryPane embedded /> : null}
+
         {activeSection === "submissions" ? (
           <SubmissionsPanel initialFocusedId={submissionsFocusId} />
         ) : null}
@@ -894,6 +907,10 @@ function ExperimentalPanel() {
       return false;
     }
   });
+  const [workspaceOnboardingPreference, setWorkspaceOnboardingPreference] =
+    useState<WorkspaceOnboardingPreference>(
+      loadWorkspaceOnboardingPreference,
+    );
   const [confirmEnableOpen, setConfirmEnableOpen] = useState(false);
 
   const apply = (next: boolean) => {
@@ -924,6 +941,29 @@ function ExperimentalPanel() {
               apply(false);
             }
           }}
+        />
+        <SettingsMenuSelectRow
+          label="Workspace onboarding mode"
+          description="Controls what Start onboarding uses for new empty workspaces. Deterministic is the default release path; agentic stays opt-in while under construction."
+          value={workspaceOnboardingPreference}
+          onValueChange={(value) => {
+            const nextValue =
+              value === "agentic" ? "agentic" : "deterministic";
+            persistWorkspaceOnboardingPreference(nextValue);
+            setWorkspaceOnboardingPreference(nextValue);
+          }}
+          options={[
+            {
+              value: "deterministic",
+              label: "Deterministic",
+              description: "Centered intro card with a lightweight continue flow.",
+            },
+            {
+              value: "agentic",
+              label: "Agentic",
+              description: "Lab-backed conversational onboarding still under active construction.",
+            },
+          ]}
         />
       </SettingsCard>
       <ConfirmDialog

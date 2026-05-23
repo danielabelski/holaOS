@@ -3,6 +3,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import {
   type MainSessionEventQueueRecord,
   type RuntimeStateStore,
+  type WorkspaceRecord,
   utcNowIso,
 } from "@holaboss/runtime-state-store";
 
@@ -129,8 +130,12 @@ function buildMainSessionEventBatchInstruction(
       "This message is a supplemental continuation only, not a fresh answer to the user's last conversational question.",
       "Do not repeat, paraphrase, or re-answer any direct reply the main session already gave. Only add the newly completed background results.",
       "These events are background updates. Keep the reply concise and natural.",
-      "If completed work established clearly stable or recurring verified workspace knowledge that future runs should reuse, record it in `AGENTS.md` with `update_workspace_instructions` before replying.",
-      "Do not persist one-off deliverables, unresolved hypotheses, partial investigations, or temporary runtime state.",
+      "If completed work established clearly stable workspace-wide defaults that future runs should obey by default, record them in `AGENTS.md` with `update_workspace_instructions` before replying.",
+      "Before writing to `AGENTS.md`, ask whether the agent should obey the information by default on most future runs in this workspace even when the current subject is not in scope.",
+      "Use `AGENTS.md` for rules, defaults, conventions, and recurring commands that should shape behavior by default, not as a general fact store for subject-specific knowledge.",
+      "Do not record named-subject knowledge in `AGENTS.md` unless it is explicitly intended to become a workspace-wide default instruction. This includes customer, project, vendor, person, system, or workflow-specific facts such as contacts, owners, thresholds, URLs, channels, prior outcomes, and subject-specific procedures.",
+      "A statement being durable or phrased as `remember this` does not by itself make it an `AGENTS.md` item; if it is mainly contextual knowledge to recall later, keep it in memory instead.",
+      "Do not persist one-off deliverables, unresolved hypotheses, partial investigations, or temporary runtime state. When in doubt, prefer memory or transient context over `AGENTS.md`.",
       "If an event comes from an automation or cronjob, treat it like a specific automation update rather than a generic status bulletin.",
       "Use the event title, goal, context, and deliverables to explain what ran and what changed in concrete terms.",
       "If an automation update is marked as the first run, you may mention that naturally when it helps orient the user.",
@@ -184,6 +189,20 @@ function materializableBatchForOwner(
   return events.filter((event) => event.deliveryBucket === "background_update");
 }
 
+function eventQueueWorkspaces(store: RuntimeStateStore): WorkspaceRecord[] {
+  const workspaces = new Map<string, WorkspaceRecord>();
+  for (const workspace of store.listWorkspaces()) {
+    workspaces.set(workspace.id, workspace);
+    for (const lab of store.listWorkspaceLabs({
+      sourceWorkspaceId: workspace.id,
+      activeOnly: true,
+    })) {
+      workspaces.set(lab.id, lab);
+    }
+  }
+  return [...workspaces.values()];
+}
+
 export class RuntimeMainSessionEventWorker
   implements MainSessionEventWorkerLike
 {
@@ -231,7 +250,7 @@ export class RuntimeMainSessionEventWorker
     const now = utcNowIso();
     let materialized = 0;
 
-    for (const workspace of this.#store.listWorkspaces()) {
+    for (const workspace of eventQueueWorkspaces(this.#store)) {
       this.#store.recoverFailedMaterializedMainSessionEvents({
         workspaceId: workspace.id,
         nowIso: now,

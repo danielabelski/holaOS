@@ -9,6 +9,10 @@ import { RuntimeStateStore } from "@holaboss/runtime-state-store";
 import { processClaimedInput } from "./claimed-input-executor.js";
 import { FilesystemMemoryService } from "./memory.js";
 import {
+  globalMemoryDirForWorkspaceRoot,
+  workspaceMemoryDir,
+} from "./workspace-bundle-paths.js";
+import {
   LEGACY_DURABLE_MEMORY_WRITEBACK_JOB_TYPE,
   EVOLVE_JOB_TYPE,
   createEvolveTaskProposal,
@@ -19,10 +23,25 @@ import { persistSkillCandidate, reviewTurnForSkillCandidate } from "./evolve-ski
 import { RuntimeEvolveWorker } from "./evolve-worker.js";
 
 const tempDirs: string[] = [];
+const ORIGINAL_ENV = {
+  HB_SANDBOX_ROOT: process.env.HB_SANDBOX_ROOT,
+  HOLABOSS_RUNTIME_CONFIG_PATH: process.env.HOLABOSS_RUNTIME_CONFIG_PATH,
+};
 
 afterEach(() => {
   for (const dir of tempDirs.splice(0)) {
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+  if (ORIGINAL_ENV.HB_SANDBOX_ROOT === undefined) {
+    delete process.env.HB_SANDBOX_ROOT;
+  } else {
+    process.env.HB_SANDBOX_ROOT = ORIGINAL_ENV.HB_SANDBOX_ROOT;
+  }
+  if (ORIGINAL_ENV.HOLABOSS_RUNTIME_CONFIG_PATH === undefined) {
+    delete process.env.HOLABOSS_RUNTIME_CONFIG_PATH;
+  } else {
+    process.env.HOLABOSS_RUNTIME_CONFIG_PATH =
+      ORIGINAL_ENV.HOLABOSS_RUNTIME_CONFIG_PATH;
   }
 });
 
@@ -35,10 +54,12 @@ function makeTempDir(prefix: string): string {
 function makeRuntimeState(prefix: string): {
   store: RuntimeStateStore;
   memoryService: FilesystemMemoryService;
+  workspaceRoot: string;
 } {
   const root = makeTempDir(prefix);
   const workspaceRoot = path.join(root, "workspace");
   return {
+    workspaceRoot,
     store: new RuntimeStateStore({
       dbPath: path.join(root, "runtime.db"),
       workspaceRoot,
@@ -47,12 +68,164 @@ function makeRuntimeState(prefix: string): {
   };
 }
 
+function listMarkdownFiles(root: string): string[] {
+  if (!fs.existsSync(root)) {
+    return [];
+  }
+  const stat = fs.statSync(root);
+  if (stat.isFile() && path.extname(root).toLowerCase() === ".md") {
+    return [root];
+  }
+  if (!stat.isDirectory()) {
+    return [];
+  }
+  const files: string[] = [];
+  const stack = [root];
+  while (stack.length > 0) {
+    const current = stack.pop() as string;
+    const entries = fs.readdirSync(current, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of entries) {
+      const fullPath = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(fullPath);
+      } else if (entry.isFile() && path.extname(entry.name).toLowerCase() === ".md") {
+        files.push(fullPath);
+      }
+    }
+  }
+  return files.sort();
+}
+
+function snapshotMemoryFiles(workspaceRoot: string, workspaceId: string): Record<string, string> {
+  const workspaceDir = path.join(workspaceRoot, workspaceId);
+  const workspaceRootDir = workspaceMemoryDir(workspaceDir);
+  const globalRootDir = globalMemoryDirForWorkspaceRoot(workspaceRoot);
+  const files: Record<string, string> = {};
+
+  for (const filePath of listMarkdownFiles(workspaceRootDir)) {
+    const relativePath = path.relative(workspaceRootDir, filePath).split(path.sep).join("/");
+    files[`workspace/${workspaceId}/${relativePath}`] = fs.readFileSync(filePath, "utf8");
+  }
+
+  const rootIndexPath = path.join(globalRootDir, "MEMORY.md");
+  if (fs.existsSync(rootIndexPath) && fs.statSync(rootIndexPath).isFile()) {
+    files["MEMORY.md"] = fs.readFileSync(rootIndexPath, "utf8");
+  }
+  if (fs.existsSync(globalRootDir) && fs.statSync(globalRootDir).isDirectory()) {
+    for (const entry of fs.readdirSync(globalRootDir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      if (!entry.isDirectory() || entry.name === "workspace") {
+        continue;
+      }
+      for (const filePath of listMarkdownFiles(path.join(globalRootDir, entry.name))) {
+        const relativePath = path.relative(globalRootDir, filePath).split(path.sep).join("/");
+        files[relativePath] = fs.readFileSync(filePath, "utf8");
+      }
+    }
+  }
+
+  return files;
+}
+
+function listActiveInteractionLeaves(store: RuntimeStateStore, workspaceId: string) {
+  return store.listInteractionLeaves({
+    workspaceId,
+    status: "active",
+    limit: 10_000,
+    offset: 0,
+  });
+}
+
+function listActiveInteractionSummaries(store: RuntimeStateStore, workspaceId: string) {
+  return store.listInteractionSummaryNodes({
+    workspaceId,
+    status: "active",
+    limit: 10_000,
+    offset: 0,
+  });
+}
+
 function seedWorkspace(store: RuntimeStateStore): void {
   store.createWorkspace({
     workspaceId: "workspace-1",
     name: "Workspace 1",
     harness: "pi",
     status: "active",
+  });
+}
+
+function writeRuntimeConfig(root: string, document: Record<string, unknown>): void {
+  const configPath = path.join(root, "state", "runtime-config.json");
+  fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  fs.writeFileSync(
+    configPath,
+    `${JSON.stringify(document, null, 2)}\n`,
+    "utf8",
+  );
+  process.env.HB_SANDBOX_ROOT = root;
+  process.env.HOLABOSS_RUNTIME_CONFIG_PATH = configPath;
+}
+
+function configureBackgroundTaskModel(root: string): void {
+  writeRuntimeConfig(root, {
+    runtime: {
+      background_tasks: {
+        provider: "openai_direct",
+        model: "gpt-5.4",
+      },
+    },
+    providers: {
+      openai_direct: {
+        kind: "openai_compatible",
+        base_url: "https://api.openai.com/v1",
+        api_key: "sk-openai-test",
+      },
+    },
+  });
+}
+
+const PROJECT_FALCON_MEMORY_RESPONSE = {
+  memories: [
+    {
+      scope: "workspace",
+      memory_type: "procedure",
+      subject_key: "project-falcon:release-workflow",
+      title: "Project Falcon release workflow",
+      summary:
+        "Project Falcon releases require test, build, and publish in that order.",
+      tags: ["project-falcon", "release"],
+      evidence:
+        "Project Falcon release procedure: 1. Run npm run test. 2. Run npm run build. 3. Publish the bundle.",
+      confidence: 0.96,
+    },
+  ],
+};
+
+function seedCompletedTurn(params: {
+  store: RuntimeStateStore;
+  inputId: string;
+  messageId: string;
+  messageText: string;
+  assistantText: string;
+  startedAt: string;
+  completedAt: string;
+}): void {
+  params.store.insertSessionMessage({
+    workspaceId: "workspace-1",
+    sessionId: "session-main",
+    role: "user",
+    text: params.messageText,
+    messageId: params.messageId,
+    createdAt: params.startedAt,
+  });
+  params.store.upsertTurnResult({
+    workspaceId: "workspace-1",
+    sessionId: "session-main",
+    inputId: params.inputId,
+    startedAt: params.startedAt,
+    completedAt: params.completedAt,
+    status: "completed",
+    stopReason: "ok",
+    assistantText: params.assistantText,
   });
 }
 
@@ -82,60 +255,75 @@ async function withMockedFetch<T>(fn: () => Promise<T>, responsePayload: Record<
 }
 
 test("queued evolve memory writeback persists durable memories and refreshes indexes", async () => {
-  const { store, memoryService } = makeRuntimeState("hb-evolve-memory-");
+  const { store, memoryService, workspaceRoot } = makeRuntimeState("hb-evolve-memory-");
   seedWorkspace(store);
-  store.insertSessionMessage({
-    workspaceId: "workspace-1",
-    sessionId: "session-main",
-    role: "user",
-    text: [
-      "Please keep your responses concise.",
-      "",
-      "For verification, use `npm run test`.",
-      "",
-      "Release procedure:",
+  configureBackgroundTaskModel(path.dirname(workspaceRoot));
+  seedCompletedTurn({
+    store,
+    inputId: "input-1",
+    messageId: "user-1",
+    messageText: "Seed turn 1.",
+    assistantText: "Completed seed turn 1.",
+    startedAt: "2026-04-02T12:00:00.000Z",
+    completedAt: "2026-04-02T12:00:05.000Z",
+  });
+  seedCompletedTurn({
+    store,
+    inputId: "input-2",
+    messageId: "user-2",
+    messageText: "Seed turn 2.",
+    assistantText: "Completed seed turn 2.",
+    startedAt: "2026-04-02T12:01:00.000Z",
+    completedAt: "2026-04-02T12:01:05.000Z",
+  });
+  seedCompletedTurn({
+    store,
+    inputId: "input-3",
+    messageId: "user-3",
+    messageText: [
+      "Project Falcon release procedure:",
       "1. Run `npm run test`.",
       "2. Run `npm run build`.",
       "3. Publish the bundle.",
     ].join("\n"),
-    messageId: "user-1",
-    createdAt: "2026-04-02T12:00:00.000Z",
+    assistantText: "Captured the Project Falcon release workflow.",
+    startedAt: "2026-04-02T12:02:00.000Z",
+    completedAt: "2026-04-02T12:02:05.000Z",
   });
-
-  const turnResult = store.upsertTurnResult({
+  const turnResult = store.getTurnResult({
     workspaceId: "workspace-1",
-    sessionId: "session-main",
-    inputId: "input-1",
-    startedAt: "2026-04-02T12:00:00.000Z",
-    completedAt: "2026-04-02T12:00:05.000Z",
-    status: "completed",
-    stopReason: "ok",
-    assistantText: "Captured workspace-specific instructions for future runs.",
+    inputId: "input-3",
   });
+  assert.ok(turnResult);
 
   const queued = enqueueEvolveJob({
     store,
     workspaceId: turnResult.workspaceId,
     sessionId: turnResult.sessionId,
     inputId: turnResult.inputId,
-    instruction: "Remember the durable workspace rules from this turn.",
+    instruction: "Remember the durable Project Falcon workflow from this turn batch.",
   });
 
-  await processEvolveJob({
-    store,
-    record: queued,
-    memoryService,
-  });
+  await withMockedFetch(
+    () =>
+      processEvolveJob({
+        store,
+        record: queued,
+        memoryService,
+      }),
+    PROJECT_FALCON_MEMORY_RESPONSE,
+  );
 
-  const captured = await memoryService.capture({ workspace_id: "workspace-1" });
-  const files = captured.files as Record<string, string>;
+  const files = snapshotMemoryFiles(workspaceRoot, "workspace-1");
+  const leaves = listActiveInteractionLeaves(store, "workspace-1");
 
-  assert.ok(files["workspace/workspace-1/knowledge/facts/verification-command.md"]);
-  assert.ok(files["workspace/workspace-1/knowledge/procedures/release-procedure.md"]);
-  assert.match(files["workspace/workspace-1/MEMORY.md"], /Verification command/);
-  assert.match(files["workspace/workspace-1/MEMORY.md"], /Release procedure/);
-  assert.ok(files["workspace/workspace-1/knowledge/facts/verification-command.md"]);
-  assert.ok(files["workspace/workspace-1/MEMORY.md"]);
+  assert.equal(leaves.length, 1);
+  const releaseLeaf = leaves.find(
+    (leaf) => leaf.title === "Project Falcon release workflow",
+  );
+  assert.ok(releaseLeaf);
+  assert.match(files[releaseLeaf.path], /Project Falcon release workflow/);
+  assert.equal(listActiveInteractionSummaries(store, "workspace-1").length, 0);
 
   store.close();
 });
@@ -336,7 +524,7 @@ test("skill review can target an existing workspace skill as a patch candidate",
 });
 
 test("persistSkillCandidate writes the draft artifact and dedupes active candidates", async () => {
-  const { store, memoryService } = makeRuntimeState("hb-evolve-skill-persist-");
+  const { store, memoryService, workspaceRoot } = makeRuntimeState("hb-evolve-skill-persist-");
   seedWorkspace(store);
   const turnResult = store.upsertTurnResult({
     workspaceId: "workspace-1",
@@ -393,8 +581,7 @@ test("persistSkillCandidate writes the draft artifact and dedupes active candida
     },
   });
 
-  const captured = await memoryService.capture({ workspace_id: "workspace-1" });
-  const files = captured.files as Record<string, string>;
+  const files = snapshotMemoryFiles(workspaceRoot, "workspace-1");
   assert.equal(candidate.kind, "skill_create");
   assert.equal(candidate.status, "draft");
   assert.equal(persistedAgain.candidateId, candidate.candidateId);
@@ -692,18 +879,33 @@ test("processClaimedInput promotes misplaced evolve workspace skill files into t
 });
 
 test("sample completed turn queues durable memory work until the evolve worker runs", async () => {
-  const { store, memoryService } = makeRuntimeState("hb-evolve-e2e-");
+  const { store, memoryService, workspaceRoot } = makeRuntimeState("hb-evolve-e2e-");
   seedWorkspace(store);
+  configureBackgroundTaskModel(path.dirname(workspaceRoot));
+  seedCompletedTurn({
+    store,
+    inputId: "seed-input-1",
+    messageId: "seed-user-1",
+    messageText: "Seed turn 1.",
+    assistantText: "Completed seed turn 1.",
+    startedAt: "2026-04-02T12:00:00.000Z",
+    completedAt: "2026-04-02T12:00:05.000Z",
+  });
+  seedCompletedTurn({
+    store,
+    inputId: "seed-input-2",
+    messageId: "seed-user-2",
+    messageText: "Seed turn 2.",
+    assistantText: "Completed seed turn 2.",
+    startedAt: "2026-04-02T12:01:00.000Z",
+    completedAt: "2026-04-02T12:01:05.000Z",
+  });
   const queued = store.enqueueInput({
     workspaceId: "workspace-1",
     sessionId: "session-main",
     payload: {
       text: [
-        "Please keep your responses concise.",
-        "",
-        "For verification, use `npm run test`.",
-        "",
-        "Release procedure:",
+        "Project Falcon release procedure:",
         "1. Run `npm run test`.",
         "2. Run `npm run build`.",
         "3. Publish the bundle.",
@@ -746,7 +948,7 @@ test("sample completed turn queues durable memory work until the evolve worker r
         input_id: payload.input_id,
         sequence: 2,
         event_type: "output_delta",
-        payload: { delta: "Captured workspace-specific instructions for future runs." },
+        payload: { delta: "Captured the Project Falcon release workflow." },
       });
       await options.onEvent?.({
         session_id: payload.session_id,
@@ -765,8 +967,7 @@ test("sample completed turn queues durable memory work until the evolve worker r
     },
   });
 
-  const immediateCapture = await memoryService.capture({ workspace_id: "workspace-1" });
-  const immediateFiles = immediateCapture.files as Record<string, string>;
+  const immediateFiles = snapshotMemoryFiles(workspaceRoot, "workspace-1");
   const queuedJob = store.getPostRunJobByIdempotencyKey({
     workspaceId: "workspace-1",
     idempotencyKey: `${EVOLVE_JOB_TYPE}:${queued.inputId}`,
@@ -775,30 +976,34 @@ test("sample completed turn queues durable memory work until the evolve worker r
   assert.ok(queuedJob);
   assert.equal(queuedJob.status, "QUEUED");
   assert.equal(immediateFiles["workspace/workspace-1/runtime/session-memory/session-main.md"], undefined);
-  assert.ok(!immediateFiles["workspace/workspace-1/knowledge/facts/verification-command.md"]);
-  assert.ok(!immediateFiles["workspace/workspace-1/knowledge/procedures/release-procedure.md"]);
+  assert.deepEqual(listActiveInteractionLeaves(store, "workspace-1"), []);
 
-  const processed = await worker.processAvailableJobsOnce();
+  const processed = await withMockedFetch(
+    () => worker.processAvailableJobsOnce(),
+    PROJECT_FALCON_MEMORY_RESPONSE,
+  );
   const updatedJob = store.getPostRunJobByIdempotencyKey({
     workspaceId: "workspace-1",
     idempotencyKey: `${EVOLVE_JOB_TYPE}:${queued.inputId}`,
   });
-  const finalCapture = await memoryService.capture({ workspace_id: "workspace-1" });
-  const finalFiles = finalCapture.files as Record<string, string>;
+  const finalFiles = snapshotMemoryFiles(workspaceRoot, "workspace-1");
 
   assert.equal(processed, 1);
   assert.ok(updatedJob);
   assert.equal(updatedJob.status, "DONE");
-  assert.ok(finalFiles["workspace/workspace-1/knowledge/facts/verification-command.md"]);
-  assert.ok(finalFiles["workspace/workspace-1/knowledge/procedures/release-procedure.md"]);
-  assert.match(finalFiles["workspace/workspace-1/MEMORY.md"], /Verification command/);
-  assert.match(finalFiles["workspace/workspace-1/MEMORY.md"], /Release procedure/);
+  const leaves = listActiveInteractionLeaves(store, "workspace-1");
+  assert.equal(leaves.length, 1);
+  const releaseLeaf = leaves.find(
+    (leaf) => leaf.title === "Project Falcon release workflow",
+  );
+  assert.ok(releaseLeaf);
+  assert.ok(finalFiles[releaseLeaf.path]);
 
   store.close();
 });
 
 test("queued evolve memory writeback skips empty index generation when no durable memories are found", async () => {
-  const { store, memoryService } = makeRuntimeState("hb-evolve-noop-");
+  const { store, memoryService, workspaceRoot } = makeRuntimeState("hb-evolve-noop-");
   seedWorkspace(store);
   store.insertSessionMessage({
     workspaceId: "workspace-1",
@@ -834,14 +1039,11 @@ test("queued evolve memory writeback skips empty index generation when no durabl
     memoryService,
   });
 
-  const captured = await memoryService.capture({ workspace_id: "workspace-1" });
-  const files = captured.files as Record<string, string>;
+  const files = snapshotMemoryFiles(workspaceRoot, "workspace-1");
 
-  assert.equal(files["workspace/workspace-1/MEMORY.md"], undefined);
-  assert.equal(files["identity/MEMORY.md"], undefined);
-  assert.equal(files["preference/MEMORY.md"], undefined);
-  assert.equal(files["MEMORY.md"], undefined);
-  assert.deepEqual(store.listMemoryEntries({ status: "active" }), []);
+  assert.deepEqual(Object.keys(files), []);
+  assert.deepEqual(listActiveInteractionLeaves(store, "workspace-1"), []);
+  assert.deepEqual(listActiveInteractionSummaries(store, "workspace-1"), []);
 
   store.close();
 });
@@ -919,45 +1121,69 @@ test("evolve memory worker retries once and then marks persistent failures faile
 });
 
 test("evolve memory processor accepts legacy durable-memory job types", async () => {
-  const { store, memoryService } = makeRuntimeState("hb-evolve-legacy-job-");
+  const { store, memoryService, workspaceRoot } = makeRuntimeState("hb-evolve-legacy-job-");
   seedWorkspace(store);
-  store.insertSessionMessage({
-    workspaceId: "workspace-1",
-    sessionId: "session-main",
-    role: "user",
-    text: "For verification, use `npm run test`.",
-    messageId: "user-1",
-    createdAt: "2026-04-02T12:00:00.000Z",
-  });
-  const turnResult = store.upsertTurnResult({
-    workspaceId: "workspace-1",
-    sessionId: "session-main",
+  configureBackgroundTaskModel(path.dirname(workspaceRoot));
+  seedCompletedTurn({
+    store,
     inputId: "input-1",
+    messageId: "user-1",
+    messageText: "Seed turn 1.",
+    assistantText: "Completed seed turn 1.",
     startedAt: "2026-04-02T12:00:00.000Z",
     completedAt: "2026-04-02T12:00:05.000Z",
-    status: "completed",
-    stopReason: "ok",
-    assistantText: "Captured workspace-specific instructions for future runs.",
+  });
+  seedCompletedTurn({
+    store,
+    inputId: "input-2",
+    messageId: "user-2",
+    messageText: "Seed turn 2.",
+    assistantText: "Completed seed turn 2.",
+    startedAt: "2026-04-02T12:01:00.000Z",
+    completedAt: "2026-04-02T12:01:05.000Z",
+  });
+  seedCompletedTurn({
+    store,
+    inputId: "input-3",
+    messageId: "user-3",
+    messageText: [
+      "Project Falcon release procedure:",
+      "1. Run `npm run test`.",
+      "2. Run `npm run build`.",
+      "3. Publish the bundle.",
+    ].join("\n"),
+    assistantText: "Captured the Project Falcon release workflow.",
+    startedAt: "2026-04-02T12:02:00.000Z",
+    completedAt: "2026-04-02T12:02:05.000Z",
   });
   const legacyJob = store.enqueuePostRunJob({
     jobType: LEGACY_DURABLE_MEMORY_WRITEBACK_JOB_TYPE,
     workspaceId: "workspace-1",
     sessionId: "session-main",
-    inputId: "input-1",
-    payload: { instruction: "Remember the durable workspace rules from this turn." },
-    idempotencyKey: `${LEGACY_DURABLE_MEMORY_WRITEBACK_JOB_TYPE}:input-1`,
+    inputId: "input-3",
+    payload: {
+      instruction: "Remember the durable Project Falcon workflow from this turn batch.",
+    },
+    idempotencyKey: `${LEGACY_DURABLE_MEMORY_WRITEBACK_JOB_TYPE}:input-3`,
   });
 
-  await processEvolveJob({
-    store,
-    record: legacyJob,
-    memoryService,
-  });
+  await withMockedFetch(
+    () =>
+      processEvolveJob({
+        store,
+        record: legacyJob,
+        memoryService,
+      }),
+    PROJECT_FALCON_MEMORY_RESPONSE,
+  );
 
-  const captured = await memoryService.capture({ workspace_id: "workspace-1" });
-  const files = captured.files as Record<string, string>;
+  const files = snapshotMemoryFiles(workspaceRoot, "workspace-1");
 
-  assert.ok(files["workspace/workspace-1/knowledge/facts/verification-command.md"]);
+  const leaf = listActiveInteractionLeaves(store, "workspace-1").find(
+    (entry) => entry.title === "Project Falcon release workflow",
+  );
+  assert.ok(leaf);
+  assert.ok(files[leaf!.path]);
 
   store.close();
 });

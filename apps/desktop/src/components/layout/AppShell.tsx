@@ -25,11 +25,13 @@ import {
   type OperationsDrawerTab,
   OperationsInboxPane,
 } from "@/components/layout/OperationsDrawer";
+import { BootSplash } from "@/components/layout/BootSplash";
 import { SettingsScreenRoot } from "@/components/layout/SettingsScreenRoot";
 import { TopTabsBar } from "@/components/layout/TopTabsBar";
 import { WorkspaceControlCenter } from "@/components/layout/WorkspaceControlCenter";
 import { WorkspaceAppsDialog } from "@/components/layout/WorkspaceAppsDialog";
 import { FirstWorkspacePane } from "@/components/onboarding";
+import { WorkspaceOnboardingSurface } from "@/features/workspace-onboarding/WorkspaceOnboardingSurface";
 import { AppSurfacePane } from "@/components/panes/AppSurfacePane";
 import { BrowserPane } from "@/components/panes/BrowserPane";
 import { ArtifactsPane } from "@/components/panes/ArtifactsPane";
@@ -41,7 +43,6 @@ import {
 } from "@/components/panes/FileExplorerPane";
 import { InternalSurfacePane } from "@/components/panes/InternalSurfacePane";
 import { MissingWorkspacePane } from "@/components/panes/MissingWorkspacePane";
-import { OnboardingPane } from "@/components/panes/OnboardingPane";
 import { SubagentSessionsPane } from "@/components/panes/SubagentSessionsPane";
 import { SpaceApplicationsExplorerPane } from "@/components/panes/SpaceApplicationsExplorerPane";
 import { SpaceBrowserDisplayPane } from "@/components/panes/SpaceBrowserDisplayPane";
@@ -50,7 +51,6 @@ import { PublishScreen } from "@/components/publish/PublishScreen";
 import { Button } from "@/components/ui/button";
 import { UpdateReminder } from "@/components/ui/UpdateReminder";
 import { StoplightProvider } from "@/lib/StoplightContext";
-import { holabossLogoUrl } from "@/lib/assetPaths";
 import { type ExplorerAttachmentDragPayload } from "@/lib/attachmentDrag";
 import { CHAT_LAYOUT } from "@/lib/chatLayout";
 import { useControlCenterCardSignals } from "@/lib/controlCenterLifecycle";
@@ -235,8 +235,10 @@ function isSettingsPaneSection(value: string): value is UiSettingsPaneSection {
     value === "billing" ||
     value === "providers" ||
     value === "integrations" ||
+    value === "memory" ||
     value === "submissions" ||
-    value === "settings"
+    value === "settings" ||
+    value === "experimental"
   );
 }
 
@@ -1244,62 +1246,6 @@ function EmptyWorkspacePane() {
   );
 }
 
-function WorkspaceBootstrapPane() {
-  // Pin to the viewport so the bootstrap surface fills edge-to-edge
-  // independent of the AppShell grid's outer padding/gutters. Otherwise
-  // the body (which is translucent on macOS for vibrancy) would show as
-  // a thin frame around this pane.
-  return (
-    <section className="fixed inset-0 z-20 flex items-center justify-center overflow-hidden bg-background px-6">
-      <div
-        aria-hidden="true"
-        className="pointer-events-none absolute inset-0"
-        style={{
-          background:
-            "radial-gradient(ellipse 60% 50% at 50% 42%, color-mix(in srgb, var(--primary) 10%, transparent), transparent 70%)",
-        }}
-      />
-      <div
-        className="relative flex flex-col items-center text-center"
-        style={{ animation: "var(--animate-fade-in-once)" }}
-      >
-        <div className="relative flex h-16 w-16 items-center justify-center">
-          <img
-            src={holabossLogoUrl}
-            alt="holaOS"
-            width={56}
-            height={56}
-            draggable={false}
-            className="relative h-14 w-14 rounded-2xl select-none"
-          />
-        </div>
-        <h1
-          className="mt-6 text-[17px] font-semibold tracking-tight text-foreground"
-          style={{ letterSpacing: "-0.01em" }}
-        >
-          holaOS
-        </h1>
-        <div
-          className="mt-5 flex items-center gap-1.5"
-          aria-label="Loading"
-          role="status"
-        >
-          {[0, 1, 2].map((i) => (
-            <span
-              key={i}
-              className="block h-1 w-1 rounded-full bg-muted-foreground/70"
-              style={{
-                animation: "holaboss-splash-dot 1.2s ease-in-out infinite",
-                animationDelay: `${i * 160}ms`,
-              }}
-            />
-          ))}
-        </div>
-      </div>
-    </section>
-  );
-}
-
 function runtimeStartupBlockedMessage(
   runtimeStatus: RuntimeStatusPayload | null,
   fallbackMessage = "",
@@ -1397,15 +1343,30 @@ function WorkspaceStartupErrorPane({ message }: { message: string }) {
 }
 
 function WorkspaceOnboardingTakeover({
+  onOpenOutput,
+  onSyncFileDisplayFromAgentOperation,
+  onImageAttachmentPreviewOpenChange,
   focusRequestKey,
 }: {
+  onOpenOutput?: (output: WorkspaceOutputRecordPayload) => void;
+  onSyncFileDisplayFromAgentOperation?: (path: string) => void;
+  onImageAttachmentPreviewOpenChange?: (open: boolean) => void;
   focusRequestKey: number;
 }) {
   return (
     <section className="relative flex h-full min-h-0 min-w-0 overflow-hidden">
       <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_12%_16%,rgba(247,90,84,0.1),transparent_28%),radial-gradient(circle_at_88%_10%,rgba(247,170,126,0.08),transparent_24%),radial-gradient(circle_at_50%_100%,rgba(247,90,84,0.06),transparent_34%)]" />
       <div className="relative min-h-0 min-w-0 flex-1 overflow-hidden">
-        <OnboardingPane focusRequestKey={focusRequestKey} />
+        <WorkspaceOnboardingSurface
+          onOpenOutput={onOpenOutput}
+          onSyncFileDisplayFromAgentOperation={
+            onSyncFileDisplayFromAgentOperation
+          }
+          onImageAttachmentPreviewOpenChange={
+            onImageAttachmentPreviewOpenChange
+          }
+          focusRequestKey={focusRequestKey}
+        />
       </div>
     </section>
   );
@@ -1491,6 +1452,8 @@ function AppShellContent() {
   } | null>(null);
   const [chatSessionOpenRequest, setChatSessionOpenRequest] =
     useState<ChatSessionOpenRequest | null>(null);
+  const [isStartingMeetingMode, setIsStartingMeetingMode] = useState(false);
+  const [meetingModeError, setMeetingModeError] = useState("");
   const [chatImagePreviewOpen, setChatImagePreviewOpen] = useState(false);
   const [
     chatBrowserJumpRequestKeysBySessionId,
@@ -2926,6 +2889,7 @@ function AppShellContent() {
 
   useEffect(() => {
     setChatSessionOpenRequest(null);
+    setMeetingModeError("");
     setChatBrowserJumpRequestKeysBySessionId({});
     setActiveChatSessionId(null);
     setChatScheduleEditContext(null);
@@ -4375,6 +4339,63 @@ function AppShellContent() {
     });
   };
 
+  const handleOpenMeetingMode = useCallback(async () => {
+    const workspaceId = selectedWorkspaceId?.trim() || "";
+    if (!workspaceId || isStartingMeetingMode) {
+      return;
+    }
+
+    setIsStartingMeetingMode(true);
+    setMeetingModeError("");
+    try {
+      const response = await window.electronAPI.workspace.createWorkspaceLab(
+        workspaceId,
+        "meeting_mode",
+      );
+      const labWorkspaceId = response.lab?.id?.trim() || workspaceId;
+      const sessionId = response.session?.session_id?.trim() || "";
+      if (!sessionId) {
+        throw new Error("Meeting mode session was not created.");
+      }
+
+      if (response.created) {
+        await window.electronAPI.workspace.queueSessionInput({
+          workspace_id: labWorkspaceId,
+          session_id: sessionId,
+          text:
+            "Start meeting mode. Use the lab copied from the current workspace. Invite the user to rapidly critique what has not worked well, build a concrete change backlog from their feedback, and only implement changes after the user confirms priorities.",
+          image_urls: null,
+          attachments: [],
+          priority: 0,
+          model: null,
+          thinking_value: null,
+        });
+      }
+
+      setActiveShellView("space");
+      setSpaceVisibility((previous) => ({
+        ...previous,
+        agent: true,
+      }));
+      setAgentView({ type: "chat" });
+      setChatSessionJumpRequest(null);
+      setChatSessionOpenRequest({
+        sessionId,
+        mode: "session",
+        requestKey: nextChatSessionOpenRequestKey(),
+      });
+      setChatFocusRequestKey((current) => current + 1);
+    } catch (error) {
+      setMeetingModeError(normalizeErrorMessage(error));
+    } finally {
+      setIsStartingMeetingMode(false);
+    }
+  }, [
+    isStartingMeetingMode,
+    nextChatSessionOpenRequestKey,
+    selectedWorkspaceId,
+  ]);
+
   const controlCenterMode = activeShellView === "control_center";
   const spaceMode = activeShellView === "space";
 
@@ -4659,7 +4680,7 @@ function AppShellContent() {
         );
       }
       return onboardingModeActive ? (
-        <OnboardingPane
+        <WorkspaceOnboardingSurface
           onOpenOutput={handleOpenWorkspaceOutput}
           onSyncFileDisplayFromAgentOperation={
             handleSyncAgentOperationFileDisplay
@@ -4692,6 +4713,9 @@ function AppShellContent() {
           onBrowserJumpRequestConsumed={consumeChatBrowserJumpRequest}
           onJumpToSessionBrowser={handleJumpToSessionBrowser}
           onOpenSessions={handleOpenSessionsPane}
+          onOpenMeetingMode={handleOpenMeetingMode}
+          meetingModeBusy={isStartingMeetingMode}
+          meetingModeError={meetingModeError}
           onOpenInbox={handleOpenInboxPane}
           inboxUnreadCount={unreadTaskProposalCount}
           onOpenAutomations={handleOpenAutomationsPane}
@@ -4759,6 +4783,7 @@ function AppShellContent() {
     handleMissingInternalResource,
     handleOpenInboxPane,
     handleOpenSessionsPane,
+    handleOpenMeetingMode,
     handleOpenAutomationsPane,
     handleOpenArtifactsPane,
     handleOpenAutomationRunSession,
@@ -4773,7 +4798,9 @@ function AppShellContent() {
     handleOpenWorkspaceOutput,
     hasSelectedWorkspace,
     isLoadingTaskProposals,
+    isStartingMeetingMode,
     proposalAction,
+    meetingModeError,
     selectedWorkspace?.name,
     selectedWorkspace?.folder_state,
     selectedWorkspace?.workspace_path,
@@ -5423,14 +5450,21 @@ function AppShellContent() {
           bootstrapErrorMessage ? (
             <WorkspaceStartupErrorPane message={bootstrapErrorMessage} />
           ) : (
-            <WorkspaceBootstrapPane />
+            <BootSplash />
           )
         ) : hydratedRuntimeErrorMessage ? (
           <WorkspaceStartupErrorPane message={hydratedRuntimeErrorMessage} />
         ) : !hasWorkspaces ? (
           <FirstWorkspacePane />
         ) : showOnboardingTakeover ? (
-          <WorkspaceOnboardingTakeover focusRequestKey={chatFocusRequestKey} />
+          <WorkspaceOnboardingTakeover
+            onOpenOutput={handleOpenWorkspaceOutput}
+            onSyncFileDisplayFromAgentOperation={
+              handleSyncAgentOperationFileDisplay
+            }
+            onImageAttachmentPreviewOpenChange={setChatImagePreviewOpen}
+            focusRequestKey={chatFocusRequestKey}
+          />
         ) : controlCenterMode ? (
           <WorkspaceControlCenter
             workspaces={workspaces}

@@ -9,6 +9,12 @@ import {
 
 const RUNTIME_TOOLS_CAPABILITY_STATUS_PATH = "/api/v1/capabilities/runtime-tools";
 const RUNTIME_TOOLS_ONBOARDING_STATUS_PATH = "/api/v1/capabilities/runtime-tools/onboarding/status";
+const RUNTIME_TOOLS_ONBOARDING_ALIGNMENT_QUESTION_PATH =
+  "/api/v1/capabilities/runtime-tools/onboarding/alignment-question";
+const RUNTIME_TOOLS_ONBOARDING_ALIGNMENT_REPORT_PATH =
+  "/api/v1/capabilities/runtime-tools/onboarding/alignment-report";
+const RUNTIME_TOOLS_ONBOARDING_VERIFICATION_REPORT_PATH =
+  "/api/v1/capabilities/runtime-tools/onboarding/verification-report";
 const RUNTIME_TOOLS_ONBOARDING_COMPLETE_PATH = "/api/v1/capabilities/runtime-tools/onboarding/complete";
 const RUNTIME_TOOLS_CRONJOBS_PATH = "/api/v1/capabilities/runtime-tools/cronjobs";
 const RUNTIME_TOOLS_SUBAGENTS_PATH = "/api/v1/capabilities/runtime-tools/subagents";
@@ -17,15 +23,19 @@ const RUNTIME_TOOLS_IMAGE_GENERATE_PATH = "/api/v1/capabilities/runtime-tools/im
 const RUNTIME_TOOLS_DOWNLOADS_PATH = "/api/v1/capabilities/runtime-tools/downloads";
 const RUNTIME_TOOLS_REPORTS_PATH = "/api/v1/capabilities/runtime-tools/reports";
 const RUNTIME_TOOLS_WEB_SEARCH_PATH = "/api/v1/capabilities/runtime-tools/web-search";
+const RUNTIME_TOOLS_MEMORY_RETRIEVE_PATH = "/api/v1/capabilities/runtime-tools/memory/retrieve";
 const RUNTIME_TOOLS_TODO_PATH = "/api/v1/capabilities/runtime-tools/todo";
 const RUNTIME_TOOLS_SCRATCHPAD_PATH = "/api/v1/capabilities/runtime-tools/scratchpad";
 const RUNTIME_TOOLS_WORKSPACE_INSTRUCTIONS_PATH = "/api/v1/capabilities/runtime-tools/workspace-instructions";
 const RUNTIME_TOOLS_SKILL_PATH = "/api/v1/capabilities/runtime-tools/skill";
 const RUNTIME_TOOLS_TERMINAL_SESSIONS_PATH = "/api/v1/capabilities/runtime-tools/terminal-sessions";
 const RUNTIME_TOOLS_WORKSPACE_APPS_PATH = "/api/v1/capabilities/runtime-tools/workspace-apps";
+const RUNTIME_TOOLS_WORKSPACE_INTEGRATIONS_PATH = "/api/v1/capabilities/runtime-tools/workspace-integrations";
 const RUNTIME_TOOLS_WORKSPACE_APPS_PORTS_PATH = "/api/v1/capabilities/runtime-tools/workspace-apps/ports";
 const RUNTIME_TOOLS_WORKSPACE_DATA_TABLES_PATH = "/api/v1/capabilities/runtime-tools/workspace-data/tables";
 const RUNTIME_TOOLS_WORKSPACE_DATA_QUERY_PATH = "/api/v1/capabilities/runtime-tools/workspace-data/query";
+const RUNTIME_TOOLS_WORKSPACE_INTEGRATIONS_PROPOSE_CONNECT_PATH =
+  "/api/v1/capabilities/runtime-tools/workspace-integrations/propose-connect";
 const DEFAULT_RUNTIME_TOOL_TIMEOUT_MS = 30000;
 const IMAGE_GENERATE_RUNTIME_TOOL_TIMEOUT_MS = 180000;
 const DOWNLOAD_URL_RUNTIME_TOOL_TIMEOUT_MS = 120000;
@@ -309,6 +319,17 @@ function createWebSearchBody(toolParams: unknown): Record<string, unknown> {
   };
 }
 
+function createMemoryRetrieveBody(toolParams: unknown): Record<string, unknown> {
+  const params = isRecord(toolParams) ? toolParams : {};
+  return {
+    query: String(params.query ?? ""),
+    ...(optionalString(params.mode) ? { mode: optionalString(params.mode) } : {}),
+    ...(optionalString(params.tree_id) ? { tree_id: optionalString(params.tree_id) } : {}),
+    ...(optionalString(params.node_id) ? { node_id: optionalString(params.node_id) } : {}),
+    ...(typeof params.max_results === "number" ? { max_results: params.max_results } : {}),
+  };
+}
+
 function createSkillBody(toolParams: unknown): Record<string, unknown> {
   const params = isRecord(toolParams) ? toolParams : {};
   return {
@@ -498,6 +519,16 @@ function createWorkspaceDataQueryBody(toolParams: unknown): Record<string, unkno
   };
 }
 
+function createWorkspaceIntegrationsProposeConnectBody(
+  toolParams: unknown,
+): Record<string, unknown> {
+  const params = isRecord(toolParams) ? toolParams : {};
+  return {
+    toolkit_slug: String(params.toolkit_slug ?? ""),
+    ...(typeof params.reason === "string" ? { reason: params.reason } : {}),
+  };
+}
+
 export function runtimeToolHeaders(params: {
   workspaceId?: string | null;
   sessionId?: string | null;
@@ -574,7 +605,31 @@ function requestPlan(
   switch (toolId) {
     case "onboarding_status":
       return { method: "GET", requestPath: RUNTIME_TOOLS_ONBOARDING_STATUS_PATH };
-    case "onboarding_complete": {
+    case "holaboss_create_alignment_question": {
+      const params = isRecord(toolParams) ? toolParams : {};
+      return {
+        method: "POST",
+        requestPath: RUNTIME_TOOLS_ONBOARDING_ALIGNMENT_QUESTION_PATH,
+        body: {
+          question: params.question,
+        },
+      };
+    }
+    case "holaboss_create_alignment_report":
+    case "holaboss_create_verification_report": {
+      const params = isRecord(toolParams) ? toolParams : {};
+      return {
+        method: "POST",
+        requestPath:
+          toolId === "holaboss_create_alignment_report"
+            ? RUNTIME_TOOLS_ONBOARDING_ALIGNMENT_REPORT_PATH
+            : RUNTIME_TOOLS_ONBOARDING_VERIFICATION_REPORT_PATH,
+        body: {
+          report: params.report,
+        },
+      };
+    }
+    case "holaboss_onboarding_complete": {
       const params = isRecord(toolParams) ? toolParams : {};
       return {
         method: "POST",
@@ -647,6 +702,12 @@ function requestPlan(
       return { method: "POST", requestPath: RUNTIME_TOOLS_REPORTS_PATH, body: createWriteReportBody(toolParams) };
     case "web_search":
       return { method: "POST", requestPath: RUNTIME_TOOLS_WEB_SEARCH_PATH, body: createWebSearchBody(toolParams) };
+    case "memory_retrieve":
+      return {
+        method: "POST",
+        requestPath: RUNTIME_TOOLS_MEMORY_RETRIEVE_PATH,
+        body: createMemoryRetrieveBody(toolParams),
+      };
     case "skill":
       return { method: "POST", requestPath: RUNTIME_TOOLS_SKILL_PATH, body: createSkillBody(toolParams) };
     case "todoread":
@@ -706,17 +767,11 @@ function requestPlan(
         requestPath: `${terminalSessionPath(isRecord(toolParams) ? toolParams.terminal_id : undefined)}/close`,
         body: {},
       };
-    case "workspace_apps_find":
+    case "workspace_integrations_list_catalog":
       return {
         method: "POST",
-        requestPath: `${RUNTIME_TOOLS_WORKSPACE_APPS_PATH}/find`,
-        body: createWorkspaceAppFindBody(toolParams),
-      };
-    case "workspace_apps_install":
-      return {
-        method: "POST",
-        requestPath: `${RUNTIME_TOOLS_WORKSPACE_APPS_PATH}/install`,
-        body: createWorkspaceAppInstallBody(toolParams),
+        requestPath: `${RUNTIME_TOOLS_WORKSPACE_INTEGRATIONS_PATH}/catalog`,
+        body: {},
       };
     case "workspace_apps_scaffold":
       return {
@@ -802,6 +857,12 @@ function requestPlan(
         method: "POST",
         requestPath: RUNTIME_TOOLS_WORKSPACE_DATA_QUERY_PATH,
         body: createWorkspaceDataQueryBody(toolParams),
+      };
+    case "holaboss_workspace_integrations_propose_connect":
+      return {
+        method: "POST",
+        requestPath: RUNTIME_TOOLS_WORKSPACE_INTEGRATIONS_PROPOSE_CONNECT_PATH,
+        body: createWorkspaceIntegrationsProposeConnectBody(toolParams),
       };
   }
   throw new Error(`Unsupported runtime tool: ${toolId}`);
