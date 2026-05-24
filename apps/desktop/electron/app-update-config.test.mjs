@@ -75,3 +75,9 @@ test("write-app-update-config includes the beta channel when requested", async (
     await rm(tempRoot, { recursive: true, force: true });
   }
 });
+
+test("write-app-update-config avoids private builder-util imports", async () => {
+  const source = await readFile(writeAppUpdateConfigPath, "utf8");
+
+  assert.doesNotMatch(source, /builder-util\/out\/filename/);
+});

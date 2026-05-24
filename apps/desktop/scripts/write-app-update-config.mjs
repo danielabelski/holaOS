@@ -6,7 +6,6 @@ import { fileURLToPath } from "node:url";
 import YAML from "yaml";
 
 const require = createRequire(import.meta.url);
-const { sanitizeFileName } = require("builder-util/out/filename");
 const builderConfig = require("../electron-builder.config.cjs");
 const packageJson = require("../package.json");
 
@@ -39,7 +38,22 @@ function resolveUpdaterCacheDirName() {
   if (typeof packageJson.name !== "string" || !packageJson.name.trim()) {
     throw new Error("desktop/package.json must define a package name.");
   }
-  return `${sanitizeFileName(packageJson.name).toLowerCase()}-updater`;
+  return `${sanitizePackageNameForCacheDir(packageJson.name)}-updater`;
+}
+
+function sanitizePackageNameForCacheDir(packageName) {
+  const normalized = packageName
+    .trim()
+    .toLowerCase()
+    .replace(/^@/, "")
+    .replace(/[\\/]/g, "-")
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  if (!normalized) {
+    throw new Error("desktop/package.json must define a valid package name.");
+  }
+  return normalized;
 }
 
 export async function writeAppUpdateConfig(appBundlePath) {
