@@ -8669,6 +8669,82 @@ test("queue route preserves the active claimed input while adding later queued w
   store.close();
 });
 
+test("runtime state reports a claimed checkpoint-gated input as effectively busy", async () => {
+  const root = makeTempDir("hb-runtime-api-checkpoint-gated-");
+  const store = new RuntimeStateStore({
+    dbPath: path.join(root, "runtime.db"),
+    workspaceRoot: path.join(root, "workspace")
+  });
+  const app = buildTestRuntimeApiServer({ store });
+
+  const workspace = store.createWorkspace({
+    workspaceId: "workspace-1",
+    name: "Workspace 1",
+    harness: "pi",
+    status: "active",
+  });
+  store.ensureSession({
+    workspaceId: workspace.id,
+    sessionId: "session-main",
+    kind: "main_session",
+  });
+  store.upsertBinding({
+    workspaceId: workspace.id,
+    sessionId: "session-main",
+    harness: "pi",
+    harnessSessionId: "session-main",
+  });
+  const claimed = store.enqueueInput({
+    workspaceId: workspace.id,
+    sessionId: "session-main",
+    payload: { text: "checkpoint-gated turn" },
+  });
+  store.updateInput({
+    workspaceId: workspace.id,
+    inputId: claimed.inputId,
+    fields: {
+      status: "CLAIMED",
+      claimedBy: "worker-1",
+      claimedUntil: "2026-04-17T12:00:00.000Z",
+    },
+  });
+  store.updateRuntimeState({
+    workspaceId: workspace.id,
+    sessionId: "session-main",
+    status: "QUEUED",
+    currentInputId: claimed.inputId,
+    currentWorkerId: "worker-1",
+    leaseUntil: "2026-04-17T12:00:00.000Z",
+    heartbeatAt: "2026-04-17T11:55:00.000Z",
+    lastError: null,
+  });
+
+  const stateResponse = await app.inject({
+    method: "GET",
+    url: `/api/v1/agent-sessions/session-main/state?workspace_id=${workspace.id}`
+  });
+
+  assert.equal(stateResponse.statusCode, 200);
+  assert.equal(stateResponse.json().runtime_status, "QUEUED");
+  assert.equal(stateResponse.json().effective_state, "BUSY");
+  assert.equal(stateResponse.json().current_input_id, claimed.inputId);
+
+  const statesResponse = await app.inject({
+    method: "GET",
+    url: `/api/v1/agent-sessions/by-workspace/${workspace.id}/runtime-states`
+  });
+
+  assert.equal(statesResponse.statusCode, 200);
+  assert.equal(statesResponse.json().items[0].status, "QUEUED");
+  assert.equal(statesResponse.json().items[0].runtime_status, "QUEUED");
+  assert.equal(statesResponse.json().items[0].effective_state, "BUSY");
+  assert.equal(statesResponse.json().items[0].has_queued_inputs, false);
+  assert.equal(statesResponse.json().items[0].current_input_id, claimed.inputId);
+
+  await app.close();
+  store.close();
+});
+
 test("queue route folds pending background updates into the next main-session input even before the merge window expires", async () => {
   const root = makeTempDir("hb-runtime-api-queue-inline-background-updates-");
   const store = new RuntimeStateStore({

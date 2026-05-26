@@ -1112,6 +1112,7 @@ function runtimeStatePayload(record: SessionRuntimeStateRecord): Record<string, 
 }
 
 function runtimeStateListItemPayload(params: {
+  store: RuntimeStateStore;
   record: SessionRuntimeStateRecord;
   lastTurnResult?: TurnResultRecord | null;
   hasQueuedInputs?: boolean;
@@ -1119,7 +1120,7 @@ function runtimeStateListItemPayload(params: {
   const hasQueuedInputs = params.hasQueuedInputs ?? false;
   return {
     ...runtimeStatePayload(params.record),
-    ...effectiveSessionState(params.record, hasQueuedInputs),
+    ...effectiveSessionState(params.store, params.record, hasQueuedInputs),
     has_queued_inputs: hasQueuedInputs,
     last_turn_status: params.lastTurnResult?.status ?? null,
     last_turn_completed_at: params.lastTurnResult?.completedAt ?? null,
@@ -2478,6 +2479,7 @@ function createInputMemoryUpdateProposals(params: {
 }
 
 function effectiveSessionState(
+  store: RuntimeStateStore,
   runtimeState: SessionRuntimeStateRecord | null,
   hasQueued: boolean
 ): {
@@ -2488,9 +2490,15 @@ function effectiveSessionState(
   lease_until: string | null;
 } {
   const runtimeStatus = runtimeState?.status ?? null;
+  const claimedActiveInput = runtimeStateHasClaimedActiveInput(
+    store,
+    runtimeState,
+  );
   let effectiveState = "IDLE";
   if (runtimeStatus && ["BUSY", "WAITING_USER", "ERROR"].includes(runtimeStatus)) {
     effectiveState = runtimeStatus;
+  } else if (claimedActiveInput) {
+    effectiveState = "BUSY";
   } else if (hasQueued) {
     effectiveState = "QUEUED";
   } else if (runtimeStatus) {
@@ -9643,7 +9651,7 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
       workspaceId: executionWorkspaceId,
       sessionId: resolvedSessionId,
     });
-    const queueAwareState = effectiveSessionState(runtimeStateAfterQueue, true);
+    const queueAwareState = effectiveSessionState(store, runtimeStateAfterQueue, true);
     queueWorker?.wake();
     return {
       input_id: record.inputId,
@@ -9877,7 +9885,7 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
       sessionId: params.sessionId,
       workspaceId: effectiveWorkspaceId
     });
-    return effectiveSessionState(runtimeState, hasQueued);
+    return effectiveSessionState(store, runtimeState, hasQueued);
   });
 
   app.get("/api/v1/agent-sessions/by-workspace/:workspaceId/runtime-states", async (request) => {
@@ -9893,6 +9901,7 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
           sessionId: item.sessionId,
         });
         return runtimeStateListItemPayload({
+          store,
           record: item,
           lastTurnResult:
             store.listTurnResults({
@@ -10226,6 +10235,7 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
       });
       return {
         ...runtimeStateListItemPayload({
+          store,
           record: row,
           lastTurnResult,
           hasQueuedInputs,
