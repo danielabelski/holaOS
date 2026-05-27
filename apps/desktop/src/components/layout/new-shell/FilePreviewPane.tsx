@@ -243,6 +243,7 @@ function MarkdownEditor({ preview, workspaceId, onUpdated }: EditorSurfaceProps)
     workspaceId,
     onUpdated,
   );
+  const { openUrlInBrowserTab, openFileInInternalTab } = useOpenWorkspaceOutput();
   const editable = preview.isEditable;
 
   return (
@@ -270,6 +271,8 @@ function MarkdownEditor({ preview, workspaceId, onUpdated }: EditorSurfaceProps)
             onChange={setDraft}
             readOnly={!editable}
             placeholder="Press / for commands…"
+            onLinkClick={(url) => void openUrlInBrowserTab(url)}
+            onLocalLinkClick={openFileInInternalTab}
           />
         </div>
       </div>
