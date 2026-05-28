@@ -1,4 +1,6 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { Dialog as DialogPrimitive } from "@base-ui/react/dialog";
+import { useSetAtom } from "jotai";
+import { type FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import {
   Activity,
   ArrowLeft,
@@ -33,9 +35,9 @@ import { StatusDot } from "@/components/ui/status-dot";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
+import { chatPanelViewAtom, chatSessionOpenRequestAtom } from "./state/ui";
 import { useOpenIssueDetailTab } from "./useOpenIssueDetailTab";
 
-const NEW_TEAMMATE_ID = "__new_teammate__";
 const TEAMMATE_TABLE_GRID_COLUMNS =
   "grid-cols-[minmax(240px,2.4fr)_132px_132px_104px_96px]";
 
@@ -58,7 +60,6 @@ type DraftState = {
   instructions: string;
   capabilitySummary: string;
   capabilityTags: string;
-  preferredTools: string;
   skills: SkillDraft[];
   status: TeammateStatusPayload;
   kind: TeammateKindPayload;
@@ -75,7 +76,6 @@ function emptyDraft(): DraftState {
     instructions: "",
     capabilitySummary: "",
     capabilityTags: "",
-    preferredTools: "",
     skills: [],
     status: "active",
     kind: "custom",
@@ -89,7 +89,6 @@ function draftFromTeammate(teammate: TeammateRecordPayload): DraftState {
     instructions: teammate.instructions ?? "",
     capabilitySummary: teammate.capability_profile.summary ?? "",
     capabilityTags: teammate.capability_profile.capabilities.join(", "),
-    preferredTools: teammate.capability_profile.preferred_tools.join(", "),
     skills: teammate.skills.map((skill) => ({
       localId: skill.skill_id || makeDraftSkillId(),
       skillId: skill.skill_id,
@@ -178,14 +177,12 @@ function normalizedCapabilityProfileInput(
 ): Partial<TeammateCapabilityProfilePayload> | null {
   const summary = draft.capabilitySummary.trim();
   const capabilities = normalizedCommaSeparatedValues(draft.capabilityTags);
-  const preferredTools = normalizedCommaSeparatedValues(draft.preferredTools);
-  if (!summary && capabilities.length === 0 && preferredTools.length === 0) {
+  if (!summary && capabilities.length === 0) {
     return null;
   }
   return {
     summary: summary || null,
     capabilities,
-    preferred_tools: preferredTools,
   };
 }
 
@@ -276,13 +273,27 @@ function teammateSummary(teammate: TeammateRecordPayload): string {
   if (summary) {
     return summary;
   }
+  if (teammate.kind === "system" && teammate.teammate_id === "hr") {
+    return "The built-in HR teammate owns teammate design, bootstrap quality, and roster changes.";
+  }
   return teammate.kind === "system"
     ? "The built-in General teammate picks up work when no custom teammate is a stronger routing match."
     : "No routing instructions yet.";
 }
 
+function teammateCreationRequestPrompt(name: string, role: string): string {
+  return [
+    "Please ask the built-in HR teammate to create this teammate.",
+    "",
+    `Teammate name: ${name}`,
+    `Teammate role: ${role}`,
+  ].join("\n");
+}
+
 export function TeammatesPane({ workspaceId }: { workspaceId: string }) {
   const openIssueDetailTab = useOpenIssueDetailTab();
+  const setChatPanelView = useSetAtom(chatPanelViewAtom);
+  const setChatSessionOpenRequest = useSetAtom(chatSessionOpenRequestAtom);
   const [teammates, setTeammates] = useState<TeammateRecordPayload[]>([]);
   const [issues, setIssues] = useState<IssueRecordPayload[]>([]);
   const [isLoading, setIsLoading] = useState(false);
@@ -296,6 +307,11 @@ export function TeammatesPane({ workspaceId }: { workspaceId: string }) {
   const [detailTab, setDetailTab] = useState<DetailTab>("activity");
   const [searchQuery, setSearchQuery] = useState("");
   const [archiveConfirmOpen, setArchiveConfirmOpen] = useState(false);
+  const [createDialogOpen, setCreateDialogOpen] = useState(false);
+  const [createName, setCreateName] = useState("");
+  const [createRole, setCreateRole] = useState("");
+  const [createError, setCreateError] = useState("");
+  const [isCreateSubmitting, setIsCreateSubmitting] = useState(false);
 
   const refresh = useCallback(async () => {
     if (!workspaceId.trim()) {
@@ -331,45 +347,25 @@ export function TeammatesPane({ workspaceId }: { workspaceId: string }) {
     [teammates],
   );
 
-  const selectedTeammate =
-    selectedTeammateId && selectedTeammateId !== NEW_TEAMMATE_ID
-      ? teammatesById[selectedTeammateId] ?? null
-      : null;
-  const isCreating = selectedTeammateId === NEW_TEAMMATE_ID;
-  const showingDetail = isCreating || Boolean(selectedTeammate);
+  const selectedTeammate = selectedTeammateId
+    ? teammatesById[selectedTeammateId] ?? null
+    : null;
+  const showingDetail = Boolean(selectedTeammate);
 
   useEffect(() => {
-    if (
-      selectedTeammateId &&
-      selectedTeammateId !== NEW_TEAMMATE_ID &&
-      !teammatesById[selectedTeammateId]
-    ) {
+    if (selectedTeammateId && !teammatesById[selectedTeammateId]) {
       setSelectedTeammateId(null);
       setDetailTab("activity");
     }
   }, [selectedTeammateId, teammatesById]);
 
   useEffect(() => {
-    if (isCreating) {
-      setDraft((current) =>
-        current.teammateId == null ? current : emptyDraft(),
-      );
-      return;
-    }
     if (selectedTeammate) {
       setDraft(draftFromTeammate(selectedTeammate));
       return;
     }
     setDraft(emptyDraft());
-  }, [isCreating, selectedTeammate]);
-
-  const customActiveCount = useMemo(
-    () =>
-      teammates.filter(
-        (teammate) => teammate.kind === "custom" && teammate.status === "active",
-      ).length,
-    [teammates],
-  );
+  }, [selectedTeammate]);
 
   const archivedCount = useMemo(
     () => teammates.filter((teammate) => teammate.status === "archived").length,
@@ -426,10 +422,9 @@ export function TeammatesPane({ workspaceId }: { workspaceId: string }) {
     (!!selectedTeammate && selectedTeammate.kind === "system") ||
     (!!selectedTeammate && selectedTeammate.status === "archived");
   const canSave =
-    isCreating ||
-    (!!selectedTeammate &&
-      selectedTeammate.kind === "custom" &&
-      selectedTeammate.status === "active");
+    !!selectedTeammate &&
+    selectedTeammate.kind === "custom" &&
+    selectedTeammate.status === "active";
 
   const handleBackToList = useCallback(() => {
     setSelectedTeammateId(null);
@@ -438,9 +433,10 @@ export function TeammatesPane({ workspaceId }: { workspaceId: string }) {
   }, []);
 
   const handleStartCreate = useCallback(() => {
-    setSelectedTeammateId(NEW_TEAMMATE_ID);
-    setDraft(emptyDraft());
-    setDetailTab("instructions");
+    setCreateDialogOpen(true);
+    setCreateName("");
+    setCreateRole("");
+    setCreateError("");
     setStatusMessage("");
   }, []);
 
@@ -551,19 +547,7 @@ export function TeammatesPane({ workspaceId }: { workspaceId: string }) {
           );
         }
       };
-      if (isCreating) {
-        const created = await window.electronAPI.workspace.createTeammate({
-          workspace_id: workspaceId,
-          name,
-          instructions: draft.instructions.trim() || null,
-          capability_profile: capabilityProfile,
-        });
-        await persistSkills(created.teammate.teammate_id, []);
-        await refresh();
-        setSelectedTeammateId(created.teammate.teammate_id);
-        setDetailTab("activity");
-        setStatusMessage("Teammate created.");
-      } else if (selectedTeammate) {
+      if (selectedTeammate) {
         const updated = await window.electronAPI.workspace.updateTeammate(
           workspaceId,
           selectedTeammate.teammate_id,
@@ -586,7 +570,79 @@ export function TeammatesPane({ workspaceId }: { workspaceId: string }) {
     } finally {
       setIsSaving(false);
     }
-  }, [draft, isCreating, refresh, selectedTeammate, workspaceId]);
+  }, [draft, refresh, selectedTeammate, workspaceId]);
+
+  const handleCreateDialogOpenChange = useCallback((nextOpen: boolean) => {
+    setCreateDialogOpen(nextOpen);
+    if (!nextOpen) {
+      setCreateName("");
+      setCreateRole("");
+      setCreateError("");
+      setIsCreateSubmitting(false);
+    }
+  }, []);
+
+  const handleSubmitCreateRequest = useCallback(
+    async (event: FormEvent<HTMLFormElement>) => {
+      event.preventDefault();
+      const name = createName.trim();
+      const role = createRole.trim();
+      if (!workspaceId.trim()) {
+        setCreateError("Select a workspace before creating a teammate.");
+        return;
+      }
+      if (!name) {
+        setCreateError("Teammate name is required.");
+        return;
+      }
+      if (!role) {
+        setCreateError("Teammate role is required.");
+        return;
+      }
+
+      setIsCreateSubmitting(true);
+      setCreateError("");
+      try {
+        const ensured = await window.electronAPI.workspace.ensureMainSession(
+          workspaceId,
+        );
+        const sessionId = ensured.session.session_id;
+        await window.electronAPI.workspace.queueSessionInput({
+          workspace_id: workspaceId,
+          session_id: sessionId,
+          text: teammateCreationRequestPrompt(name, role),
+          image_urls: [],
+          attachments: [],
+        });
+        setChatPanelView("chat");
+        setChatSessionOpenRequest({
+          sessionId,
+          requestKey: Date.now(),
+          mode: "session",
+        });
+        handleCreateDialogOpenChange(false);
+        setStatusMessage(
+          "Sent teammate creation request to the main session. Watch the chat panel for follow-up questions.",
+        );
+      } catch (error) {
+        setCreateError(
+          error instanceof Error
+            ? error.message
+            : "Failed to send teammate creation request",
+        );
+      } finally {
+        setIsCreateSubmitting(false);
+      }
+    },
+    [
+      createName,
+      createRole,
+      handleCreateDialogOpenChange,
+      setChatPanelView,
+      setChatSessionOpenRequest,
+      workspaceId,
+    ],
+  );
 
   const handleArchive = useCallback(async () => {
     if (!selectedTeammate || selectedTeammate.kind === "system") {
@@ -646,9 +702,7 @@ export function TeammatesPane({ workspaceId }: { workspaceId: string }) {
 
   const headerTitle = !showingDetail
     ? "Teammates"
-    : isCreating
-      ? "New teammate"
-      : selectedTeammate?.name || "Teammate";
+    : selectedTeammate?.name || "Teammate";
 
   return (
     <>
@@ -731,7 +785,7 @@ export function TeammatesPane({ workspaceId }: { workspaceId: string }) {
                       Restore
                     </Button>
                   ) : null}
-                  {!isCreating && selectedTeammate?.kind === "custom" ? (
+                  {selectedTeammate?.kind === "custom" ? (
                     <Button
                       type="button"
                       variant="outline"
@@ -751,7 +805,7 @@ export function TeammatesPane({ workspaceId }: { workspaceId: string }) {
                       disabled={draftLocked || isSaving}
                     >
                       {isSaving ? <Loader2 className="size-4 animate-spin" /> : null}
-                      {isCreating ? "Create teammate" : "Save changes"}
+                      Save changes
                     </Button>
                   ) : null}
                 </>
@@ -954,40 +1008,24 @@ export function TeammatesPane({ workspaceId }: { workspaceId: string }) {
                         </div>
                         <div className="mt-5">
                           <div className="text-2xl font-semibold tracking-tight text-foreground">
-                            {isCreating ? draft.name.trim() || "New teammate" : selectedTeammate?.name}
+                            {selectedTeammate?.name}
                           </div>
                           <div className="mt-2 flex flex-wrap items-center gap-2">
                             <Badge variant="outline" className="bg-background/80">
                               <StatusDot
-                                variant={
-                                  isCreating
-                                    ? "success"
-                                    : teammateStatusVariant(
-                                        selectedTeammate?.status ?? "active",
-                                      )
-                                }
+                                variant={teammateStatusVariant(selectedTeammate?.status ?? "active")}
                                 className="mr-2"
                               />
-                              {isCreating
-                                ? "Active"
-                                : teammateStatusLabel(
-                                    selectedTeammate?.status ?? "active",
-                                  )}
+                              {teammateStatusLabel(selectedTeammate?.status ?? "active")}
                             </Badge>
                             <Badge variant="outline" className="bg-background/80">
-                              {isCreating
-                                ? "Custom"
-                                : selectedTeammate?.kind === "system"
-                                  ? "System"
-                                  : "Custom"}
+                              {selectedTeammate?.kind === "system" ? "System" : "Custom"}
                             </Badge>
                           </div>
                           <p className="mt-4 text-sm leading-6 text-foreground/58">
-                            {isCreating
-                              ? "Create a teammate the Workspace Manager can recognize and route to."
-                              : selectedTeammate
-                                ? teammateSummary(selectedTeammate)
-                                : "No teammate selected."}
+                            {selectedTeammate
+                              ? teammateSummary(selectedTeammate)
+                              : "No teammate selected."}
                           </p>
                         </div>
                       </div>
@@ -995,15 +1033,15 @@ export function TeammatesPane({ workspaceId }: { workspaceId: string }) {
                       <div className="space-y-4 px-5 py-5 text-sm">
                         <MetricRow
                           label="Assigned issues"
-                          value={`${isCreating ? 0 : selectedIssueCount}`}
+                          value={`${selectedIssueCount}`}
                         />
                         <MetricRow
                           label="Working now"
-                          value={`${isCreating ? 0 : selectedRunningCount}`}
+                          value={`${selectedRunningCount}`}
                         />
                         <MetricRow
                           label="Completed"
-                          value={`${isCreating ? 0 : selectedCompletedCount}`}
+                          value={`${selectedCompletedCount}`}
                         />
                         <MetricRow
                           label="Skills"
@@ -1015,19 +1053,11 @@ export function TeammatesPane({ workspaceId }: { workspaceId: string }) {
                         />
                         <MetricRow
                           label="Created"
-                          value={
-                            isCreating
-                              ? "Not created yet"
-                              : relativeTimeLabel(selectedTeammate?.created_at ?? null)
-                          }
+                          value={relativeTimeLabel(selectedTeammate?.created_at ?? null)}
                         />
                         <MetricRow
                           label="Updated"
-                          value={
-                            isCreating
-                              ? "Draft"
-                              : relativeTimeLabel(selectedTeammate?.updated_at ?? null)
-                          }
+                          value={relativeTimeLabel(selectedTeammate?.updated_at ?? null)}
                         />
                       </div>
                     </CardContent>
@@ -1060,24 +1090,20 @@ export function TeammatesPane({ workspaceId }: { workspaceId: string }) {
                           variant="line"
                           className="w-full justify-start rounded-none bg-transparent p-0"
                         >
-                          {!isCreating ? (
-                            <>
-                              <TabsTrigger
-                                value="activity"
-                                className="h-12 rounded-none px-3"
-                              >
-                                <Activity className="size-4" />
-                                Activity
-                              </TabsTrigger>
-                              <TabsTrigger
-                                value="issues"
-                                className="h-12 rounded-none px-3"
-                              >
-                                <ListTodo className="size-4" />
-                                Issues
-                              </TabsTrigger>
-                            </>
-                          ) : null}
+                          <TabsTrigger
+                            value="activity"
+                            className="h-12 rounded-none px-3"
+                          >
+                            <Activity className="size-4" />
+                            Activity
+                          </TabsTrigger>
+                          <TabsTrigger
+                            value="issues"
+                            className="h-12 rounded-none px-3"
+                          >
+                            <ListTodo className="size-4" />
+                            Issues
+                          </TabsTrigger>
                           <TabsTrigger
                             value="instructions"
                             className="h-12 rounded-none px-3"
@@ -1095,127 +1121,22 @@ export function TeammatesPane({ workspaceId }: { workspaceId: string }) {
                         </TabsList>
                       </div>
 
-                      {!isCreating ? (
-                        <TabsContent value="activity" className="w-full px-5 py-5">
-                          <div className="space-y-4">
-                            <Card className="bg-background/55">
-                              <CardHeader>
-                                <CardTitle>Now</CardTitle>
-                                <CardDescription>
-                                  Current workload for this teammate.
-                                </CardDescription>
-                              </CardHeader>
-                              <CardContent className="space-y-3">
-                                {selectedRunningIssues.length > 0 ? (
-                                  selectedRunningIssues.map((issue) => (
-                                    <button
-                                      key={issue.issue_id}
-                                      type="button"
-                                      className="flex w-full items-center justify-between gap-3 rounded-2xl border border-border bg-background/70 px-4 py-3 text-left transition-colors hover:bg-background/90"
-                                      onClick={() =>
-                                        void openIssueDetailTab({
-                                          workspaceId: issue.workspace_id,
-                                          issueId: issue.issue_id,
-                                          title: issue.title,
-                                        })
-                                      }
-                                    >
-                                      <div className="min-w-0">
-                                        <div className="truncate text-sm font-medium text-foreground">
-                                          {issue.issue_id} · {issue.title}
-                                        </div>
-                                        <div className="mt-1 text-sm text-foreground/48">
-                                          Updated {relativeTimeLabel(issue.updated_at)}
-                                        </div>
-                                      </div>
-                                      <Badge
-                                        variant="outline"
-                                        className="bg-background/80"
-                                      >
-                                        <StatusDot
-                                          variant="primary"
-                                          className="mr-2"
-                                        />
-                                        Working
-                                      </Badge>
-                                    </button>
-                                  ))
-                                ) : (
-                                  <div className="rounded-2xl border border-dashed border-border bg-background/45 px-4 py-8 text-sm text-foreground/48">
-                                    No active work right now.
-                                  </div>
-                                )}
-                              </CardContent>
-                            </Card>
-
-                            <Card className="bg-background/55">
-                              <CardHeader>
-                                <CardTitle>Recent work</CardTitle>
-                                <CardDescription>
-                                  The latest issues this teammate has touched.
-                                </CardDescription>
-                              </CardHeader>
-                              <CardContent className="space-y-3">
-                                {selectedIssues.length > 0 ? (
-                                  selectedIssues.slice(0, 5).map((issue) => (
-                                    <button
-                                      key={issue.issue_id}
-                                      type="button"
-                                      className="flex w-full items-center justify-between gap-3 rounded-2xl border border-border bg-background/70 px-4 py-3 text-left transition-colors hover:bg-background/90"
-                                      onClick={() =>
-                                        void openIssueDetailTab({
-                                          workspaceId: issue.workspace_id,
-                                          issueId: issue.issue_id,
-                                          title: issue.title,
-                                        })
-                                      }
-                                    >
-                                      <div className="min-w-0">
-                                        <div className="truncate text-sm font-medium text-foreground">
-                                          {issue.issue_id} · {issue.title}
-                                        </div>
-                                        <div className="mt-1 text-sm text-foreground/48">
-                                          {issueStatusLabel(issue.status)} · Updated{" "}
-                                          {relativeTimeLabel(issue.updated_at)}
-                                        </div>
-                                      </div>
-                                      <Badge
-                                        variant="outline"
-                                        className={issuePriorityBadgeClass(
-                                          issue.priority,
-                                        )}
-                                      >
-                                        {issuePriorityLabel(issue.priority)}
-                                      </Badge>
-                                    </button>
-                                  ))
-                                ) : (
-                                  <div className="rounded-2xl border border-dashed border-border bg-background/45 px-4 py-8 text-sm text-foreground/48">
-                                    No issue activity yet.
-                                  </div>
-                                )}
-                              </CardContent>
-                            </Card>
-                          </div>
-                        </TabsContent>
-                      ) : null}
-
-                      {!isCreating ? (
-                        <TabsContent value="issues" className="w-full px-5 py-5">
+                      <TabsContent value="activity" className="w-full px-5 py-5">
+                        <div className="space-y-4">
                           <Card className="bg-background/55">
                             <CardHeader>
-                              <CardTitle>Assigned issues</CardTitle>
+                              <CardTitle>Now</CardTitle>
                               <CardDescription>
-                                All issues currently assigned to this teammate.
+                                Current workload for this teammate.
                               </CardDescription>
                             </CardHeader>
                             <CardContent className="space-y-3">
-                              {selectedIssues.length > 0 ? (
-                                selectedIssues.map((issue) => (
+                              {selectedRunningIssues.length > 0 ? (
+                                selectedRunningIssues.map((issue) => (
                                   <button
                                     key={issue.issue_id}
                                     type="button"
-                                    className="flex w-full items-center justify-between gap-4 rounded-2xl border border-border bg-background/70 px-4 py-3 text-left transition-colors hover:bg-background/90"
+                                    className="flex w-full items-center justify-between gap-3 rounded-2xl border border-border bg-background/70 px-4 py-3 text-left transition-colors hover:bg-background/90"
                                     onClick={() =>
                                       void openIssueDetailTab({
                                         workspaceId: issue.workspace_id,
@@ -1228,41 +1149,142 @@ export function TeammatesPane({ workspaceId }: { workspaceId: string }) {
                                       <div className="truncate text-sm font-medium text-foreground">
                                         {issue.issue_id} · {issue.title}
                                       </div>
-                                      <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-foreground/48">
-                                        <span>{issueStatusLabel(issue.status)}</span>
-                                        <span className="text-foreground/25">•</span>
-                                        <span>
-                                          Updated {relativeTimeLabel(issue.updated_at)}
-                                        </span>
+                                      <div className="mt-1 text-sm text-foreground/48">
+                                        Updated {relativeTimeLabel(issue.updated_at)}
                                       </div>
                                     </div>
-                                    <div className="flex shrink-0 items-center gap-2">
-                                      <Badge
-                                        variant="outline"
-                                        className="bg-background/80"
-                                      >
-                                        {issueStatusLabel(issue.status)}
-                                      </Badge>
-                                      <Badge
-                                        variant="outline"
-                                        className={issuePriorityBadgeClass(
-                                          issue.priority,
-                                        )}
-                                      >
-                                        {issuePriorityLabel(issue.priority)}
-                                      </Badge>
-                                    </div>
+                                    <Badge
+                                      variant="outline"
+                                      className="bg-background/80"
+                                    >
+                                      <StatusDot
+                                        variant="primary"
+                                        className="mr-2"
+                                      />
+                                      Working
+                                    </Badge>
                                   </button>
                                 ))
                               ) : (
                                 <div className="rounded-2xl border border-dashed border-border bg-background/45 px-4 py-8 text-sm text-foreground/48">
-                                  No assigned issues yet.
+                                  No active work right now.
                                 </div>
                               )}
                             </CardContent>
                           </Card>
-                        </TabsContent>
-                      ) : null}
+
+                          <Card className="bg-background/55">
+                            <CardHeader>
+                              <CardTitle>Recent work</CardTitle>
+                              <CardDescription>
+                                The latest issues this teammate has touched.
+                              </CardDescription>
+                            </CardHeader>
+                            <CardContent className="space-y-3">
+                              {selectedIssues.length > 0 ? (
+                                selectedIssues.slice(0, 5).map((issue) => (
+                                  <button
+                                    key={issue.issue_id}
+                                    type="button"
+                                    className="flex w-full items-center justify-between gap-3 rounded-2xl border border-border bg-background/70 px-4 py-3 text-left transition-colors hover:bg-background/90"
+                                    onClick={() =>
+                                      void openIssueDetailTab({
+                                        workspaceId: issue.workspace_id,
+                                        issueId: issue.issue_id,
+                                        title: issue.title,
+                                      })
+                                    }
+                                  >
+                                    <div className="min-w-0">
+                                      <div className="truncate text-sm font-medium text-foreground">
+                                        {issue.issue_id} · {issue.title}
+                                      </div>
+                                      <div className="mt-1 text-sm text-foreground/48">
+                                        {issueStatusLabel(issue.status)} · Updated{" "}
+                                        {relativeTimeLabel(issue.updated_at)}
+                                      </div>
+                                    </div>
+                                    <Badge
+                                      variant="outline"
+                                      className={issuePriorityBadgeClass(
+                                        issue.priority,
+                                      )}
+                                    >
+                                      {issuePriorityLabel(issue.priority)}
+                                    </Badge>
+                                  </button>
+                                ))
+                              ) : (
+                                <div className="rounded-2xl border border-dashed border-border bg-background/45 px-4 py-8 text-sm text-foreground/48">
+                                  No issue activity yet.
+                                </div>
+                              )}
+                            </CardContent>
+                          </Card>
+                        </div>
+                      </TabsContent>
+
+                      <TabsContent value="issues" className="w-full px-5 py-5">
+                        <Card className="bg-background/55">
+                          <CardHeader>
+                            <CardTitle>Assigned issues</CardTitle>
+                            <CardDescription>
+                              All issues currently assigned to this teammate.
+                            </CardDescription>
+                          </CardHeader>
+                          <CardContent className="space-y-3">
+                            {selectedIssues.length > 0 ? (
+                              selectedIssues.map((issue) => (
+                                <button
+                                  key={issue.issue_id}
+                                  type="button"
+                                  className="flex w-full items-center justify-between gap-4 rounded-2xl border border-border bg-background/70 px-4 py-3 text-left transition-colors hover:bg-background/90"
+                                  onClick={() =>
+                                    void openIssueDetailTab({
+                                      workspaceId: issue.workspace_id,
+                                      issueId: issue.issue_id,
+                                      title: issue.title,
+                                    })
+                                  }
+                                >
+                                  <div className="min-w-0">
+                                    <div className="truncate text-sm font-medium text-foreground">
+                                      {issue.issue_id} · {issue.title}
+                                    </div>
+                                    <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-foreground/48">
+                                      <span>{issueStatusLabel(issue.status)}</span>
+                                      <span className="text-foreground/25">•</span>
+                                      <span>
+                                        Updated {relativeTimeLabel(issue.updated_at)}
+                                      </span>
+                                    </div>
+                                  </div>
+                                  <div className="flex shrink-0 items-center gap-2">
+                                    <Badge
+                                      variant="outline"
+                                      className="bg-background/80"
+                                    >
+                                      {issueStatusLabel(issue.status)}
+                                    </Badge>
+                                    <Badge
+                                      variant="outline"
+                                      className={issuePriorityBadgeClass(
+                                        issue.priority,
+                                      )}
+                                    >
+                                      {issuePriorityLabel(issue.priority)}
+                                    </Badge>
+                                  </div>
+                                </button>
+                              ))
+                            ) : (
+                              <div className="rounded-2xl border border-dashed border-border bg-background/45 px-4 py-8 text-sm text-foreground/48">
+                                No assigned issues yet.
+                              </div>
+                            )}
+                          </CardContent>
+                        </Card>
+                      </TabsContent>
 
                       <TabsContent
                         value="instructions"
@@ -1329,26 +1351,6 @@ export function TeammatesPane({ workspaceId }: { workspaceId: string }) {
                               />
                               <div className="mt-2 text-xs text-foreground/45">
                                 Comma-separated domains, specialties, or routing cues.
-                              </div>
-                            </div>
-                            <div>
-                              <div className="mb-2 text-xs font-medium uppercase tracking-[0.16em] text-foreground/42">
-                                Preferred tools
-                              </div>
-                              <Input
-                                value={draft.preferredTools}
-                                onChange={(event) =>
-                                  setDraft((current) => ({
-                                    ...current,
-                                    preferredTools: event.target.value,
-                                  }))
-                                }
-                                placeholder="edit, bash, web_search"
-                                disabled={draftLocked}
-                                className="h-11 bg-background/75"
-                              />
-                              <div className="mt-2 text-xs text-foreground/45">
-                                Optional comma-separated tool ids that are strong fits for this teammate.
                               </div>
                             </div>
                             <div>
@@ -1423,17 +1425,15 @@ export function TeammatesPane({ workspaceId }: { workspaceId: string }) {
                                           Helper files
                                         </Badge>
                                       ) : null}
-                                      {!isCreating ? (
-                                        <Button
-                                          type="button"
-                                          variant="ghost"
-                                          size="sm"
-                                          onClick={() => void handleRevealSkill(skill)}
-                                        >
-                                          <FolderOpen className="size-4" />
-                                          Reveal
-                                        </Button>
-                                      ) : null}
+                                      <Button
+                                        type="button"
+                                        variant="ghost"
+                                        size="sm"
+                                        onClick={() => void handleRevealSkill(skill)}
+                                      >
+                                        <FolderOpen className="size-4" />
+                                        Reveal
+                                      </Button>
                                       {!draftLocked ? (
                                         <Button
                                           type="button"
@@ -1546,6 +1546,101 @@ export function TeammatesPane({ workspaceId }: { workspaceId: string }) {
           void handleArchive();
         }}
       />
+
+      <DialogPrimitive.Root
+        open={createDialogOpen}
+        onOpenChange={handleCreateDialogOpenChange}
+      >
+        <DialogPrimitive.Portal>
+          <DialogPrimitive.Backdrop
+            className="fixed inset-0 z-[90] bg-foreground/20 backdrop-blur-sm data-open:animate-in data-open:fade-in-0 data-closed:animate-out data-closed:fade-out-0"
+            style={{
+              animationDuration: "var(--duration-snappy)",
+              animationTimingFunction: "var(--ease-out-expo)",
+            }}
+          />
+          <DialogPrimitive.Popup
+            className="fixed top-[16%] left-1/2 z-[100] w-[min(540px,calc(100vw-32px))] -translate-x-1/2 overflow-hidden rounded-xl border border-border bg-popover/95 shadow-2xl outline-none backdrop-blur-2xl data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95"
+            style={{
+              animationDuration: "var(--duration-base)",
+              animationTimingFunction: "var(--ease-out-expo)",
+            }}
+          >
+            <form onSubmit={handleSubmitCreateRequest} className="flex flex-col">
+              <div className="flex items-center justify-between border-b border-border px-4 py-3">
+                <div>
+                  <div className="text-sm font-medium text-foreground">
+                    New teammate
+                  </div>
+                  <div className="mt-1 text-xs text-foreground/48">
+                    Send a teammate creation request to the main session.
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => handleCreateDialogOpenChange(false)}
+                  className="grid size-7 place-items-center rounded-md text-foreground/45 transition-colors hover:bg-foreground/[0.06] hover:text-foreground"
+                  aria-label="Close new teammate dialog"
+                >
+                  <X className="size-4" />
+                </button>
+              </div>
+
+              <div className="grid gap-4 px-4 py-4">
+                <div>
+                  <div className="mb-2 text-xs font-medium uppercase tracking-[0.16em] text-foreground/42">
+                    Name
+                  </div>
+                  <Input
+                    value={createName}
+                    onChange={(event) => setCreateName(event.target.value)}
+                    placeholder="Frontend teammate"
+                    disabled={isCreateSubmitting}
+                    className="h-11 bg-background/75"
+                  />
+                </div>
+                <div>
+                  <div className="mb-2 text-xs font-medium uppercase tracking-[0.16em] text-foreground/42">
+                    Role
+                  </div>
+                  <Textarea
+                    value={createRole}
+                    onChange={(event) => setCreateRole(event.target.value)}
+                    placeholder="Own React dashboard implementation, UI polish, and frontend build issues."
+                    disabled={isCreateSubmitting}
+                    className="min-h-[120px] resize-y bg-background/75"
+                  />
+                  <div className="mt-2 text-xs text-foreground/45">
+                    The main session will route this through the roster workflow, ask any follow-up questions it still needs, and provision a stronger teammate when the remit is clear enough.
+                  </div>
+                </div>
+                {createError ? (
+                  <div className="rounded-xl border border-border bg-card px-3 py-2 text-xs text-foreground/65">
+                    {createError}
+                  </div>
+                ) : null}
+              </div>
+
+              <div className="flex items-center justify-end gap-2 border-t border-border px-4 py-3">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  onClick={() => handleCreateDialogOpenChange(false)}
+                  disabled={isCreateSubmitting}
+                >
+                  Cancel
+                </Button>
+                <Button type="submit" disabled={isCreateSubmitting}>
+                  {isCreateSubmitting ? (
+                    <Loader2 className="size-4 animate-spin" />
+                  ) : null}
+                  Send request
+                </Button>
+              </div>
+            </form>
+          </DialogPrimitive.Popup>
+        </DialogPrimitive.Portal>
+      </DialogPrimitive.Root>
     </>
   );
 }
