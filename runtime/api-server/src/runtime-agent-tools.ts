@@ -82,6 +82,10 @@ import {
   formatDashboardUiLintError,
   inspectDashboardUiUsage,
 } from "./workspace-app-ui-lint.js";
+import {
+  parseOnboardingAlignmentReport,
+  sanitizeOnboardingAlignmentReport,
+} from "../../../shared/onboarding-contract.js";
 import { selectDelegatedTaskTeammateByCapability } from "./teammate-routing.js";
 import { preferredCoordinatorSessionId } from "./coordinator-session-routing.js";
 import {
@@ -2482,7 +2486,7 @@ export function normalizeDelivery(params: {
   };
 }
 
-function parseStoredOnboardingReport(
+function parseStoredOnboardingPayload(
   raw: string | null | undefined,
 ): JsonValue | null {
   const normalized = normalizedString(raw);
@@ -2655,7 +2659,7 @@ function sanitizeAlignmentQuestion(
 function parseStoredAlignmentQuestion(
   raw: string | null | undefined,
 ): OnboardingAlignmentQuestion | null {
-  const parsed = parseStoredOnboardingReport(raw);
+  const parsed = parseStoredOnboardingPayload(raw);
   if (!isRecord(parsed)) {
     return null;
   }
@@ -2664,6 +2668,14 @@ function parseStoredAlignmentQuestion(
   } catch {
     return null;
   }
+}
+
+function parseStoredAlignmentReport(
+  raw: string | null | undefined,
+): JsonValue | null {
+  const parsed = parseStoredOnboardingPayload(raw);
+  const normalized = parseOnboardingAlignmentReport(parsed);
+  return normalized as unknown as JsonValue | null;
 }
 
 export function effectiveOnboardingState(workspace: WorkspaceRecord): string | null {
@@ -2689,8 +2701,8 @@ export function onboardingPayload(workspace: WorkspaceRecord): JsonObject {
     alignment_question: parseStoredAlignmentQuestion(
       workspace.onboardingAlignmentQuestion,
     ) as unknown as JsonValue | null,
-    alignment_report: parseStoredOnboardingReport(workspace.onboardingAlignmentReport),
-    verification_report: parseStoredOnboardingReport(workspace.onboardingVerificationReport),
+    alignment_report: parseStoredAlignmentReport(workspace.onboardingAlignmentReport),
+    verification_report: parseStoredOnboardingPayload(workspace.onboardingVerificationReport),
     onboarding_completed_at: workspace.onboardingCompletedAt,
     onboarding_completion_summary: workspace.onboardingCompletionSummary,
     onboarding_requested_at: workspace.onboardingRequestedAt,
@@ -3258,14 +3270,17 @@ export class RuntimeAgentToolsService {
   }): JsonObject {
     const scope = this.requireActiveOnboardingLab(params.workspaceId);
     this.requireOnboardingState(scope.source, [ONBOARDING_ALIGNMENT_STATE]);
-    if (Object.keys(params.report).length === 0) {
+    let report;
+    try {
+      report = sanitizeOnboardingAlignmentReport(params.report);
+    } catch (error) {
       throw new RuntimeAgentToolsServiceError(
         400,
-        "alignment_report_required",
-        "alignment report must be a non-empty object",
+        "alignment_report_invalid",
+        error instanceof Error ? error.message : "alignment report is invalid",
       );
     }
-    const serialized = JSON.stringify(params.report);
+    const serialized = JSON.stringify(report);
     const source = this.syncOnboardingFlow(scope, {
       onboardingState: ONBOARDING_AWAITING_ALIGNMENT_APPROVAL_STATE,
       onboardingAlignmentQuestion: null,

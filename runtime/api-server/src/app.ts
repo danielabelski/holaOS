@@ -197,6 +197,10 @@ import {
   buildMemoryUpdateProposalsFromUserInput,
 } from "./user-memory-proposals.js";
 import { promotedWorkspaceSkillPath } from "./evolve-skill-review.js";
+import {
+  parseOnboardingAlignmentReport,
+  sanitizeOnboardingAlignmentReport,
+} from "../../../shared/onboarding-contract.js";
 
 const DEFAULT_POLL_INTERVAL_MS = 50;
 const DEFAULT_BODY_LIMIT_BYTES = 10 * 1024 * 1024;
@@ -1075,7 +1079,7 @@ function workspaceRecordPayload(
     alignment_question: parsedWorkspaceReportPayload(
       workspace.onboardingAlignmentQuestion,
     ),
-    alignment_report: parsedWorkspaceReportPayload(
+    alignment_report: parsedWorkspaceAlignmentReportPayload(
       workspace.onboardingAlignmentReport,
     ),
     verification_report: parsedWorkspaceReportPayload(
@@ -1173,6 +1177,24 @@ function parsedWorkspaceReportPayload(raw: string | null | undefined): unknown |
   } catch {
     return null;
   }
+}
+
+function parsedWorkspaceAlignmentReportPayload(
+  raw: string | null | undefined,
+): unknown | null {
+  return parseOnboardingAlignmentReport(parsedWorkspaceReportPayload(raw));
+}
+
+function serializedWorkspaceAlignmentReport(
+  value: unknown,
+): string | null {
+  if (value == null) {
+    return null;
+  }
+  if (!isRecord(value)) {
+    throw new Error("alignment_report must be an object");
+  }
+  return JSON.stringify(sanitizeOnboardingAlignmentReport(value));
 }
 
 function isPathWithinWorkspaceRoot(candidate: string, workspaceRoot: string): boolean {
@@ -8038,6 +8060,9 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
     }
 
     try {
+      const onboardingAlignmentReport = hasOwn(request.body, "alignment_report")
+        ? serializedWorkspaceAlignmentReport(request.body.alignment_report)
+        : null;
       const created = store.createWorkspace({
         workspaceId: optionalString(request.body.workspace_id),
         name: requiredString(request.body.name, "name"),
@@ -8049,9 +8074,7 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
         onboardingAlignmentQuestion: isRecord(request.body.alignment_question)
           ? JSON.stringify(request.body.alignment_question)
           : null,
-        onboardingAlignmentReport: isRecord(request.body.alignment_report)
-          ? JSON.stringify(request.body.alignment_report)
-          : null,
+        onboardingAlignmentReport,
         onboardingVerificationReport: isRecord(request.body.verification_report)
           ? JSON.stringify(request.body.verification_report)
           : null,
@@ -8288,9 +8311,9 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
           : null;
       }
       if (hasOwn(request.body, "alignment_report")) {
-        fields.onboardingAlignmentReport = isRecord(request.body.alignment_report)
-          ? JSON.stringify(request.body.alignment_report)
-          : null;
+        fields.onboardingAlignmentReport = serializedWorkspaceAlignmentReport(
+          request.body.alignment_report,
+        );
       }
       if (hasOwn(request.body, "verification_report")) {
         fields.onboardingVerificationReport = isRecord(request.body.verification_report)
