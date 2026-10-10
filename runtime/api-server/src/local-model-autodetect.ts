@@ -35,12 +35,15 @@ function existingProviderFor(
   );
 }
 
-function sameModelIds(left: string[], right: string[]): boolean {
-  if (left.length !== right.length) {
+function unchanged(existing: ConfiguredLocalModelProvider, endpoint: LocalModelEndpoint): boolean {
+  if (existing.model_ids.length !== endpoint.models.length) {
     return false;
   }
-  const rightSet = new Set(right);
-  return left.every((id) => rightSet.has(id));
+  return endpoint.models.every(
+    (model) =>
+      existing.model_ids.includes(model.id) &&
+      (model.context_window === undefined || existing.context_windows[model.id] === model.context_window),
+  );
 }
 
 export async function syncLocalModelProviders(
@@ -58,7 +61,7 @@ export async function syncLocalModelProviders(
       continue;
     }
     const existing = existingProviderFor(configured, entry);
-    if (existing && sameModelIds(existing.model_ids, entry.models.map((model) => model.id))) {
+    if (existing && unchanged(existing, entry)) {
       continue;
     }
     changed.push(

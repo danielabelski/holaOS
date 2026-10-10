@@ -735,6 +735,7 @@ export interface ConfiguredLocalModelProvider {
   base_url: string;
   engine: string;
   model_ids: string[];
+  context_windows: Record<string, number | undefined>;
 }
 
 function idSegment(value: string): string {
@@ -790,6 +791,38 @@ function removeProviderModelEntries(models: StringMap, providerId: string): stri
   return removed;
 }
 
+export function readLocalModelProviderConfig(
+  providerId: string,
+): { provider_id: string; base_url: string; engine: string } | null {
+  const { document } = loadRuntimeConfigDocument();
+  const provider = asObject(asObject(document.providers)[providerId]);
+  const baseUrl = normalizeString(provider.base_url);
+  if (!baseUrl || (provider.local !== true && !isLocalModelProviderId(providerId))) {
+    return null;
+  }
+  return { provider_id: providerId, base_url: baseUrl, engine: normalizeString(provider.engine) };
+}
+
+export function updateLocalModelContextWindow(providerId: string, modelId: string, contextWindow: number): boolean {
+  const { document, configPath } = loadRuntimeConfigDocument();
+  const models = asObject(document.models);
+  const token = Object.keys(models).find((key) => {
+    const entry = asObject(models[key]);
+    return modelEntryProviderId(key, entry) === providerId && (normalizeString(entry.model) || key.slice(providerId.length + 1)) === modelId;
+  });
+  if (!token) {
+    return false;
+  }
+  const entry = asObject(models[token]);
+  if (entry.context_window === contextWindow) {
+    return false;
+  }
+  models[token] = { ...entry, context_window: contextWindow };
+  document.models = models;
+  writeRuntimeConfigDocument(document, configPath);
+  return true;
+}
+
 export function readLocalModelProviders(): ConfiguredLocalModelProvider[] {
   const { document } = loadRuntimeConfigDocument();
   const providers = asObject(document.providers);
@@ -800,13 +833,22 @@ export function readLocalModelProviders(): ConfiguredLocalModelProvider[] {
     if (!isLocalModelProviderId(providerId) && provider.local !== true) {
       continue;
     }
+    const providerModels = Object.entries(models)
+      .filter(([token, entry]) => modelEntryProviderId(token, entry) === providerId)
+      .map(([token, entry]) => {
+        const record = asObject(entry);
+        const contextWindow = record.context_window;
+        return {
+          id: normalizeString(record.model) || token.slice(providerId.length + 1),
+          contextWindow: typeof contextWindow === "number" && contextWindow > 0 ? contextWindow : undefined,
+        };
+      });
     result.push({
       provider_id: providerId,
       base_url: normalizeString(provider.base_url),
       engine: normalizeString(provider.engine),
-      model_ids: Object.entries(models)
-        .filter(([token, entry]) => modelEntryProviderId(token, entry) === providerId)
-        .map(([token, entry]) => normalizeString(asObject(entry).model) || token.slice(providerId.length + 1)),
+      model_ids: providerModels.map((model) => model.id),
+      context_windows: Object.fromEntries(providerModels.map((model) => [model.id, model.contextWindow])),
     });
   }
   return result;

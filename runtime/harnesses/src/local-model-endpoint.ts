@@ -65,3 +65,18 @@ export function isLocalModelEndpoint(
   const octets = ipv4Octets(hostname);
   return octets !== null && isLocalIpv4(octets);
 }
+
+const CONTEXT_OVERFLOW_PATTERN =
+  /exceeds the available context size|maximum context length|context length of only|longer than the model'?s context length|context window exceeded|context_length_exceeded|n_ctx/i;
+
+export function withLocalContextGuidance(message: string, providerId: string | null | undefined): string {
+  if (!(providerId ?? "").trim().toLowerCase().startsWith("local_") || !CONTEXT_OVERFLOW_PATTERN.test(message)) {
+    return message;
+  }
+  return (
+    `${message}\n\nThe local model's context window is too small for this conversation. ` +
+    "Restart the model server with 32768 tokens of context or more: llama.cpp `-c 32768`, " +
+    "Ollama `OLLAMA_CONTEXT_LENGTH=32768`, LM Studio: reload the model with a larger Context Length, " +
+    "vLLM `--max-model-len 32768`."
+  );
+}

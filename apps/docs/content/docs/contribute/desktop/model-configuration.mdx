@@ -354,6 +354,17 @@ You can also write this by hand. A provider is treated as local when it sets `"l
 - the context window comes from `context_window` (default 32768) and output is capped at `max_tokens`, or half the context up to 16384
 - input is text-only unless `input_modalities` includes `"image"`
 
+### Context window
+
+holaOS sends its instructions and tool definitions with every request (about 14,000 tokens), so a local model needs a context window of at least 16,384 tokens; 32,768 or more is recommended. Before each run the runtime asks the server what context it is actually serving (llama.cpp `/props`, Ollama `/api/ps`, LM Studio `/api/v0/models`, vLLM `/v1/models`), records it, and stops with instructions if it is too small:
+
+- llama.cpp: restart `llama-server` with `-c 32768`
+- Ollama: set `OLLAMA_CONTEXT_LENGTH=32768` and restart Ollama, or use a Modelfile with `PARAMETER num_ctx 32768`. Ollama serves models with a small default context and silently truncates longer prompts, so this matters even when the model itself supports a long context.
+- LM Studio: reload the model with a larger Context Length
+- vLLM: `--max-model-len 32768`
+
+For Ollama and LM Studio, a model that is not loaded yet is loaded first so its real context can be read.
+
 If a model does not respond, check the server directly first:
 
 ```bash

@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   isLocalModelEndpoint,
   withDefaultHttpScheme,
+  withLocalContextGuidance,
 } from "./local-model-endpoint.js";
 
 test("isLocalModelEndpoint recognizes loopback, LAN and local hostnames", () => {
@@ -61,4 +62,14 @@ test("withDefaultHttpScheme only prefixes scheme-less URLs", () => {
   assert.equal(withDefaultHttpScheme("localhost:8080"), "http://localhost:8080");
   assert.equal(withDefaultHttpScheme(" https://host/v1 "), "https://host/v1");
   assert.equal(withDefaultHttpScheme(""), "");
+});
+
+test("context overflow errors from local providers get guidance; others are untouched", () => {
+  const llama = "400 request (13537 tokens) exceeds the available context size (8192 tokens), try increasing it";
+  const guided = withLocalContextGuidance(llama, "local_llamacpp_1234");
+  assert.ok(guided.startsWith(llama));
+  assert.match(guided, /-c 32768/);
+  assert.match(withLocalContextGuidance("This model's maximum context length is 4096 tokens", "local_vllm"), /max-model-len/);
+  assert.equal(withLocalContextGuidance(llama, "openai"), llama);
+  assert.equal(withLocalContextGuidance("401 unauthorized", "local_ollama"), "401 unauthorized");
 });

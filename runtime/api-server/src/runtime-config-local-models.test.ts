@@ -162,6 +162,7 @@ test("re-registering replaces that provider's models, keeps per-model extras and
       base_url: "http://127.0.0.1:11434/v1",
       engine: "ollama",
       model_ids: ["llama3.2:3b"],
+      context_windows: { "llama3.2:3b": 131072 },
     },
   ]);
 });

@@ -73,7 +73,7 @@ test("base URLs normalize with or without scheme and /v1", () => {
   assert.throws(() => localModelServerRoot("ftp://example.com"), /http/);
 });
 
-test("ollama: version, context from /api/show, loaded via /api/ps, vision, embeddings skipped", async () => {
+test("ollama: served context from /api/ps or Modelfile num_ctx, model max kept separately", async () => {
   const shows: Record<string, unknown> = {
     "llama3.2:3b": {
       capabilities: ["completion", "tools"],
@@ -96,7 +96,7 @@ test("ollama: version, context from /api/show, loaded via /api/ps, vision, embed
     "GET /api/tags": () => ({
       json: { models: Object.keys(shows).map((name) => ({ name, model: name })) },
     }),
-    "GET /api/ps": () => ({ json: { models: [{ name: "llama3.2:3b", model: "llama3.2:3b" }] } }),
+    "GET /api/ps": () => ({ json: { models: [{ name: "llama3.2:3b", model: "llama3.2:3b", context_length: 4096 }] } }),
     "POST /api/show": (body) => {
       const name = (body as { model?: string }).model ?? "";
       return shows[name] ? { json: shows[name] } : { status: 404, json: { error: "missing" } };
@@ -108,12 +108,12 @@ test("ollama: version, context from /api/show, loaded via /api/ps, vision, embed
   assert.equal(endpoint.engine_version, "0.12.3");
   assert.equal(endpoint.base_url, `${root}/v1`);
   assert.deepEqual(endpoint.models, [
-    { id: "llama3.2:3b", context_window: 131072, loaded: true, supports_vision: false },
-    { id: "llava:7b", context_window: 8192, loaded: false, supports_vision: true },
+    { id: "llama3.2:3b", context_window: 4096, max_context_window: 131072, loaded: true, supports_vision: false },
+    { id: "llava:7b", context_window: 8192, max_context_window: 32768, loaded: false, supports_vision: true },
   ]);
 });
 
-test("lmstudio: /api/v0/models types, loaded context, embeddings skipped", async () => {
+test("lmstudio: loaded context is served context; unloaded models only report their max", async () => {
   const root = await startFakeServer({
     "GET /v1/models": () => ({
       json: { object: "list", data: [{ id: "qwen/qwen3-8b", object: "model", owned_by: "organization_owner" }] },
@@ -139,8 +139,8 @@ test("lmstudio: /api/v0/models types, loaded context, embeddings skipped", async
   const endpoint = await probeLocalModelEndpoint(`${root}/v1`);
   assert.equal(endpoint.engine, "lmstudio");
   assert.deepEqual(endpoint.models, [
-    { id: "qwen/qwen3-8b", context_window: 32768, loaded: true, supports_vision: false },
-    { id: "google/gemma-3-4b", context_window: 131072, loaded: false, supports_vision: true },
+    { id: "qwen/qwen3-8b", context_window: 32768, max_context_window: 40960, loaded: true, supports_vision: false },
+    { id: "google/gemma-3-4b", max_context_window: 131072, loaded: false, supports_vision: true },
   ]);
 });
 

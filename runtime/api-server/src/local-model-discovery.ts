@@ -19,7 +19,10 @@ export const LOCAL_MODEL_ENGINES: readonly LocalModelEngine[] = [
 
 export interface LocalModelInfo {
   id: string;
+  /** Context the server actually serves this model with; omitted when that is only known after loading. */
   context_window?: number;
+  /** Largest context the model supports, when it differs from what is being served. */
+  max_context_window?: number;
   loaded?: boolean;
   supports_vision?: boolean;
 }
@@ -195,6 +198,9 @@ function compactModel(model: LocalModelInfo): LocalModelInfo {
   return {
     id: model.id,
     ...(model.context_window !== undefined ? { context_window: model.context_window } : {}),
+    ...(model.max_context_window !== undefined && model.max_context_window !== model.context_window
+      ? { max_context_window: model.max_context_window }
+      : {}),
     ...(model.loaded !== undefined ? { loaded: model.loaded } : {}),
     ...(model.supports_vision !== undefined ? { supports_vision: model.supports_vision } : {}),
   };
@@ -225,14 +231,14 @@ function ownedBy(entries: JsonRecord[]): Set<string> {
   return new Set(entries.map((entry) => nonEmptyString(entry.owned_by).toLowerCase()).filter(Boolean));
 }
 
-function ollamaContextWindow(show: JsonRecord | null): number | undefined {
+function ollamaModelfileContext(show: JsonRecord | null): number | undefined {
+  const numCtxMatch = /(?:^|\n)\s*num_ctx\s+(\d+)/.exec(nonEmptyString(show?.parameters));
+  return numCtxMatch ? positiveInteger(numCtxMatch[1]) : undefined;
+}
+
+function ollamaMaxContext(show: JsonRecord | null): number | undefined {
   if (!show) {
     return undefined;
-  }
-  const parameters = nonEmptyString(show.parameters);
-  const numCtxMatch = /(?:^|\n)\s*num_ctx\s+(\d+)/.exec(parameters);
-  if (numCtxMatch) {
-    return positiveInteger(numCtxMatch[1]);
   }
   const modelInfo = isRecord(show.model_info) ? show.model_info : {};
   for (const [key, value] of Object.entries(modelInfo)) {
@@ -258,11 +264,12 @@ async function collectOllama(
   const names = recordList(okRecord(tags)?.models)
     .map((entry) => nonEmptyString(entry.name) || nonEmptyString(entry.model))
     .filter(Boolean);
-  const loadedNames = new Set(
-    recordList(okRecord(ps)?.models)
-      .flatMap((entry) => [nonEmptyString(entry.name), nonEmptyString(entry.model)])
-      .filter(Boolean),
-  );
+  const loadedContext = new Map<string, number | undefined>();
+  for (const entry of recordList(okRecord(ps)?.models)) {
+    for (const name of [nonEmptyString(entry.name), nonEmptyString(entry.model)].filter(Boolean)) {
+      loadedContext.set(name, positiveInteger(entry.context_length));
+    }
+  }
   const shows = await Promise.all(
     names.slice(0, OLLAMA_SHOW_LIMIT).map(async (name) =>
       okRecord(await probeJson(`${root}/api/show`, { ...options, method: "POST", body: { model: name } })),
@@ -280,8 +287,9 @@ async function collectOllama(
     models.push(
       compactModel({
         id: name,
-        context_window: ollamaContextWindow(show),
-        loaded: loadedNames.has(name),
+        context_window: loadedContext.get(name) ?? ollamaModelfileContext(show),
+        max_context_window: ollamaMaxContext(show),
+        loaded: loadedContext.has(name),
         supports_vision: capabilities ? capabilities.includes("vision") : undefined,
       }),
     );
@@ -303,9 +311,8 @@ function collectLmStudio(root: string, payload: JsonRecord): LocalModelEndpoint 
       const type = nonEmptyString(entry.type).toLowerCase();
       return compactModel({
         id: nonEmptyString(entry.id),
-        context_window:
-          (loaded ? positiveInteger(entry.loaded_context_length) : undefined) ??
-          positiveInteger(entry.max_context_length),
+        context_window: loaded ? positiveInteger(entry.loaded_context_length) : undefined,
+        max_context_window: positiveInteger(entry.max_context_length),
         loaded,
         supports_vision: type ? type === "vlm" : undefined,
       });

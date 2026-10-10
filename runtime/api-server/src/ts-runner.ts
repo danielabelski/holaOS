@@ -25,6 +25,7 @@ import {
   type RunningWorkspaceMcpSidecar,
 } from "./runner-prep.js";
 import { compileWorkspaceRuntimePlanFromWorkspace } from "./runner-prep.js";
+import { ensureLocalModelReady, LocalModelNotReadyError } from "./local-model-preflight.js";
 import {
   projectAgentRuntimeConfig,
   type AgentRuntimeConfigCliRequest,
@@ -274,6 +275,7 @@ export interface TsRunnerExecutionDeps {
   projectAgentRuntimeConfig: (
     request: AgentRuntimeConfigCliRequest,
   ) => AgentRuntimeConfigCliResponse;
+  ensureLocalModelReady?: (target: { providerId: string; modelId: string }) => Promise<void>;
   resolveHarnessPlugin: (harness: string) => RuntimeHarnessPlugin;
   runHarnessHost: (params: {
     harness: string;
@@ -2347,6 +2349,7 @@ function defaultExecutionDeps(): TsRunnerExecutionDeps {
     compilePlan: ({ workspaceId, workspaceDir }) =>
       compileWorkspaceRuntimePlanFromWorkspace({ workspaceId, workspaceDir }),
     projectAgentRuntimeConfig: (request) => projectAgentRuntimeConfig(request),
+    ensureLocalModelReady: (target) => ensureLocalModelReady(target),
     resolveHarnessPlugin: (harness) => requireRuntimeHarnessPlugin(harness),
     runHarnessHost: harnessInProcessEnabled()
       ? inProcessRunHarnessHost
@@ -2900,6 +2903,18 @@ export async function executeTsRunnerRequest(
         ),
     );
 
+    if (deps.ensureLocalModelReady) {
+      await measureBootstrapStageAsync(
+        bootstrapStageTimingsMs,
+        "check_local_model",
+        async () =>
+          await deps.ensureLocalModelReady?.({
+            providerId: runtimeConfig.provider_id,
+            modelId: runtimeConfig.model_id,
+          }),
+      );
+    }
+
     await measureBootstrapStageAsync(
       bootstrapStageTimingsMs,
       "prepare_harness_run",
@@ -3125,7 +3140,10 @@ export async function executeTsRunnerRequest(
         inputId: request.input_id,
         sequence: 2,
         errorType: errorTypeFor(error),
-        message: `${bootstrap.harness} execution failed: ${errorMessage(error)}`,
+        message:
+          error instanceof LocalModelNotReadyError
+            ? error.message
+            : `${bootstrap.harness} execution failed: ${errorMessage(error)}`,
       }),
     });
   }
