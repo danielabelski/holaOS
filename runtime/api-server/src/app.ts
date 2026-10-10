@@ -200,6 +200,7 @@ import { ComposioSchemaCache, primeComposioSchemaCache } from "./composio-schema
 import { isInStoreCatalog } from "./integration-store-catalog.js";
 import { removeComposioMcpRegistryEntry } from "./composio-tool-registry.js";
 import { executeComposioInlineTool } from "./composio-inline-execution.js";
+import { PublishApprovalGate } from "./publish-approval-gate.js";
 import { createComposioApiClientFromEnv } from "./composio-api-client.js";
 import { setRemoteComposioSource } from "./composio-remote-source.js";
 import {
@@ -3866,6 +3867,7 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
   const durableMemoryWorker = resolveDurableMemoryWorker(options, app, store, memoryService);
   const queueWorker = resolveQueueWorker(options, app, store, memoryService, durableMemoryWorker);
   queueWorkerHolder.worker = queueWorker;
+  const publishApprovalGate = new PublishApprovalGate({ store });
   const runtimeAgentToolsService = new RuntimeAgentToolsService(store, {
     workspaceRoot: store.workspaceRoot,
     terminalSessionManager,
@@ -6371,6 +6373,15 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
         toolSlug,
         connectedAccountId,
         arguments: args,
+        publishApproval: {
+          gate: publishApprovalGate,
+          workspaceId,
+          sessionId: capabilitySessionId({
+            headers: request.headers as Record<string, unknown>,
+            body: request.body,
+          }),
+          inputId: headerString(request.headers as Record<string, unknown>, "x-holaboss-input-id"),
+        },
       });
       app.log.info(
         {
