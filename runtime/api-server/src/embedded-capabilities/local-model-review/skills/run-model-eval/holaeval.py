@@ -154,7 +154,7 @@ def detect(base):
         info["server_props"] = {k: props.get(k) for k in ("model_path", "total_slots", "chat_template_caps") if k in props}
         info["server_defaults"] = {k: (gen.get("params") or gen).get(k) for k in ("temperature", "top_p", "top_k", "min_p", "n_predict") if k in (gen.get("params") or gen)}
         for mid in ids or [Path(props.get("model_path", "model")).name]:
-            info["models"].append({"id": mid, "context_window": n_ctx})
+            info["models"].append({"id": Path(mid).stem if mid.endswith(".gguf") else mid, "context_window": n_ctx})
     elif isinstance(lms, dict) and isinstance(lms.get("data"), list):
         info["engine"] = "lmstudio"
         for m in lms["data"]:
