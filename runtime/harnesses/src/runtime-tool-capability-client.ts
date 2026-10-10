@@ -41,6 +41,8 @@ const RUNTIME_TOOLS_MCP_REFRESH_PATH =
   "/api/v1/capabilities/runtime-tools/mcp/refresh";
 const RUNTIME_TOOLS_MCP_REAUTHORIZE_PATH =
   "/api/v1/capabilities/runtime-tools/mcp/reauthorize";
+const LOCAL_MODELS_DISCOVER_PATH = "/api/v1/local-models/discover";
+const LOCAL_MODELS_REGISTER_PATH = "/api/v1/local-models/register";
 const DEFAULT_RUNTIME_TOOL_TIMEOUT_MS = 30000;
 const IMAGE_GENERATE_RUNTIME_TOOL_TIMEOUT_MS = 180000;
 // Video jobs submit + poll + download; allow well past the proxy's job wait.
@@ -659,6 +661,28 @@ function createMcpReauthorizeBody(toolParams: unknown): Record<string, unknown> 
   return body;
 }
 
+function localModelsDiscoverPath(toolParams: unknown): string {
+  const baseUrl = optionalString(isRecord(toolParams) ? toolParams.base_url : undefined);
+  if (!baseUrl) {
+    return LOCAL_MODELS_DISCOVER_PATH;
+  }
+  return `${LOCAL_MODELS_DISCOVER_PATH}?${new URLSearchParams({ base_url: baseUrl }).toString()}`;
+}
+
+function createLocalModelsRegisterBody(toolParams: unknown): Record<string, unknown> {
+  const params = isRecord(toolParams) ? toolParams : {};
+  const baseUrl = optionalString(params.base_url);
+  if (!baseUrl) {
+    throw new Error("base_url is required");
+  }
+  const body: Record<string, unknown> = { base_url: baseUrl };
+  const models = optionalStringArray(params.models);
+  if (models) body.models = models;
+  const engine = optionalString(params.engine);
+  if (engine) body.engine = engine;
+  return body;
+}
+
 
 export function runtimeToolHeaders(params: {
   workspaceId?: string | null;
@@ -1026,6 +1050,14 @@ function requestPlan(
         method: "POST",
         requestPath: RUNTIME_TOOLS_MCP_REAUTHORIZE_PATH,
         body: createMcpReauthorizeBody(toolParams),
+      };
+    case "local_models_discover":
+      return { method: "GET", requestPath: localModelsDiscoverPath(toolParams) };
+    case "local_models_register":
+      return {
+        method: "POST",
+        requestPath: LOCAL_MODELS_REGISTER_PATH,
+        body: createLocalModelsRegisterBody(toolParams),
       };
   }
   throw new Error(`Unsupported runtime tool: ${toolId}`);

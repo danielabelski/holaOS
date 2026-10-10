@@ -1625,6 +1625,18 @@ export const RUNTIME_AGENT_TOOL_DEFINITIONS: RuntimeAgentToolDefinition[] = [
     path: "/api/v1/capabilities/runtime-tools/mcp/refresh",
     description: runtimeToolBaseDefinition("mcp_refresh").description
   },
+  {
+    id: runtimeToolBaseDefinition("local_models_discover").id,
+    method: "GET",
+    path: "/api/v1/local-models/discover",
+    description: runtimeToolBaseDefinition("local_models_discover").description
+  },
+  {
+    id: runtimeToolBaseDefinition("local_models_register").id,
+    method: "POST",
+    path: "/api/v1/local-models/register",
+    description: runtimeToolBaseDefinition("local_models_register").description
+  },
 ];
 
 export class RuntimeAgentToolsServiceError extends Error {

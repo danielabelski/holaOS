@@ -52,6 +52,15 @@ const BASE_RELATION_TYPES = [
   "many_to_one",
   "many_to_many",
 ] as const;
+const LOCAL_MODEL_ENGINE_IDS = [
+  "ollama",
+  "lmstudio",
+  "llamacpp",
+  "vllm",
+  "sglang",
+  "mlx",
+  "openai_compatible",
+] as const;
 const TODO_WRITE_OPS_TEXT = "`replace`, `add_phase`, `add_task`, `update`, and `remove_task`";
 const TODO_WRITE_ALIAS_WARNING =
   "Do not invent alias op names such as `replace_all`, `update_task`, or `set_status`.";
@@ -1419,6 +1428,40 @@ function runtimeToolParameters(toolId: RuntimeAgentToolId): Record<string, unkno
         required: ["server"],
         additionalProperties: false,
       };
+    case "local_models_discover":
+      return {
+        type: "object",
+        properties: {
+          base_url: {
+            type: "string",
+            description:
+              "Optional extra server address to probe in addition to the default local ports, e.g. `http://127.0.0.1:9000` or `192.168.1.20:11434` (with or without `/v1`).",
+          },
+        },
+        additionalProperties: false,
+      };
+    case "local_models_register":
+      return {
+        type: "object",
+        properties: {
+          base_url: {
+            type: "string",
+            description: "The server's `base_url` as returned by `local_models_discover`.",
+          },
+          models: {
+            type: "array",
+            items: { type: "string" },
+            description:
+              "Optional model ids to register. Omit to register every chat model the server lists.",
+          },
+          engine: literalStringUnion(
+            LOCAL_MODEL_ENGINE_IDS,
+            "Optional engine override, only when the detected engine is wrong (e.g. an MLX server detected as `openai_compatible`).",
+          ),
+        },
+        required: ["base_url"],
+        additionalProperties: false,
+      };
   }
 }
 
@@ -1634,6 +1677,19 @@ function runtimeToolPromptGuidelines(toolId: RuntimeAgentToolId): string[] {
       "After you propose connects, stop. Do not retry the tool, do not call MCP tools that need those connections, do not poll. The runtime parks the input and re-dispatches it the moment every required connection is active.",
       "DASHBOARD APPS — POST-BUILD POLISH PASS IS AUTO-QUEUED: when `workspace_apps_ensure_running` returns `ready: true` for a dashboard-shape app (one with `src/client/`), the runtime automatically queues a polish-only input on the user-facing main session (the response includes `polish_pass_queued` listing the queued inputs). Do NOT also attempt an interface-design refactor pass inside the current turn. Wrap up the build turn cleanly — tell the user the app is built and that a polish pass will run next. The polish input dispatches as the next turn, with fresh context and a narrow `apps/<app_id>/src/client/` scope; that turn is where the rewrite happens.",
       "When that polish turn fires (you will see a `text` payload starting with `[Auto-queued post-build polish pass]`), follow it literally: invoke `interface-design`, REWRITE each `src/client/` file via `bash` heredoc (NOT `edit`), rebuild + restart, then verify with `browser_screenshot`. The polish turn's `text` payload tells you what to do and when it's done; do not bring concrete visual rules from elsewhere — the `interface-design` skill output is the sole authority for what the dashboard should look like.",
+    ];
+  }
+  if (toolId === "local_models_discover") {
+    return [
+      "Use `local_models_discover` when the user wants to use, compare, or evaluate a model running on their own machine (Ollama, LM Studio, llama.cpp, MLX, vLLM, SGLang, or another OpenAI-compatible server).",
+      "It only finds servers that are already running. When it returns no endpoints, ask the user to start their local server or tell you its address; do not try to install an engine or download a model.",
+      "Pass `base_url` when the user names a host or port other than the engine defaults.",
+    ];
+  }
+  if (toolId === "local_models_register") {
+    return [
+      "Call `local_models_discover` first and pass the `base_url` it returned; pass `models` only when the user wants a subset.",
+      "After registering, the model is selectable in the chat model picker and can be targeted as `<provider_id>/<model_id>`; use the exact `token` values from the result.",
     ];
   }
   return appBuilderToolGuidance;

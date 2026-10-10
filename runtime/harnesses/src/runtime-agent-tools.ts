@@ -303,6 +303,18 @@ export const RUNTIME_AGENT_TOOL_DEFINITIONS = [
     description:
       "Re-run the OAuth sign-in for an already-connected REMOTE MCP server so the user can SWITCH the connected account (or refresh an expired / revoked authorization). Use this when the user asks to 'switch/change the <server> account', 're-authorize', 're-login', or 'sign in as a different user' for a connected MCP server — NOT `mcp_connect` (which adds a new server) or `mcp_refresh` (which only reloads tools without touching auth). Takes a single `server` arg: the id or name of the connected server (e.g. 'heygen'). It does NOT complete the sign-in itself — it surfaces an inline 'Re-authorize' button in the chat that the user clicks to open the browser and pick a different account. Tell the user to click it. (Note: to land on a DIFFERENT account they may need to sign out of that service in their browser first.)",
     policy: "mutate"
+  },
+  {
+    id: "local_models_discover",
+    description:
+      "Find model servers that are ALREADY RUNNING on the user's machine — Ollama, LM Studio, llama.cpp, MLX, vLLM, SGLang, or any OpenAI-compatible server — by probing their default local ports plus any `base_url` you pass. Returns each server's `base_url`, `engine`, the `provider_id` it registers as, whether it is already `registered`, and its chat models with `token`, context window, loaded state and vision support when the server reports them. This never installs an engine or downloads a model: if nothing is found, ask the user to start their local server (or tell you its address) and call it again.",
+    policy: "inspect"
+  },
+  {
+    id: "local_models_register",
+    description:
+      "Register a running local model server (from `local_models_discover`) as a model provider. Its models become selectable in the chat model picker and usable anywhere a model is chosen as `<provider_id>/<model_id>` (the result lists the exact tokens). Pass `base_url`; optionally `models` (model ids) to register a subset — the default is every chat model the server lists. Re-registering the same server refreshes its model list. Only works while the server is running; it does not install or download anything.",
+    policy: "mutate"
   }
 ] as const;
 

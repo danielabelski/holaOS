@@ -3211,6 +3211,8 @@ async function defaultCreateSession(request: HarnessHostPiRequest): Promise<PiSe
     open_macos_settings: "workspace_admin",
     update_workspace_instructions: "workspace_admin",
     holaboss_workspace_integrations_set_default_account: "integration_setup",
+    local_models_discover: "local_models",
+    local_models_register: "local_models",
     cronjobs: "scheduling",
     terminal_session: "terminal",
   };

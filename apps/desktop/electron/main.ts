@@ -6623,6 +6623,43 @@ function runtimeProviderLabel(providerId: string): string {
     .join(" ");
 }
 
+const LOCAL_RUNTIME_PROVIDER_ENGINE_LABELS: Record<string, string> = {
+  ollama: "Ollama",
+  lmstudio: "LM Studio",
+  llamacpp: "llama.cpp",
+  mlx: "MLX",
+  vllm: "vLLM",
+  sglang: "SGLang",
+  openai_compatible: "OpenAI-compatible",
+};
+
+function localRuntimeProviderLabel(
+  providerId: string,
+  providerPayload: Record<string, unknown>,
+  baseUrl: string,
+): string {
+  const normalizedProviderId = providerId.trim().toLowerCase();
+  if (providerPayload.local !== true && !normalizedProviderId.startsWith("local_")) {
+    return "";
+  }
+  const engine =
+    runtimeFirstNonEmptyString(providerPayload.engine).toLowerCase() ||
+    normalizedProviderId.replace(/^local_/, "");
+  const engineLabel =
+    LOCAL_RUNTIME_PROVIDER_ENGINE_LABELS[engine] ??
+    (engine ? runtimeProviderLabel(engine) : "Model server");
+  if (normalizedProviderId === `local_${engine}`) {
+    return `Local · ${engineLabel}`;
+  }
+  let host = "";
+  try {
+    host = new URL(baseUrl).host;
+  } catch {
+    host = "";
+  }
+  return host ? `Local · ${engineLabel} (${host})` : `Local · ${engineLabel}`;
+}
+
 function normalizeRuntimeProviderKind(
   rawKind: string,
   providerId: string,
@@ -7213,7 +7250,9 @@ function runtimeProviderModelGroups(
     providers.set(canonicalProviderId, {
       id: canonicalProviderId,
       kind,
-      label: runtimeProviderLabel(canonicalProviderId),
+      label:
+        localRuntimeProviderLabel(canonicalProviderId, providerPayload, baseUrl) ||
+        runtimeProviderLabel(canonicalProviderId),
     });
   }
 
@@ -17203,6 +17242,43 @@ async function emitRuntimeConfig(config?: RuntimeConfigPayload) {
   }
 }
 
+let runtimeConfigFileWatcher: FSWatcher | null = null;
+let runtimeConfigFileChangeTimer: ReturnType<typeof setTimeout> | null = null;
+
+// The runtime registers providers (e.g. local model servers) by writing this file directly.
+function startRuntimeConfigFileWatcher(): void {
+  if (runtimeConfigFileWatcher) {
+    return;
+  }
+  const configPath = runtimeConfigPath();
+  const watchedFileName = path.basename(configPath);
+  try {
+    mkdirSync(path.dirname(configPath), { recursive: true });
+    runtimeConfigFileWatcher = watch(
+      path.dirname(configPath),
+      { persistent: false },
+      (_eventType, filename) => {
+        if (filename && String(filename) !== watchedFileName) {
+          return;
+        }
+        if (runtimeConfigFileChangeTimer) {
+          clearTimeout(runtimeConfigFileChangeTimer);
+        }
+        runtimeConfigFileChangeTimer = setTimeout(() => {
+          runtimeConfigFileChangeTimer = null;
+          void emitRuntimeConfig().catch(() => undefined);
+        }, 250);
+      },
+    );
+    runtimeConfigFileWatcher.on("error", () => {
+      runtimeConfigFileWatcher?.close();
+      runtimeConfigFileWatcher = null;
+    });
+  } catch {
+    runtimeConfigFileWatcher = null;
+  }
+}
+
 async function fileExists(targetPath: string) {
   try {
     await fs.access(targetPath);
@@ -27018,6 +27094,10 @@ async function runBootStep(
 
 app.whenReady().then(() => {
   void ensureDesktopBrowserServiceStarted();
+});
+
+app.whenReady().then(() => {
+  startRuntimeConfigFileWatcher();
 });
 
 app.whenReady().then(async () => {

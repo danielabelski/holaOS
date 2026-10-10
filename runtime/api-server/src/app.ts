@@ -57,6 +57,7 @@ import {
 } from "@holaboss/remote-api/server";
 import { mountRemoteApiMcp } from "@holaboss/remote-api/mcp";
 import { mountRuntimeToolsMcp } from "./runtime-tools-mcp.js";
+import { registerLocalModelRoutes } from "./local-model-routes.js";
 import { resolveProductRuntimeConfig } from "./runtime-config.js";
 
 // Org-owned sessions: the org active RIGHT NOW (from runtime-config.json, which
@@ -5068,6 +5069,8 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
       return sendError(reply, 500, error instanceof Error ? error.message : "runtime config update failed");
     }
   });
+
+  registerLocalModelRoutes(app);
 
   app.get("/api/v1/runtime/profile", async (request, reply) => {
     void reply;

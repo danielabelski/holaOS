@@ -153,6 +153,8 @@ const SUBAGENT_ONLY_BLOCKED_RUNTIME_TOOL_IDS = new Set([
   // (or block via reply_task) rather than pause for direct user
   // input. main_session keeps ask_user_question.
   "ask_user_question",
+  // Registering a model server rewrites runtime-config.json; main_session only.
+  "local_models_register",
 ]);
 const APP_BUILDER_ONLY_RUNTIME_TOOL_IDS = new Set([
   "workspace_apps_scaffold",
@@ -194,6 +196,8 @@ const MAIN_SESSION_RUNTIME_TOOL_IDS = new Set([
   "holaboss_workspace_integrations_set_default_account",
   "mcp_connect",
   "mcp_refresh",
+  "local_models_discover",
+  "local_models_register",
 ]);
 void MAIN_SESSION_RUNTIME_TOOL_IDS;
 
