@@ -1371,7 +1371,7 @@ function runtimeToolParameters(toolId: RuntimeAgentToolId): Record<string, unkno
           capability_id: {
             type: "string",
             description:
-              "The id of the capability to install. Must match the directory name under `capabilities/` and the `id` field in `capability.yaml`.",
+              "The id of the capability to install: the directory name under `capabilities/` for one you authored, or a built-in catalog id such as `local-model-review`.",
           },
         },
         required: ["capability_id"],

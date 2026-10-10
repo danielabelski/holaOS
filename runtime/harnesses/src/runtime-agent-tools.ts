@@ -283,7 +283,7 @@ export const RUNTIME_AGENT_TOOL_DEFINITIONS = [
   {
     id: "capability_install",
     description:
-      "Install a workspace-authored capability from the workspace's `capabilities/<capability_id>/` directory. Reads `capability.yaml`, registers the capability's skills and agent prompt into the workspace, and returns the installed record. Use after you have finished authoring a capability directory to activate it in the current workspace.",
+      "Install a capability into the current workspace: a workspace-authored one from `capabilities/<capability_id>/`, or otherwise a built-in one from the holaOS catalog by id (for example `local-model-review`). Copies its skills (with their helper files) into `skills/`, registers its MCP servers, and returns the installed record with integration status.",
     policy: "mutate"
   },
   {

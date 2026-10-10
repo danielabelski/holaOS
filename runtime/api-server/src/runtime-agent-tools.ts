@@ -90,7 +90,11 @@ import {
   upsertWorkspaceMcpServerEntry,
 } from "./workspace-apps.js";
 import { authorizeMcpServerViaHost } from "./mcp-authorize-host.js";
-import { installWorkspaceAuthoredCapability } from "./workspace-capabilities.js";
+import {
+  installCapability as installCatalogCapability,
+  installWorkspaceAuthoredCapability,
+  loadCapabilityCatalog,
+} from "./workspace-capabilities.js";
 import {
   INTEGRATION_CATALOG_PROVIDERS,
   integrationCatalogProviderIds,
@@ -7629,11 +7633,30 @@ export class RuntimeAgentToolsService {
     if (!capabilityId) {
       throw new RuntimeAgentToolsServiceError(400, "capability_id_required", "capabilityId is required");
     }
-    const result = await installWorkspaceAuthoredCapability({
+    const workspaceDir = this.store.workspaceDir(params.workspaceId);
+    const authoredManifest = path.join(workspaceDir, "capabilities", capabilityId, "capability.yaml");
+    if (existsSync(authoredManifest)) {
+      const result = await installWorkspaceAuthoredCapability({
+        store: this.store,
+        workspaceId: params.workspaceId,
+        workspaceDir,
+        capabilityId,
+      });
+      return result as unknown as JsonObject;
+    }
+    const builtIn = loadCapabilityCatalog().find((entry) => entry.id === capabilityId);
+    if (!builtIn) {
+      throw new RuntimeAgentToolsServiceError(
+        404,
+        "capability_not_found",
+        `no capability '${capabilityId}' in capabilities/ or the built-in catalog`,
+      );
+    }
+    const result = await installCatalogCapability({
       store: this.store,
       workspaceId: params.workspaceId,
-      workspaceDir: this.store.workspaceDir(params.workspaceId),
-      capabilityId,
+      workspaceDir,
+      capability: builtIn,
     });
     return result as unknown as JsonObject;
   }
