@@ -307,7 +307,9 @@ holaOS can use a model server that is already running on this machine or on the 
 
 ### Find and register a running server
 
-Ask the agent ("use the model I have running in LM Studio"), or call the runtime directly:
+The runtime checks the usual ports (11434, 1234, 8080, 8000, 30000) when it starts and every 30 seconds after that. A server it finds is registered automatically and its models appear in the chat model picker. When the server's model list changes, the registration is updated. To turn this off, set `"local_models": { "auto_detect": false }` in `runtime-config.json`, or set `HOLABOSS_LOCAL_MODEL_AUTODETECT=0`.
+
+For a server on another port or machine, ask the agent ("use the model I have running in LM Studio"), or call the runtime directly:
 
 ```bash
 # list servers on the usual ports (11434, 1234, 8080, 8000, 30000) with their models and context windows

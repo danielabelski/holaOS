@@ -745,6 +745,15 @@ function idSegment(value: string): string {
     .replace(/^_+|_+$/g, "");
 }
 
+export function localModelAutoDetectEnabled(): boolean {
+  const envValue = (process.env.HOLABOSS_LOCAL_MODEL_AUTODETECT ?? "").trim().toLowerCase();
+  if (envValue === "0" || envValue === "false" || envValue === "off") {
+    return false;
+  }
+  const { document } = loadRuntimeConfigDocument();
+  return asObject(document.local_models).auto_detect !== false;
+}
+
 export function isLocalModelProviderId(providerId: string): boolean {
   return providerId.trim().startsWith(LOCAL_MODEL_PROVIDER_PREFIX);
 }
