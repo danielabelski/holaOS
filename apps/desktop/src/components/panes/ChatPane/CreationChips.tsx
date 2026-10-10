@@ -56,6 +56,12 @@ const CREATION_TYPES: CreationType[] = [
     examplePrompt:
       "Put together a performance report summarizing last month's key metrics.",
   },
+  {
+    skillId: "run-model-eval",
+    label: "Model eval",
+    examplePrompt:
+      "Install the local-model-review combo, then test the model I have running locally: find it, measure its speed, run the capability spot check, and write a conclusion pack.",
+  },
 ];
 
 export function CreationChips({
