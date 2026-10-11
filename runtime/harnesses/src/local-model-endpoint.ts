@@ -69,9 +69,20 @@ export function isLocalModelEndpoint(
 const CONTEXT_OVERFLOW_PATTERN =
   /exceeds the available context size|maximum context length|context length of only|longer than the model'?s context length|context window exceeded|context_length_exceeded|n_ctx/i;
 
+const SERVED_CONTEXT_PATTERN = /context(?: size| window| length)?[^\d]{0,40}\((\d{4,7}) tokens\)|n_ctx[^\d]{0,10}(\d{4,7})/i;
+
 export function withLocalContextGuidance(message: string, providerId: string | null | undefined): string {
   if (!(providerId ?? "").trim().toLowerCase().startsWith("local_") || !CONTEXT_OVERFLOW_PATTERN.test(message)) {
     return message;
+  }
+  const servedMatch = message.match(SERVED_CONTEXT_PATTERN);
+  const served = Number(servedMatch?.[1] ?? servedMatch?.[2] ?? 0);
+  if (served >= 32768) {
+    return (
+      `${message}\n\nThis conversation has grown past the ${served.toLocaleString("en-US")}-token context the local model is serving. ` +
+      "Start a new chat, or restart the model server with a larger context if the model supports it " +
+      "(llama.cpp `-c 65536`, Ollama `OLLAMA_CONTEXT_LENGTH=65536`, LM Studio: a larger Context Length, vLLM `--max-model-len 65536`)."
+    );
   }
   return (
     `${message}\n\nThe local model's context window is too small for this conversation. ` +

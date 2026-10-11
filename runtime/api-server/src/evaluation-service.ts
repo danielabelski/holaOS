@@ -348,7 +348,7 @@ export function renderEvaluationAgentContext(params: {
     `- Question (${record.questionType.replace("_", " ")}): ${record.question}`,
     `- Status: ${record.status}`,
     runs.length > 0
-      ? `- Data files: ${path.join(params.evalDir, "data")} (read them with your file tools to find evidence)`
+      ? `- Data files: ${path.join(params.evalDir, "data")} (raw task files are large; search them for a task id instead of reading them whole)`
       : "- Nothing has run yet; there are no data files.",
     `- Analyst model: ${record.brainModel ?? params.defaultModel ?? "default"}${(record.brainModel ?? params.defaultModel ?? "").startsWith("local_") ? " (runs on this machine; speed tests wait until you are idle)" : ""}`,
     "",

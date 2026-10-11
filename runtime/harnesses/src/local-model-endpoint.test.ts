@@ -73,3 +73,11 @@ test("context overflow errors from local providers get guidance; others are unto
   assert.equal(withLocalContextGuidance(llama, "openai"), llama);
   assert.equal(withLocalContextGuidance("401 unauthorized", "local_ollama"), "401 unauthorized");
 });
+
+test("an overflow on an already large context suggests a new chat instead of -c 32768", () => {
+  const grown = "400 request (36764 tokens) exceeds the available context size (32768 tokens), try increasing it";
+  const guided = withLocalContextGuidance(grown, "local_llamacpp_1234");
+  assert.match(guided, /grown past the 32,768-token context/);
+  assert.match(guided, /Start a new chat/);
+  assert.doesNotMatch(guided, /-c 32768/);
+});
