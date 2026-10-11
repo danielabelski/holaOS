@@ -69,7 +69,7 @@ function countFiles(rootPath) {
 
 function isEmbeddedSkillSupportPath(filePath) {
   const normalized = filePath.split(path.sep).join("/");
-  return normalized.includes("/embedded-skills/");
+  return normalized.includes("/embedded-skills/") || normalized.includes("/embedded-capabilities/");
 }
 
 function shouldPruneFile(filePath) {

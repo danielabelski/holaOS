@@ -15,8 +15,23 @@ test("prunePackagedTree preserves skill markdown while pruning other markdown fi
   const skillPath = path.join(skillDir, "SKILL.md");
   const referencePath = path.join(referenceDir, "integration-backed-apps.md");
   const docsPath = path.join(docsDir, "guide.md");
+  const capabilityAssetPath = path.join(
+    root,
+    "runtime",
+    "api-server",
+    "dist",
+    "embedded-capabilities",
+    "local-model-review",
+    "skills",
+    "run-model-eval",
+    "packs",
+    "agent-v1",
+    "system-full.md",
+  );
 
   try {
+    fs.mkdirSync(path.dirname(capabilityAssetPath), { recursive: true });
+    fs.writeFileSync(capabilityAssetPath, "You are the agent.\n", "utf8");
     fs.mkdirSync(skillDir, { recursive: true });
     fs.mkdirSync(referenceDir, { recursive: true });
     fs.mkdirSync(docsDir, { recursive: true });
@@ -29,6 +44,7 @@ test("prunePackagedTree preserves skill markdown while pruning other markdown fi
 
     assert.equal(fs.existsSync(skillPath), true);
     assert.equal(fs.existsSync(referencePath), true);
+    assert.equal(fs.existsSync(capabilityAssetPath), true);
     assert.equal(fs.existsSync(readmePath), false);
     assert.equal(fs.existsSync(docsPath), false);
   } finally {
