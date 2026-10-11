@@ -54,15 +54,28 @@ Runs are long. Use `terminal_session_start` for anything over a couple of minute
 
 To compare quantizations, engines, or machines, run each with its own `--label` into the same run directory.
 
-## 5. Read the results properly
+## 5. Agent fitness
+
+When the user wants to know whether the model can run as the holaOS agent itself:
+
+```bash
+python3 skills/run-model-eval/holaeval.py agent --base-url <url> --model <id> --out <run_dir> --label <label> --samples 1
+python3 skills/run-model-eval/holaeval.py chart --dir <run_dir> --kind agent --title "<model>: holaOS agent fitness"
+```
+
+`packs/agent-v1.json` runs 8 multi-turn tasks (read a value, edit JSON, count rows, create a file, pick web search, answer without tools, ask when the request is ambiguous, strict output format) against a simulated workspace: files live in memory and no real command runs. Each task runs twice: `full` sends the real holaOS system prompt and tool list (about 15K tokens before the task), `lean` sends 8 core tools and a short prompt. If the context window cannot hold the full request, `full` is skipped and the summary says why. Results go to `agent-tasks-<label>.jsonl` and `agent-summary-<label>.json`; `tables` adds an "Agent fitness" section.
+
+The gap between `full` and `lean` is the finding: it shows whether the model fails at agent work or only at the size of the holaOS request. "tool call written as text" means the model wrote the call into its reply instead of using the tool-calling protocol; check the engine's chat template before blaming the model.
+
+## 6. Read the results properly
 
 ```bash
 python3 skills/run-model-eval/holaeval.py tables --dir <run_dir>
 ```
 
-A pass rate alone is not a finding. For every failed task, open `<run_dir>/tasks-<label>.jsonl` and read the actual output (`content`, `reasoning`, `tool_calls`, `finish_reason`, `reason`). Name the cause: wrong answer, broken format, ran out of tokens while thinking, right tool with a wrongly formatted argument, prompt truncated by the server, request error.
+A pass rate alone is not a finding. For every failed task, open `<run_dir>/tasks-<label>.jsonl` (or `agent-tasks-<label>.jsonl`) and read the actual output (`content`, `reasoning`, `tool_calls`, `finish_reason`, `reason`). Name the cause: wrong answer, broken format, ran out of tokens while thinking, right tool with a wrongly formatted argument, prompt truncated by the server, request error.
 
-## 6. Follow up on anything surprising
+## 7. Follow up on anything surprising
 
 The most useful findings usually come from a second, targeted run. When something looks off, design a small experiment that changes one variable, write it as a custom pack in the run directory (same JSON shape as `packs/general-v1.json`; tasks may set `system`), and run it with a new `--label`. Examples:
 
@@ -72,6 +85,6 @@ The most useful findings usually come from a second, targeted run. When somethin
 
 Use enough samples to say something (10 is a good default for a yes/no behavior) and report both conditions.
 
-## 7. Hand off
+## 8. Hand off
 
 When the numbers are in, continue with the `write-conclusion-pack` skill. Stop any terminal sessions you started.

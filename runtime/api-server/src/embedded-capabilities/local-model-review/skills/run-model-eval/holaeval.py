@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """Evaluate an OpenAI-compatible model server that is already running.
 
-Subcommands: probe, speed, run, tables, chart, selftest. Standard library only.
+Subcommands: probe, speed, run, agent, tables, chart, selftest. Standard library only.
 """
 
 import argparse
+import fnmatch
 import hashlib
 import json
 import os
 import platform
 import random
 import re
+import shlex
 import shutil
 import statistics
 import subprocess
@@ -621,7 +623,1095 @@ def cmd_speed(args):
          "reps": args.reps, "context_window": ctx_window, "depths": rows, "concurrency": conc}, indent=2))
 
 
+# ---------- agent: virtual workspace ----------
+
+DEFAULT_AGENT_PACK = HERE / "packs" / "agent-v1.json"
+
+
+class VFS:
+    """In-memory workspace. Nothing here touches the real filesystem."""
+
+    def __init__(self, files=None, root="/workspace"):
+        self.root = "/" + root.strip("/")
+        self.files = {}
+        self.dirs = {"/"}
+        self._add_dirs(self.root)
+        for rel, content in (files or {}).items():
+            path = self.resolve(rel)
+            if rel.endswith("/") or content is None:
+                self.mkdir(path, parents=True)
+            else:
+                self.write(path, content)
+        self.initial = dict(self.files)
+        self.initial_dirs = set(self.dirs)
+
+    def resolve(self, path, cwd=None):
+        path = str(path if path is not None else ".").strip() or "."
+        if path == "~" or path.startswith("~/"):
+            path = self.root + path[1:]
+        if not path.startswith("/"):
+            path = (cwd or self.root) + "/" + path
+        parts = []
+        for p in path.split("/"):
+            if p in ("", "."):
+                continue
+            if p == "..":
+                if parts:
+                    parts.pop()
+                continue
+            parts.append(p)
+        return "/" + "/".join(parts)
+
+    def _add_dirs(self, path):
+        while path not in ("", "/"):
+            self.dirs.add(path)
+            path = path.rsplit("/", 1)[0]
+
+    @staticmethod
+    def parent(path):
+        return path.rsplit("/", 1)[0] or "/"
+
+    def isdir(self, path):
+        return path in self.dirs
+
+    def isfile(self, path):
+        return path in self.files
+
+    def read(self, path):
+        if path in self.files:
+            return self.files[path]
+        if path in self.dirs:
+            raise IsADirectoryError(path)
+        raise FileNotFoundError(path)
+
+    def write(self, path, content, append=False, parents=True):
+        if path in self.dirs:
+            raise IsADirectoryError(path)
+        if not parents and self.parent(path) not in self.dirs:
+            raise FileNotFoundError(self.parent(path))
+        self._add_dirs(self.parent(path))
+        self.files[path] = (self.files.get(path, "") if append else "") + content
+
+    def mkdir(self, path, parents=False):
+        if path in self.files:
+            raise FileExistsError(path)
+        if not parents and self.parent(path) not in self.dirs:
+            raise FileNotFoundError(self.parent(path))
+        self._add_dirs(path)
+
+    def listdir(self, path):
+        names = {(p[len(path.rstrip("/")) + 1:], True) for p in self.dirs if p != path and self.parent(p) == path}
+        names |= {(p[len(path.rstrip("/")) + 1:], False) for p in self.files if self.parent(p) == path}
+        return sorted(names)
+
+    def walk(self, path):
+        prefix = path.rstrip("/") + "/"
+        return sorted([(p, True) for p in self.dirs if p.startswith(prefix)] + [(p, False) for p in self.files if p.startswith(prefix)])
+
+    def rel(self, path):
+        if path == self.root:
+            return "."
+        return path[len(self.root) + 1:] if path.startswith(self.root + "/") else path
+
+    def changes(self):
+        out = {self.rel(p): c for p, c in self.files.items() if self.initial.get(p) != c}
+        out.update({self.rel(p): None for p in self.initial if p not in self.files})
+        return out
+
+    def changed(self):
+        return bool(self.changes()) or self.dirs != self.initial_dirs
+
+
+# ---------- agent: bash simulator ----------
+
+HEREDOC_RE = re.compile(r"(?<!<)<<(?!<)(-?)\s*(['\"]?)([A-Za-z_]\w*)\2")
+BASH_MUTATING_RE = re.compile(r"(^|[\s;&|(])(mv|rm|cp|tee|touch|mkdir|rmdir|truncate|dd|ln|chmod|install|rename)\b"
+                              r"|\bsed\s+(-\w+\s+)*-i|\bperl\s+-\w*i|>")
+
+
+def bash_mutates(command):
+    cleaned = re.sub(r"'[^']*'|\"[^\"]*\"", "''", command)
+    cleaned = re.sub(r"\d?>&\d|&?\d?>\s*/dev/null", " ", cleaned)
+    return bool(BASH_MUTATING_RE.search(cleaned))
+
+
+def extract_heredocs(command):
+    lines = command.split("\n")
+    out, bodies = [], []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        i += 1
+        pending = []
+
+        def repl(m):
+            pending.append((m.group(3), m.group(1) == "-"))
+            bodies.append("")
+            return f" < __HEREDOC{len(bodies) - 1}__ "
+
+        line = HEREDOC_RE.sub(repl, line)
+        first = len(bodies) - len(pending)
+        for k, (delim, strip_tabs) in enumerate(pending):
+            body = []
+            while i < len(lines) and lines[i].strip() != delim:
+                body.append(lines[i].lstrip("\t") if strip_tabs else lines[i])
+                i += 1
+            i += 1
+            bodies[first + k] = "\n".join(body) + ("\n" if body else "")
+        out.append(line)
+    return "\n".join(out), bodies
+
+
+def bash_tokens(script):
+    lexer = shlex.shlex(script, posix=True, punctuation_chars=";&|<>\n")
+    lexer.whitespace = " \t\r"
+    lexer.whitespace_split = True
+    tokens = []
+    for tok in lexer:
+        if tok and set(tok) <= set(";&|<>\n") and "\n" in tok:
+            tok = tok.replace("\n", "") or ";"
+        tokens.append(tok)
+    return tokens
+
+
+def bre_to_python(pattern):
+    out, i = [], 0
+    while i < len(pattern):
+        ch = pattern[i]
+        if ch == "\\" and i + 1 < len(pattern) and pattern[i + 1] in "|()+?{}":
+            out.append(pattern[i + 1])
+            i += 2
+            continue
+        out.append("\\" + ch if ch in "|()+?{}" else ch)
+        if ch == "\\" and i + 1 < len(pattern):
+            out.append(pattern[i + 1])
+            i += 1
+        i += 1
+    return "".join(out)
+
+
+class BashSim:
+    """A tiny shell over the VFS: ls, cat, head, tail, wc, grep, find, sort, echo, printf, mkdir, touch, cd, pwd."""
+
+    def __init__(self, vfs):
+        self.vfs = vfs
+        self.cwd = vfs.root
+
+    def run(self, command):
+        script, heredocs = extract_heredocs(command)
+        script = re.sub(r"(?<![\w-])\d?>&\d", " ", script)
+        script = re.sub(r"(?<![\w-])2>>?\s*[^\s;&|<>]+", " ", script)
+        script = script.replace("&>", ">")
+        if "$(" in script or "`" in script:
+            return "bash: command substitution is not available in this sandbox\n", 1
+        try:
+            tokens = bash_tokens(script)
+        except ValueError as exc:
+            return f"bash: syntax error: {exc}\n", 2
+        output, code, op, current = [], 0, None, []
+        for tok in tokens + [";"]:
+            if tok in (";", "&&", "||", ";;", "&"):
+                if current:
+                    if not (op == "&&" and code != 0) and not (op == "||" and code == 0):
+                        out, code = self.pipeline(current, heredocs)
+                        output.append(out)
+                    op = tok if tok in ("&&", "||") else None
+                    current = []
+                continue
+            current.append(tok)
+        return "".join(output), code
+
+    def pipeline(self, tokens, heredocs):
+        stages, cur = [], []
+        for tok in tokens:
+            if tok == "|":
+                stages.append(cur)
+                cur = []
+            else:
+                cur.append(tok)
+        stages.append(cur)
+        stdin, errors, code, out = None, [], 0, ""
+        for stage in stages:
+            argv, target, append, src, err = [], None, False, None, None
+            i = 0
+            while i < len(stage):
+                tok = stage[i]
+                if tok in (">", ">>", ">|") and i + 1 < len(stage):
+                    target, append = stage[i + 1], tok == ">>"
+                    i += 2
+                    continue
+                if tok == "<" and i + 1 < len(stage):
+                    m = re.fullmatch(r"__HEREDOC(\d+)__", stage[i + 1])
+                    if m:
+                        src = heredocs[int(m.group(1))]
+                    else:
+                        try:
+                            src = self.vfs.read(self.vfs.resolve(stage[i + 1], self.cwd))
+                        except (FileNotFoundError, IsADirectoryError):
+                            err = f"bash: {stage[i + 1]}: No such file or directory\n"
+                    i += 2
+                    continue
+                argv.append(tok)
+                i += 1
+            if err:
+                errors.append(err)
+                code, out = 1, ""
+            elif not argv:
+                out, code = (src or ""), 0
+            else:
+                out, e, code = self.exec(argv, src if src is not None else stdin)
+                if e:
+                    errors.append(e)
+            if target is not None:
+                if target != "/dev/null":
+                    path = self.vfs.resolve(target, self.cwd)
+                    try:
+                        self.vfs.write(path, out, append=append, parents=False)
+                    except (FileNotFoundError, IsADirectoryError):
+                        errors.append(f"bash: {target}: No such file or directory\n")
+                        code = 1
+                out = ""
+            stdin = out
+        return out + "".join(errors), code
+
+    def expand(self, args):
+        out = []
+        for a in args:
+            if any(c in a for c in "*?[") and not a.startswith("-"):
+                base = self.vfs.resolve(".", self.cwd)
+                pattern = self.vfs.resolve(a, self.cwd)
+                hits = sorted(p for p, _ in self.vfs.walk("/") if fnmatch_path(p, pattern))
+                if hits:
+                    out += [p[len(base) + 1:] if not a.startswith("/") and p.startswith(base + "/") else p for p in hits]
+                    continue
+            out.append(a)
+        return out
+
+    def _read_inputs(self, files, stdin, cmd):
+        if not files:
+            return [(None, stdin or "")], ""
+        items, errs = [], ""
+        for f in files:
+            if f == "-":
+                items.append((None, stdin or ""))
+                continue
+            try:
+                items.append((f, self.vfs.read(self.vfs.resolve(f, self.cwd))))
+            except IsADirectoryError:
+                errs += f"{cmd}: {f}: Is a directory\n"
+            except FileNotFoundError:
+                errs += f"{cmd}: {f}: No such file or directory\n"
+        return items, errs
+
+    def exec(self, argv, stdin):
+        cmd, args = argv[0], argv[1:]
+        handler = getattr(self, "cmd_" + cmd.replace("-", "_"), None) if re.fullmatch(r"[a-z]+", cmd) else None
+        if cmd in (":", "true"):
+            return "", "", 0
+        if cmd == "false":
+            return "", "", 1
+        if handler is None:
+            return "", f"bash: {cmd}: command not available in this sandbox\n", 127
+        return handler(args, stdin)
+
+    def cmd_pwd(self, args, stdin):
+        return self.cwd + "\n", "", 0
+
+    def cmd_cd(self, args, stdin):
+        path = self.vfs.resolve(args[0] if args else self.vfs.root, self.cwd)
+        if not self.vfs.isdir(path):
+            return "", f"bash: cd: {args[0]}: No such file or directory\n", 1
+        self.cwd = path
+        return "", "", 0
+
+    def cmd_echo(self, args, stdin):
+        newline, escapes = True, False
+        while args and re.fullmatch(r"-[neE]+", args[0]):
+            newline = newline and "n" not in args[0]
+            escapes = escapes or "e" in args[0]
+            args = args[1:]
+        text = " ".join(args)
+        if escapes:
+            text = text.replace("\\n", "\n").replace("\\t", "\t")
+        return text + ("\n" if newline else ""), "", 0
+
+    def cmd_printf(self, args, stdin):
+        if not args:
+            return "", "printf: usage: printf format [arguments]\n", 2
+        fmt = args[0].replace("\\n", "\n").replace("\\t", "\t").replace("\\\\", "\\")
+        rest = args[1:]
+        slots = len(re.findall(r"%[sd]", fmt))
+        if not slots or not rest:
+            return re.sub(r"%[sd]", "", fmt).replace("%%", "%"), "", 0
+        out = []
+        for i in range(0, len(rest), slots):
+            chunk = iter(rest[i:i + slots])
+            out.append(re.sub(r"%[sd]", lambda _: next(chunk, ""), fmt).replace("%%", "%"))
+        return "".join(out), "", 0
+
+    def cmd_cat(self, args, stdin):
+        number = "-n" in args
+        items, errs = self._read_inputs(self.expand([a for a in args if not a.startswith("-") or a == "-"]), stdin, "cat")
+        text = "".join(c for _, c in items)
+        if number:
+            text = "".join(f"{i:>6}\t{line}\n" for i, line in enumerate(text.splitlines(), 1))
+        return text, errs, 1 if errs else 0
+
+    def _head_tail(self, args, stdin, cmd):
+        n, files, i, from_start = 10, [], 0, False
+        while i < len(args):
+            a = args[i]
+            if a == "-n" and i + 1 < len(args):
+                a = "-n" + args[i + 1]
+                i += 1
+            if re.fullmatch(r"-n?\+?\d+", a):
+                n = int(re.sub(r"\D", "", a))
+                from_start = "+" in a
+            elif not a.startswith("-") or a == "-":
+                files.append(a)
+            i += 1
+        items, errs = self._read_inputs(self.expand(files), stdin, cmd)
+        out = []
+        for name, content in items:
+            lines = content.splitlines(keepends=True)
+            if len(items) > 1:
+                out.append(f"==> {name} <==\n")
+            out.append("".join(lines[:n] if cmd == "head" else lines[max(n - 1, 0):] if from_start else lines[-n:] if n else []))
+        return "".join(out), errs, 1 if errs else 0
+
+    def cmd_head(self, args, stdin):
+        return self._head_tail(args, stdin, "head")
+
+    def cmd_tail(self, args, stdin):
+        return self._head_tail(args, stdin, "tail")
+
+    def cmd_wc(self, args, stdin):
+        flags = "".join(a[1:] for a in args if a.startswith("-") and a != "-")
+        modes = [m for m in "lwc" if m in flags] or ["l", "w", "c"]
+        items, errs = self._read_inputs(self.expand([a for a in args if not a.startswith("-") or a == "-"]), stdin, "wc")
+        rows, total = [], [0, 0, 0]
+        for name, content in items:
+            counts = [content.count("\n"), len(content.split()), len(content.encode())]
+            total = [a + b for a, b in zip(total, counts)]
+            vals = [counts["lwc".index(m)] for m in modes]
+            rows.append(" ".join(str(v) for v in vals) + (f" {name}" if name else ""))
+        if len(items) > 1:
+            rows.append(" ".join(str(total["lwc".index(m)]) for m in modes) + " total")
+        return "\n".join(rows) + "\n", errs, 1 if errs else 0
+
+    def cmd_grep(self, args, stdin):
+        flags, pattern, files, i = set(), None, [], 0
+        while i < len(args):
+            a = args[i]
+            if a == "-e" and i + 1 < len(args):
+                pattern = args[i + 1]
+                i += 2
+                continue
+            if a in ("-A", "-B", "-C", "-m"):
+                i += 2
+                continue
+            if a.startswith("--"):
+                flags.add({"--recursive": "r", "--ignore-case": "i", "--count": "c", "--line-number": "n"}.get(a, ""))
+            elif a.startswith("-") and len(a) > 1:
+                flags |= set(a[1:])
+            elif pattern is None:
+                pattern = a
+            else:
+                files.append(a)
+            i += 1
+        if pattern is None:
+            return "", "usage: grep [-icnrlvEFw] pattern [file ...]\n", 2
+        if "F" in flags:
+            regex = re.escape(pattern)
+        elif "E" in flags:
+            regex = pattern
+        else:
+            regex = bre_to_python(pattern)
+        if "w" in flags:
+            regex = rf"\b(?:{regex})\b"
+        try:
+            rx = re.compile(regex, re.I if "i" in flags else 0)
+        except re.error:
+            rx = re.compile(re.escape(pattern), re.I if "i" in flags else 0)
+        recursive = bool(flags & {"r", "R"})
+        files = self.expand(files) or (["."] if recursive else [])
+        targets, errs = [], ""
+        for f in files:
+            path = self.vfs.resolve(f, self.cwd)
+            if self.vfs.isdir(path):
+                if not recursive:
+                    errs += f"grep: {f}: Is a directory\n"
+                    continue
+                for p, is_dir in self.vfs.walk(path):
+                    if not is_dir:
+                        shown = p[len(path.rstrip("/")) + 1:]
+                        targets.append(((f.rstrip("/") + "/" + shown) if f not in (".", "./") else shown, self.vfs.files[p]))
+            elif self.vfs.isfile(path):
+                targets.append((f, self.vfs.files[path]))
+            else:
+                errs += f"grep: {f}: No such file or directory\n"
+        if not files:
+            targets = [(None, stdin or "")]
+        show_name = (len(targets) > 1 or recursive) and "h" not in flags
+        out, matched = [], False
+        for name, content in targets:
+            hits = [(n, line) for n, line in enumerate(content.splitlines(), 1) if bool(rx.search(line)) != ("v" in flags)]
+            matched = matched or bool(hits)
+            if "l" in flags:
+                if hits:
+                    out.append(f"{name}\n")
+            elif "c" in flags:
+                out.append((f"{name}:" if show_name else "") + f"{len(hits)}\n")
+            else:
+                for n, line in hits:
+                    out.append((f"{name}:" if show_name else "") + (f"{n}:" if "n" in flags else "") + line + "\n")
+        return "".join(out), errs, 0 if matched else (2 if errs else 1)
+
+    def cmd_ls(self, args, stdin):
+        flags = "".join(a[1:] for a in args if a.startswith("-"))
+        paths = self.expand([a for a in args if not a.startswith("-")]) or ["."]
+        loose, out, errs = [], [], ""
+        for p in paths:
+            path = self.vfs.resolve(p, self.cwd)
+            if self.vfs.isfile(path):
+                loose.append((p, False))
+            elif self.vfs.isdir(path):
+                out.append((p, [(n, d) for n, d in self.vfs.listdir(path)]))
+            else:
+                errs += f"ls: {p}: No such file or directory\n"
+        if loose:
+            out.insert(0, (None, loose))
+        groups = []
+        for header, entries in out:
+            text = [f"{header}:\n"] if len(out) > 1 and header is not None else []
+            for name, is_dir in entries:
+                if "l" in flags:
+                    full = self.vfs.resolve(name if header is None else header + "/" + name, self.cwd)
+                    size = 64 if is_dir else len(self.vfs.files.get(full, "").encode())
+                    text.append(f"{'d' if is_dir else '-'}rw-r--r--  1 user  staff  {size:>6}  {name}\n")
+                else:
+                    text.append(name + ("/" if is_dir and "F" in flags else "") + "\n")
+            groups.append("".join(text))
+        return "\n".join(groups), errs, 1 if errs else 0
+
+    def cmd_find(self, args, stdin):
+        starts, i, ftype, name, iname, maxdepth = [], 0, None, None, None, None
+        while i < len(args) and not args[i].startswith("-"):
+            starts.append(args[i])
+            i += 1
+        while i < len(args):
+            a = args[i]
+            val = args[i + 1] if i + 1 < len(args) else ""
+            if a == "-type":
+                ftype = val
+            elif a == "-name":
+                name = val
+            elif a == "-iname":
+                iname = val
+            elif a in ("-maxdepth", "-depth") and val.isdigit():
+                maxdepth = int(val)
+            elif a in ("-print", "-print0"):
+                i += 1
+                continue
+            else:
+                return "", f"find: {a}: unsupported option in this sandbox\n", 1
+            i += 2
+        out, errs = [], ""
+        for s in starts or ["."]:
+            path = self.vfs.resolve(s, self.cwd)
+            if not self.vfs.isdir(path) and not self.vfs.isfile(path):
+                errs += f"find: {s}: No such file or directory\n"
+                continue
+            entries = [(path, self.vfs.isdir(path))] + (self.vfs.walk(path) if self.vfs.isdir(path) else [])
+            for p, is_dir in entries:
+                depth = 0 if p == path else p[len(path.rstrip("/")) + 1:].count("/") + 1
+                base = p.rsplit("/", 1)[-1]
+                if maxdepth is not None and depth > maxdepth:
+                    continue
+                if ftype and (ftype == "f") == is_dir:
+                    continue
+                if name and not fnmatch.fnmatchcase(base, name):
+                    continue
+                if iname and not fnmatch.fnmatch(base.lower(), iname.lower()):
+                    continue
+                out.append(s.rstrip("/") + p[len(path):] if p != path else s)
+        return "".join(o + "\n" for o in out), errs, 1 if errs else 0
+
+    def cmd_sort(self, args, stdin):
+        flags = "".join(a[1:] for a in args if a.startswith("-"))
+        items, errs = self._read_inputs(self.expand([a for a in args if not a.startswith("-")]), stdin, "sort")
+        lines = "".join(c for _, c in items).splitlines()
+        key = (lambda s: float(re.match(r"\s*(-?\d+(\.\d+)?)", s).group(1)) if re.match(r"\s*-?\d", s) else 0.0) if "n" in flags else None
+        lines = sorted(lines, key=key, reverse="r" in flags)
+        return "".join(line + "\n" for line in lines), errs, 1 if errs else 0
+
+    def cmd_mkdir(self, args, stdin):
+        parents = any(a.startswith("-") and "p" in a for a in args)
+        errs = ""
+        for d in [a for a in args if not a.startswith("-")]:
+            path = self.vfs.resolve(d, self.cwd)
+            if self.vfs.isdir(path):
+                if not parents:
+                    errs += f"mkdir: {d}: File exists\n"
+                continue
+            try:
+                self.vfs.mkdir(path, parents=parents)
+            except (FileNotFoundError, FileExistsError):
+                errs += f"mkdir: {d}: No such file or directory\n"
+        return "", errs, 1 if errs else 0
+
+    def cmd_touch(self, args, stdin):
+        errs = ""
+        for f in [a for a in args if not a.startswith("-")]:
+            path = self.vfs.resolve(f, self.cwd)
+            if not self.vfs.isfile(path):
+                try:
+                    self.vfs.write(path, "", parents=False)
+                except (FileNotFoundError, IsADirectoryError):
+                    errs += f"touch: {f}: No such file or directory\n"
+        return "", errs, 1 if errs else 0
+
+
+def fnmatch_path(path, pattern):
+    return fnmatch.fnmatchcase(path, pattern) and path.count("/") == pattern.count("/")
+
+
+# ---------- agent: tools ----------
+
+def _int_arg(value, default=None):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def tool_read(vfs, a):
+    path = a.get("path")
+    if not isinstance(path, str) or not path.strip():
+        return "Error: path is required.", True
+    p = vfs.resolve(path)
+    if vfs.isdir(p):
+        entries = vfs.listdir(p)
+        return "\n".join(f"{i}. {n}{'/' if d else ''}" for i, (n, d) in enumerate(entries, 1)) or "(empty directory)", False
+    if not vfs.isfile(p):
+        return f"Error: File not found: {path}", True
+    lines = vfs.files[p].split("\n")
+    start = max(_int_arg(a.get("offset"), 1) or 1, 1) - 1
+    limit = _int_arg(a.get("limit"))
+    chunk = lines[start:start + limit] if limit else lines[start:]
+    return "\n".join(chunk), False
+
+
+def tool_write(vfs, a):
+    path, content = a.get("path"), a.get("content")
+    if not isinstance(path, str) or not isinstance(content, str):
+        return "Error: path and content are required.", True
+    vfs.write(vfs.resolve(path), content)
+    return f"Successfully wrote {len(content.encode())} bytes to {path}", False
+
+
+def tool_edit(vfs, a):
+    path, edits = a.get("path"), a.get("edits")
+    if isinstance(edits, str):
+        try:
+            edits = json.loads(edits)
+        except json.JSONDecodeError:
+            edits = None
+    if not isinstance(path, str) or not isinstance(edits, list) or not edits:
+        return "Error: Edit tool input is invalid. edits must contain at least one replacement.", True
+    p = vfs.resolve(path)
+    if not vfs.isfile(p):
+        return f"Error: Could not edit file: {path}. File not found.", True
+    original = vfs.files[p]
+    spans = []
+    for i, e in enumerate(edits):
+        if not isinstance(e, dict) or not isinstance(e.get("oldText"), str) or not isinstance(e.get("newText"), str) or not e["oldText"]:
+            return f"Error: Edit tool input is invalid. edits[{i}] needs non-empty oldText and newText.", True
+        count = original.count(e["oldText"])
+        if count != 1:
+            why = "was not found in the file" if count == 0 else f"matches {count} places; include more context so it is unique"
+            return f"Error: Could not edit file: {path}. edits[{i}].oldText {why}.", True
+        start = original.index(e["oldText"])
+        spans.append((start, start + len(e["oldText"]), e["newText"], i))
+    spans.sort()
+    for prev, cur in zip(spans, spans[1:]):
+        if cur[0] < prev[1]:
+            return f"Error: edits[{prev[3]}] and edits[{cur[3]}] overlap in {path}. Merge them into one edit.", True
+    out, pos = [], 0
+    for start, end, new, _ in spans:
+        out.append(original[pos:start] + new)
+        pos = end
+    vfs.write(p, "".join(out) + original[pos:])
+    return f"Successfully replaced {len(spans)} block(s) in {path}.", False
+
+
+def tool_ls(vfs, a):
+    path = a.get("path") or "."
+    p = vfs.resolve(path)
+    if vfs.isfile(p):
+        return p.rsplit("/", 1)[-1], False
+    if not vfs.isdir(p):
+        return f"Error: Path not found: {path}", True
+    limit = _int_arg(a.get("limit"), 500) or 500
+    entries = [n + ("/" if d else "") for n, d in vfs.listdir(p)][:limit]
+    return "\n".join(entries) or "(empty directory)", False
+
+
+def _scope_paths(vfs, scope):
+    scope = re.sub(r":\d+(-\d+)?$", "", str(scope or "."))
+    p = vfs.resolve(scope)
+    if vfs.isfile(p):
+        return [p]
+    if vfs.isdir(p):
+        return [q for q, d in vfs.walk(p) if not d]
+    pattern = vfs.resolve(scope)
+    return [q for q in vfs.files if fnmatch.fnmatchcase(q, pattern) or fnmatch.fnmatchcase(q.rsplit("/", 1)[-1], scope)]
+
+
+def tool_search(vfs, a):
+    pattern = a.get("pattern")
+    if not isinstance(pattern, str) or not pattern:
+        return "Error: pattern is required.", True
+    flags = re.I if a.get("i") else 0
+    try:
+        rx = re.compile(pattern, flags)
+    except re.error:
+        rx = re.compile(re.escape(pattern), flags)
+    scopes = a.get("paths") if isinstance(a.get("paths"), list) and a.get("paths") else [a.get("path") or "."]
+    files = sorted({f for s in scopes for f in _scope_paths(vfs, s)})
+    out = []
+    for f in files:
+        hits = [(n, line) for n, line in enumerate(vfs.files[f].split("\n"), 1) if rx.search(line)]
+        if hits:
+            out.append(vfs.rel(f))
+            out += [f"  {n}: {line[:500]}" for n, line in hits]
+    return "\n".join(out) or "No matches found.", False
+
+
+def tool_find(vfs, a):
+    entries = a.get("paths") if isinstance(a.get("paths"), list) and a.get("paths") else [a.get("pattern") or "."]
+    base = vfs.resolve(a.get("path") or ".")
+    found = set()
+    for e in entries:
+        e = str(e)
+        if any(c in e for c in "*?["):
+            pattern = vfs.resolve(e, base)
+            for q, d in vfs.walk(base):
+                if fnmatch.fnmatchcase(q, pattern) or ("/" not in e and fnmatch.fnmatchcase(q.rsplit("/", 1)[-1], e)):
+                    found.add(vfs.rel(q) + ("/" if d else ""))
+        else:
+            p = vfs.resolve(e, base)
+            if vfs.isfile(p):
+                found.add(vfs.rel(p))
+            elif vfs.isdir(p):
+                found |= {vfs.rel(q) + ("/" if d else "") for q, d in vfs.walk(p)}
+    limit = max(1, min(_int_arg(a.get("limit"), 200) or 200, 200))
+    return "\n".join(sorted(found)[:limit]) or "No files found.", False
+
+
+def tool_bash(vfs, a):
+    command = a.get("command")
+    if not isinstance(command, str) or not command.strip():
+        return "Error: command is required.", True
+    out, code = BashSim(vfs).run(command)
+    text = out if out else "(no output)"
+    if code:
+        text = text.rstrip("\n") + f"\n\nCommand exited with code {code}"
+    return text, bool(code)
+
+
+def tool_search_web(vfs, a):
+    query = a.get("query")
+    if not isinstance(query, str) or not query.strip():
+        return "Error: query is required.", True
+    results = getattr(vfs, "web_results", None) or [
+        {"title": f"{query} ({kind})", "url": f"https://example.com/{kind}", "snippet": f"Simulated search result for: {query}."}
+        for kind in ("overview", "news", "reference")]
+    return json.dumps({"query": query, "results": results}), False
+
+
+AGENT_TOOL_IMPL = {
+    "read": tool_read, "write": tool_write, "edit": tool_edit, "ls": tool_ls, "list": tool_ls,
+    "search": tool_search, "grep": tool_search, "find": tool_find, "bash": tool_bash,
+    "search_web": tool_search_web, "web_search": tool_search_web,
+    "ask_user_question": lambda vfs, a: ("The user did not answer.", False),
+}
+
+
+def execute_tool(vfs, name, args, available):
+    if name not in available:
+        return f"Error: Tool {name} not found.", True
+    impl = AGENT_TOOL_IMPL.get(name)
+    if impl is None:
+        return json.dumps({"ok": True, "results": []}), False
+    try:
+        return impl(vfs, args)
+    except Exception as exc:
+        return f"Error: {exc!r}", True
+
+
+# ---------- agent: loop and grading ----------
+
+TEXT_TOOL_CALL_RE = re.compile(r"<tool_call>|</tool_call>|<function[=\s>]|\[TOOL_CALLS\]|<\|tool_call|<\|python_tag\|>|<tool_use>|<invoke\b")
+
+
+def looks_like_text_tool_call(text, tool_names):
+    if not text:
+        return False
+    if TEXT_TOOL_CALL_RE.search(text):
+        return True
+    named = re.findall(r'"(?:name|tool|tool_name|function)"\s*:\s*"([\w.-]+)"', text)
+    return any(n in tool_names for n in named) and bool(re.search(r'"(?:arguments|parameters|args|input)"\s*:', text))
+
+
+def parse_tool_args(raw):
+    if isinstance(raw, dict):
+        return raw, False
+    if raw in (None, ""):
+        return {}, False
+    try:
+        val = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return None, True
+    return (val, False) if isinstance(val, dict) else (None, True)
+
+
+def numbers_in(text):
+    return [n.replace(",", "") for n in re.findall(r"(?<![\w.])-?\d[\d,]*(?:\.\d+)?(?![\w])", text or "")]
+
+
+def check_agent_grader(g, rec, vfs):
+    calls = rec["tool_calls"]
+    names = [c["name"] for c in calls]
+    final = rec.get("final_answer") or ""
+    if g.get("no_tool_calls") and calls:
+        return f"called a tool when none was needed ({names[0]})"
+    if "tools_used_any" in g and not any(c["name"] in g["tools_used_any"] and not c["error"] for c in calls):
+        return "answered without using " + "/".join(g["tools_used_any"])
+    for n in g.get("tools_not_used") or []:
+        if n in names:
+            return f"used {n}"
+    if g.get("no_mutation"):
+        for c in calls:
+            cargs = c.get("arguments") if isinstance(c.get("arguments"), dict) else {}
+            if c["name"] in ("edit", "write") or (c["name"] == "bash" and bash_mutates(str(cargs.get("command", "")))):
+                return f"tried to change files without asking ({c['name']})"
+        if vfs.changed():
+            return "changed files without asking"
+    if g.get("asks_user") and "ask_user_question" not in names:
+        return "asked in plain text instead of ask_user_question" if "?" in final else "did not ask the user"
+    spec = g.get("tool_call")
+    if spec:
+        matching = [c for c in calls if c["name"] == spec["name"]]
+        if not matching:
+            return f"never called {spec['name']}"
+        values = [str((c.get("arguments") or {}).get(spec["arg"], "") if isinstance(c.get("arguments"), dict) else "") for c in matching]
+        if not any(any(k.lower() in v.lower() for k in spec.get("contains_any_ci", [""])) for v in values):
+            return f"{spec['name']} {spec['arg']}={values[0]!r} is not relevant"
+    spec = g.get("file_json")
+    if spec:
+        path = vfs.resolve(spec["path"])
+        if not vfs.isfile(path):
+            return f"{spec['path']} missing"
+        try:
+            obj = json.loads(vfs.files[path])
+        except json.JSONDecodeError:
+            return f"{spec['path']} is no longer valid JSON"
+        if obj != spec["equals"]:
+            if not isinstance(obj, dict):
+                return f"{spec['path']} is not a JSON object"
+            for k, v in spec["equals"].items():
+                if k not in obj:
+                    return f"{k} was removed"
+                if obj[k] != v:
+                    return f"{k}={obj[k]!r}, expected {v!r}"
+            return f"unexpected keys {sorted(set(obj) - set(spec['equals']))}"
+    spec = g.get("file_bullets")
+    if spec:
+        path = vfs.resolve(spec["path"])
+        if not vfs.isfile(path):
+            return f"{spec['path']} not created"
+        bullets = [ln.strip() for ln in vfs.files[path].splitlines() if re.match(r"\s*[-*+]\s", ln)]
+        for item in spec["items"]:
+            if not any(item in b for b in bullets):
+                return f"{spec['path']} has no bullet for {item}"
+        for item in spec.get("exclude") or []:
+            if any(item in b for b in bullets):
+                return f"{spec['path']} lists {item}"
+    if "answer_contains" in g and g["answer_contains"].lower() not in final.lower():
+        return f"answer missing {g['answer_contains']!r}"
+    for bad in g.get("answer_excludes") or []:
+        if bad.lower() in final.lower():
+            return f"answer also mentions {bad!r}"
+    if "answer_number" in g:
+        nums = numbers_in(final)
+        if not nums:
+            return "no number in answer"
+        if not any(n == str(g["answer_number"]) or (n.replace(".", "", 1).isdigit() and float(n) == g["answer_number"]) for n in nums):
+            return f"answered {', '.join(nums[:3])}, expected {g['answer_number']}"
+    spec = g.get("answer_json_array")
+    if spec:
+        raw = final.strip()
+        if spec.get("no_fence") and raw.startswith("```"):
+            return "wrapped in a code fence"
+        try:
+            arr = json.loads(raw)
+        except json.JSONDecodeError:
+            return "not valid JSON" if raw.startswith("[") else "not only a JSON array"
+        if not isinstance(arr, list) or not all(isinstance(x, str) for x in arr):
+            return "not a JSON array of strings"
+        got = sorted(x.rstrip("/").rsplit("/", 1)[-1] for x in arr) if spec.get("basename") else sorted(arr)
+        if got != sorted(spec["items"]):
+            return f"names {sorted(arr)} != {sorted(spec['items'])}"
+    return None
+
+
+def grade_agent(task, rec, vfs, max_turns):
+    if rec.get("error"):
+        context = re.search(r"context|n_ctx|too long|maximum.*length", rec["error"], re.I)
+        return False, "request failed: context window exceeded" if context else "request failed"
+    reason = check_agent_grader(task["grader"], rec, vfs)
+    if reason is None and rec.get("final_answer") is not None:
+        return True, None
+    if rec.get("text_tool_call"):
+        return False, "tool call written as text"
+    if rec.get("final_answer") is None:
+        return False, f"no final answer within {max_turns} turns" + (" (work was correct)" if reason is None else "")
+    if not rec["final_answer"].strip() and rec.get("finish_reason") == "length":
+        return False, "ran out of tokens before answering"
+    return False, reason
+
+
+def load_agent_pack(path):
+    pack = json.loads(Path(path).read_text())
+    for t in pack["tasks"]:
+        t.setdefault("category", "general")
+        t.setdefault("vfs", {})
+    return pack
+
+
+def load_agent_condition(pack_path, pack, name):
+    spec = pack["conditions"][name]
+    root = Path(pack_path).resolve().parent
+    system = (root / spec["system"]).read_text().rstrip("\n")
+    tools = json.loads((root / spec["tools"]).read_text())
+    return {"name": name, "system": system, "tools": tools, "user_suffix": spec.get("user_suffix", ""),
+            "tool_names": [t["function"]["name"] for t in tools], "approx_tokens": spec.get("approx_tokens") or {}}
+
+
+def estimate_request_tokens(cond, tasks):
+    longest = max((len(t["prompt"]) for t in tasks), default=0)
+    chars = len(cond["system"]) + len(json.dumps(cond["tools"])) + len(cond.get("user_suffix", "")) + longest
+    return int(chars / 3.5)
+
+
+def plan_conditions(conds, tasks, ctx_window):
+    active, skipped = [], []
+    for name, cond in conds.items():
+        est = estimate_request_tokens(cond, tasks)
+        if ctx_window and est > 0.9 * ctx_window:
+            skipped.append({"condition": name, "reason": f"estimated request ~{est} tokens exceeds 90% of the {ctx_window}-token context window"})
+        else:
+            active.append(name)
+    return active, skipped
+
+
+def message_text(content):
+    if isinstance(content, list):
+        return "".join(p.get("text", "") for p in content if isinstance(p, dict))
+    return content or ""
+
+
+def agent_chat(base, payload):
+    try:
+        return chat(base, payload)
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", "replace")[:400]
+        raise RuntimeError(f"HTTP {exc.code}: {body}") from None
+
+
+def run_agent_task(send, model, task, sample, cond, sampling, engine, max_turns, max_tokens, vfs_base, workspace):
+    vfs = VFS({**(vfs_base or {}), **task["vfs"]}, root=workspace)
+    vfs.web_results = task.get("web_results")
+    messages = [{"role": "system", "content": cond["system"]},
+                {"role": "user", "content": task["prompt"] + cond.get("user_suffix", "")}]
+    rec = {"id": task["id"], "category": task["category"], "sample": sample, "condition": cond["name"], "turns": 0,
+           "tool_calls": [], "final_answer": None, "finish_reason": None, "text_tool_call": False, "prompt_tokens": None,
+           "first_response_s": None, "completion_tokens": 0, "error": None, "trace": []}
+    started = time.time()
+    try:
+        for turn in range(max_turns):
+            payload = {"model": model, "messages": messages, "tools": cond["tools"], "max_tokens": task.get("max_tokens", max_tokens), **sampling}
+            if engine == "llamacpp":
+                payload["cache_prompt"] = False
+            t0 = time.perf_counter()
+            data = send(payload)
+            elapsed = time.perf_counter() - t0
+            rec["turns"] += 1
+            choice = data["choices"][0]
+            msg = choice.get("message") or {}
+            usage = data.get("usage") or {}
+            if turn == 0:
+                rec["prompt_tokens"] = usage.get("prompt_tokens")
+                rec["first_response_s"] = round(elapsed, 2)
+            rec["completion_tokens"] += usage.get("completion_tokens") or 0
+            rec["finish_reason"] = choice.get("finish_reason")
+            content = message_text(msg.get("content"))
+            reasoning_key = next((k for k in ("reasoning_content", "reasoning") if msg.get(k)), None)
+            calls = msg.get("tool_calls") or []
+            rec["trace"].append({"content": content[:4000], "reasoning": (msg[reasoning_key][:2000] if reasoning_key else ""),
+                                 "finish_reason": choice.get("finish_reason"), "seconds": round(elapsed, 2),
+                                 "tool_calls": [(c.get("function") or {}).get("name") for c in calls]})
+            if not calls:
+                rec["final_answer"] = content
+                break
+            assistant = {"role": "assistant", "content": content or None, "tool_calls": []}
+            if reasoning_key:
+                assistant[reasoning_key] = msg[reasoning_key]
+            results = []
+            for i, call in enumerate(calls):
+                fn = call.get("function") or {}
+                name = fn.get("name") or ""
+                args, bad = parse_tool_args(fn.get("arguments"))
+                cid = call.get("id") or f"call_{turn}_{i}"
+                raw = fn.get("arguments") if isinstance(fn.get("arguments"), str) else json.dumps(fn.get("arguments"))
+                assistant["tool_calls"].append({"id": cid, "type": "function",
+                                                "function": {"name": name, "arguments": raw if bad else json.dumps(args, ensure_ascii=False)}})
+                if bad:
+                    result, is_err = "Error: tool arguments are not valid JSON.", True
+                else:
+                    result, is_err = execute_tool(vfs, name, args, cond["tool_names"])
+                rec["tool_calls"].append({"turn": turn + 1, "name": name, "arguments": raw if bad else args, "error": is_err, "result": result[:1000]})
+                results.append({"role": "tool", "tool_call_id": cid, "content": result})
+            messages.append(assistant)
+            messages.extend(results)
+    except Exception as exc:
+        rec["error"] = repr(exc)
+    rec["text_tool_call"] = looks_like_text_tool_call(rec["final_answer"], cond["tool_names"])
+    rec["files_changed"] = {k: (v[:2000] if isinstance(v, str) else v) for k, v in vfs.changes().items()}
+    rec["passed"], rec["reason"] = grade_agent(task, rec, vfs, max_turns)
+    rec["passed"] = bool(rec["passed"])
+    rec["seconds"] = round(time.time() - started, 1)
+    return rec
+
+
+def summarize_agent(records, conds, active):
+    out = {}
+    for name in active:
+        recs = [r for r in records if r["condition"] == name]
+        c = {"passed": sum(r["passed"] for r in recs), "n": len(recs), "by_task": {}}
+        for r in recs:
+            t = c["by_task"].setdefault(r["id"], {"category": r["category"], "passed": 0, "n": 0, "reasons": {}})
+            t["passed"] += r["passed"]
+            t["n"] += 1
+            if not r["passed"]:
+                t["reasons"][r["reason"] or "failed"] = t["reasons"].get(r["reason"] or "failed", 0) + 1
+        pts = [r["prompt_tokens"] for r in recs if r.get("prompt_tokens")]
+        frs = [r["first_response_s"] for r in recs if r.get("first_response_s") is not None]
+        cond = conds[name]
+        c.update(prompt_tokens_avg=round(statistics.mean(pts)) if pts else None,
+                 first_response_s_avg=round(statistics.mean(frs), 2) if frs else None,
+                 turns_avg=round(statistics.mean([r["turns"] for r in recs]), 2) if recs else None,
+                 text_tool_calls=sum(1 for r in recs if r.get("text_tool_call")),
+                 tool_count=len(cond["tools"]),
+                 system_prompt_tokens_est=cond["approx_tokens"].get("system") or round(len(cond["system"]) / 3.5),
+                 tools_tokens_est=cond["approx_tokens"].get("tools") or round(len(json.dumps(cond["tools"])) / 3.5))
+        out[name] = c
+    return out
+
+
+def cmd_agent(args):
+    base = normalize_base(args.base_url)
+    pack_path = Path(args.pack)
+    pack = load_agent_pack(pack_path)
+    info = detect(base)
+    model = args.model or (info["models"][0]["id"] if info["models"] else None)
+    if not model:
+        sys.exit("no model: pass --model")
+    ctx_window = args.context_window or next((m.get("context_window") for m in info["models"] if m["id"] == model and m.get("context_window")), None)
+    sampling = dict(pack.get("sampling") or {})
+    for key in ("temperature", "top_p", "min_p"):
+        if getattr(args, key) is not None:
+            sampling[key] = getattr(args, key)
+    samples = args.samples or pack.get("samples", 3)
+    max_turns = args.max_turns or pack.get("max_turns", 6)
+    names = [c.strip() for c in args.conditions.split(",") if c.strip()]
+    unknown = [n for n in names if n not in pack["conditions"]]
+    if unknown:
+        sys.exit(f"unknown condition(s) {unknown}; pack has {list(pack['conditions'])}")
+    conds = {n: load_agent_condition(pack_path, pack, n) for n in names}
+    only = [s for s in (args.only or "").split(",") if s]
+    tasks = [t for t in pack["tasks"] if not only or any(t["id"].startswith(o) or t["category"] == o for o in only)]
+    active, skipped = plan_conditions(conds, tasks, ctx_window)
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    label = args.label
+    jobs = [(t, s, c) for t in tasks for s in range(samples) for c in active]
+    progress = open(out / f"progress-{label}.log", "a", buffering=1)
+    say = lambda msg: (print(msg, flush=True), progress.write(msg + "\n"))
+    say(f"START {label} agent model={model} engine={info['engine']} tasks={len(tasks)} samples={samples} "
+        f"conditions={','.join(active) or '-'} jobs={len(jobs)} skipped={len(skipped)}")
+    for sk in skipped:
+        say(f"SKIP {label} {sk['condition']}: {sk['reason']}")
+    max_tokens = pack.get("max_tokens", 6000)
+    workspace = pack.get("workspace", "/workspace")
+    results = []
+    started = time.time()
+    with ThreadPoolExecutor(max_workers=args.parallel) as pool, open(out / f"agent-tasks-{label}.jsonl", "w") as f:
+        futures = [pool.submit(run_agent_task, lambda payload: agent_chat(base, payload), model, t, s, conds[c], sampling, info["engine"], max_turns, max_tokens,
+                               pack.get("vfs_base"), workspace) for t, s, c in jobs]
+        for i, fut in enumerate(futures, 1):
+            rec = fut.result()
+            results.append(rec)
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            f.flush()
+            say(f"[{i}/{len(jobs)}] {rec['id']}#{rec['sample']}/{rec['condition']} {'PASS' if rec['passed'] else 'FAIL'} {rec['seconds']}s"
+                + (f" ({rec['reason']})" if not rec["passed"] else ""))
+    summary = {"label": label, "model": model, "engine": info["engine"], "base_url": base, "pack": pack.get("id"),
+               "pack_version": pack.get("version"), "sampling": sampling, "samples": samples, "max_turns": max_turns,
+               "context_window": ctx_window, "wall_seconds": round(time.time() - started, 1), "skipped": skipped,
+               "conditions": summarize_agent(results, conds, active)}
+    (out / f"agent-summary-{label}.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False))
+    say(f"DONE {label} agent " + " ".join(f"{k}={v['passed']}/{v['n']}" for k, v in summary["conditions"].items())
+        + f" wall={summary['wall_seconds']}s")
+
+
 # ---------- tables ----------
+
+def agent_tables(d):
+    agents = {}
+    for p in sorted(d.glob("agent-summary-*.json")):
+        s = json.loads(p.read_text())
+        agents[s["label"]] = s
+    if not agents:
+        return []
+    fmt = lambda v: f"{v:,}" if isinstance(v, int) else ("-" if v is None else str(v))
+    out = ["### Agent fitness (holaOS agent loop, passed / task runs)", "",
+           "| Run | Condition | Tools | Success | Avg prompt tokens (first request) | Avg first response | Avg turns |",
+           "|---|---|---|---|---|---|---|"]
+    cols = []
+    for lab, s in agents.items():
+        for cname, c in s["conditions"].items():
+            cols.append((lab, cname, c))
+            pct = round(100 * c["passed"] / c["n"]) if c["n"] else 0
+            first = f"{c['first_response_s_avg']} s" if c.get("first_response_s_avg") is not None else "-"
+            out.append(f"| {lab} | {cname} | {c['tool_count']} | {c['passed']}/{c['n']} ({pct}%) | {fmt(c.get('prompt_tokens_avg'))} | {first} | {fmt(c.get('turns_avg'))} |")
+        for sk in s.get("skipped") or []:
+            out.append(f"| {lab} | {sk['condition']} | | skipped: {sk['reason']} | | | |")
+    if cols:
+        out += ["", "| Task | Category | " + " | ".join(f"{lab} {cname}" for lab, cname, _ in cols) + " | Failure reasons |",
+                "|---|---|" + "---|" * len(cols) + "---|"]
+        tids = []
+        for _, _, c in cols:
+            tids += [t for t in c["by_task"] if t not in tids]
+        for tid in tids:
+            cat = next(c["by_task"][tid]["category"] for _, _, c in cols if tid in c["by_task"])
+            reasons = [f"{lab} {cname}: {r} ×{n}" for lab, cname, c in cols for r, n in (c["by_task"].get(tid, {}).get("reasons") or {}).items()]
+            cells = [f"{c['by_task'][tid]['passed']}/{c['by_task'][tid]['n']}" if tid in c["by_task"] else "-" for _, _, c in cols]
+            out.append(f"| {tid} | {cat} | " + " | ".join(cells) + " | " + "; ".join(reasons) + " |")
+    out.append("")
+    return out
+
 
 def cmd_tables(args):
     d = Path(args.dir)
@@ -673,6 +1763,8 @@ def cmd_tables(args):
         skipped = {lab: s["skipped"] for lab, s in summaries.items() if s.get("skipped")}
         if skipped:
             out += ["", "Skipped: " + "; ".join(f"{lab}: {x['id']} ({x['reason']})" for lab, xs in skipped.items() for x in xs)]
+        out.append("")
+    out += agent_tables(d)
     text = "\n".join(out) + "\n"
     (d / "tables.md").write_text(text)
     print(text)
@@ -720,6 +1812,58 @@ def bar_svg(title, subtitle, rows, unit, footnote, vmax=None):
     return "\n".join(parts)
 
 
+SERIES = ["#2a78d6", "#eb6834"]
+
+
+def clip(s, n):
+    s = str(s)
+    return s if len(s) <= n else s[:n - 1] + "…"
+
+
+def grouped_bar_svg(title, subtitle, groups, series, unit, footnote):
+    """groups: [(label, {series: (value, detail) or None})]; values are percentages."""
+    bar_h, bar_gap, group_gap, top, left, right, w = 30, 6, 30, 176, 340, 1040, 1200
+    group_h = len(series) * bar_h + (len(series) - 1) * bar_gap
+    plot_bottom = top + len(groups) * (group_h + group_gap) - group_gap
+    h = plot_bottom + 120
+    ticks = nice_ticks(100)
+    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{w * 2}" height="{h * 2}" viewBox="0 0 {w} {h}" font-family="Helvetica, Arial, PingFang SC, sans-serif">',
+             f'<rect width="{w}" height="{h}" fill="{SURFACE}"/>',
+             f'<text x="40" y="58" font-size="30" font-weight="700" fill="{INK}">{esc(title)}</text>',
+             f'<text x="40" y="96" font-size="18" fill="{INK2}">{esc(subtitle)}</text>']
+    x = 40
+    for i, (name, desc) in enumerate(series):
+        legend = f"{name} · {desc}" if desc else name
+        parts.append(f'<rect x="{x}" y="120" width="14" height="14" rx="3" fill="{SERIES[i % len(SERIES)]}"/>')
+        parts.append(f'<text x="{x + 22}" y="132" font-size="15" fill="{INK2}">{esc(legend)}</text>')
+        x += 60 + 7.6 * len(legend)
+    for tick in ticks:
+        tx = left + (right - left) * tick / 100
+        parts.append(f'<line x1="{tx:.1f}" y1="{top - 10}" x2="{tx:.1f}" y2="{plot_bottom + 6}" stroke="{GRID}" stroke-width="1"/>')
+        parts.append(f'<text x="{tx:.1f}" y="{plot_bottom + 28}" font-size="14" fill="{MUTED}" text-anchor="middle">{tick:g}</text>')
+    for gi, (label, values) in enumerate(groups):
+        gy = top + gi * (group_h + group_gap)
+        parts.append(f'<text x="40" y="{gy + group_h / 2 + 7:.1f}" font-size="19" font-weight="700" fill="{INK}">{esc(clip(label, 22))}</text>')
+        for si, (name, _) in enumerate(series):
+            y = gy + si * (bar_h + bar_gap)
+            parts.append(f'<text x="{left - 14}" y="{y + 21}" font-size="15" fill="{INK2}" text-anchor="end">{esc(name)}</text>')
+            cell = values.get(name)
+            if cell is None:
+                parts.append(f'<text x="{left + 10}" y="{y + 21}" font-size="15" fill="{MUTED}">skipped</text>')
+                continue
+            value, detail = cell
+            bw = (right - left) * value / 100
+            if bw > 0:
+                parts.append(f'<rect x="{left}" y="{y}" width="{bw:.1f}" height="{bar_h}" rx="4" fill="{SERIES[si % len(SERIES)]}"/>')
+            vx = left + bw + 10
+            parts.append(f'<text x="{vx:.1f}" y="{y + 22}" font-size="19" font-weight="700" fill="{INK}">{value:g}%</text>')
+            parts.append(f'<text x="{vx + 10.6 * len(f"{value:g}") + 26:.1f}" y="{y + 22}" font-size="15" fill="{MUTED}">{esc(detail)}</text>')
+    parts.append(f'<text x="{(left + right) / 2}" y="{plot_bottom + 58}" font-size="15" fill="{INK2}" text-anchor="middle">{esc(unit)}</text>')
+    parts.append(f'<text x="40" y="{h - 20}" font-size="13" fill="{MUTED}">{esc(footnote)}</text>')
+    parts.append("</svg>")
+    return "\n".join(parts)
+
+
 def svg_to_png(svg_path, png_path):
     if sys.platform == "darwin" and shutil.which("sips"):
         r = subprocess.run(["sips", "-s", "format", "png", str(svg_path), "--out", str(png_path)], capture_output=True)
@@ -738,9 +1882,38 @@ def svg_to_png(svg_path, png_path):
         return None
 
 
+def agent_chart_data(d):
+    groups, series = [], []
+    for p in sorted(d.glob("agent-summary-*.json")):
+        s = json.loads(p.read_text())
+        values = {}
+        for cname, c in s["conditions"].items():
+            series += [cname] if cname not in series else []
+            values[cname] = (round(100 * c["passed"] / c["n"]) if c["n"] else 0, f"{c['passed']}/{c['n']}")
+        for sk in s.get("skipped") or []:
+            series += [sk["condition"]] if sk["condition"] not in series else []
+        groups.append((s["label"], values))
+    order = {"full": 0, "lean": 1}
+    series.sort(key=lambda n: order.get(n, 2))
+    return groups, series
+
+
 def cmd_chart(args):
     d = Path(args.dir)
     rows = []
+    if args.kind == "agent":
+        groups, names = agent_chart_data(d)
+        if not groups:
+            sys.exit("no data for chart")
+        desc = {"full": "real holaOS prompt and 30 tools", "lean": "short prompt, 8 core tools"}
+        foot = args.footnote or f"agent-v1 pack · simulated workspace · program-graded · {time.strftime('%Y-%m-%d')}"
+        svg = grouped_bar_svg(args.title, args.subtitle or "Agent task success: full holaOS request vs lean request", groups,
+                              [(n, desc.get(n, "")) for n in names], "success rate, % of task runs", foot)
+        svg_path = d / "agent.svg"
+        svg_path.write_text(svg)
+        converter = svg_to_png(svg_path, d / "agent.png")
+        print(json.dumps({"svg": str(svg_path), "png": str(d / "agent.png") if converter else None, "converter": converter}))
+        return
     if args.kind == "speed":
         for p in sorted(d.glob("speed-*.json")):
             s = json.loads(p.read_text())
@@ -795,7 +1968,146 @@ def cmd_selftest(_args):
         assert "prompt" in t and "grader" in t, t["id"]
     assert normalize_base("localhost:8080") == "http://localhost:8080/v1"
     assert normalize_base("http://127.0.0.1:11434/v1/") == "http://127.0.0.1:11434/v1"
-    print(f"selftest ok ({len(ids)} tasks in {pack['id']})")
+    agent_ids = selftest_agent()
+    print(f"selftest ok ({len(ids)} tasks in {pack['id']}, {len(agent_ids)} agent tasks)")
+
+
+def scripted_model(steps):
+    """Fake chat endpoint: each step is a list of (tool, args) calls or a final string."""
+    steps = list(steps)
+
+    def send(payload):
+        step = steps.pop(0) if steps else "out of script"
+        usage = {"prompt_tokens": len(json.dumps(payload["messages"])) // 4, "completion_tokens": 5}
+        if isinstance(step, str):
+            msg = {"role": "assistant", "content": step}
+        else:
+            msg = {"role": "assistant", "content": "", "tool_calls": [
+                {"id": f"c{i}", "type": "function", "function": {"name": n, "arguments": a if isinstance(a, str) else json.dumps(a)}}
+                for i, (n, a) in enumerate(step)]}
+        return {"choices": [{"message": msg, "finish_reason": "stop" if isinstance(step, str) else "tool_calls"}], "usage": usage}
+
+    return send
+
+
+def selftest_agent():
+    vfs = VFS({"a/b.txt": "one\ntwo\nthree\n", "a/c.md": "# C\n", "empty/": None})
+    assert vfs.isdir("/workspace/a") and vfs.isdir("/workspace/empty") and vfs.isfile("/workspace/a/b.txt")
+    assert vfs.resolve("a/../a/./b.txt") == "/workspace/a/b.txt" and vfs.resolve("/etc/x") == "/etc/x"
+    assert vfs.listdir("/workspace") == [("a", True), ("empty", True)]
+    assert tool_read(vfs, {"path": "a/b.txt", "offset": 2, "limit": 1}) == ("two", False)
+    assert tool_read(vfs, {"path": "nope.txt"})[1]
+    assert tool_ls(vfs, {"path": "a"})[0] == "b.txt\nc.md"
+    assert tool_edit(vfs, {"path": "a/b.txt", "edits": [{"oldText": "two", "newText": "2"}]})[1] is False
+    assert vfs.files["/workspace/a/b.txt"] == "one\n2\nthree\n" and vfs.changes() == {"a/b.txt": "one\n2\nthree\n"}
+    assert "not found in the file" in tool_edit(vfs, {"path": "a/b.txt", "edits": [{"oldText": "zzz", "newText": "x"}]})[0]
+    assert "invalid" in tool_edit(vfs, {"path": "a/b.txt", "old_string": "one", "new_string": "1"})[0]
+    assert "File not found" in tool_edit(vfs, {"path": "new.md", "edits": [{"oldText": "a", "newText": "b"}]})[0]
+    assert tool_search(vfs, {"pattern": "thr", "path": "a"})[0] == "a/b.txt\n  3: three"
+    assert tool_find(vfs, {"paths": ["*.md"]})[0] == "a/c.md"
+    assert json.loads(tool_search_web(vfs, {"query": "rust release"})[0])["query"] == "rust release"
+    assert execute_tool(vfs, "cronjobs", {}, ["cronjobs"]) == ('{"ok": true, "results": []}', False)
+    assert execute_tool(vfs, "write", {"path": "x", "content": "y"}, ["read"])[1]
+
+    sh = lambda cmd: BashSim(vfs).run(cmd)
+    assert sh("ls a") == ("b.txt\nc.md\n", 0)
+    assert sh("wc -l a/b.txt") == ("3 a/b.txt\n", 0)
+    assert sh("cat a/b.txt | wc -l") == ("3\n", 0)
+    assert sh("head -n 1 a/b.txt") == ("one\n", 0)
+    assert sh("grep -c e a/b.txt") == ("2\n", 0)
+    assert sh("grep -rn three .") == ("a/b.txt:3:three\n", 0)
+    assert sh("ls a/*.md") == ("a/c.md\n", 0)
+    assert sh("ls a/b.txt a/c.md") == ("a/b.txt\na/c.md\n", 0)
+    assert sh("tail -n +2 a/b.txt|wc -l") == ("2\n", 0)
+    assert sh("mkdir -p x/y && echo hi > x/y/z.txt && cat x/y/z.txt") == ("hi\n", 0)
+    assert sh("echo more >> x/y/z.txt; cat x/y/z.txt") == ("hi\nmore\n", 0)
+    assert sh("cat > notes.md <<'EOF'\n- a.md\n- b.md\nEOF\nwc -l notes.md") == ("2 notes.md\n", 0)
+    assert sh("printf '%s\\n' one two > p.txt && cat p.txt") == ("one\ntwo\n", 0)
+    assert sh("find a -type f -name '*.txt'") == ("a/b.txt\n", 0)
+    out, code = sh("python3 -c 'print(1)'")
+    assert code == 127 and "command not available in this sandbox" in out
+    out, code = sh("cat missing.txt && echo never")
+    assert code == 1 and "never" not in out
+    assert sh("false || echo fallback") == ("fallback\n", 0)
+    assert sh("cat nope.txt 2>/dev/null; ls a") == ("cat: nope.txt: No such file or directory\nb.txt\nc.md\n", 0)
+    assert sh("cat -A a/c.md") == ("# C\n", 0)
+    assert "command not available" in sh("rm a/b.txt")[0] and vfs.isfile("/workspace/a/b.txt")
+    assert sh("echo x > nodir/f.txt")[1] == 1
+    assert bash_mutates("mv a b") and bash_mutates("echo x > f") and bash_mutates("sed -i '' s/a/b/ f")
+    assert not bash_mutates("ls -la 2>/dev/null") and not bash_mutates("grep 'a > b' f") and not bash_mutates("cat f 2>&1")
+
+    tools = ["read", "bash"]
+    assert looks_like_text_tool_call('<tool_call>{"name": "read", "arguments": {}}</tool_call>', tools)
+    assert looks_like_text_tool_call('```json\n{"name": "bash", "arguments": {"command": "ls"}}\n```', tools)
+    assert not looks_like_text_tool_call("The port is 6432.", tools)
+
+    pack = load_agent_pack(DEFAULT_AGENT_PACK)
+    full = load_agent_condition(DEFAULT_AGENT_PACK, pack, "full")
+    lean = load_agent_condition(DEFAULT_AGENT_PACK, pack, "lean")
+    assert len(lean["tools"]) == 8 and all(t in full["tools"] for t in lean["tools"])
+    assert pack["conditions"]["full"]["tool_count"] == len(full["tools"])
+    for text in (full["system"], json.dumps(full["tools"])):
+        assert not re.search(r"/Users/|/private/|/home/\w", text)
+    active, skipped = plan_conditions({"full": full, "lean": lean}, pack["tasks"], 8192)
+    assert active == ["lean"] and skipped[0]["condition"] == "full" and "8192" in skipped[0]["reason"]
+    assert plan_conditions({"full": full, "lean": lean}, pack["tasks"], None) == (["full", "lean"], [])
+    assert plan_conditions({"full": full, "lean": lean}, pack["tasks"], 32768)[0] == ["full", "lean"]
+
+    heredoc = "cat > notes/INDEX.md <<'EOF'\n- 2026-03-02-meeting.md\n- budget.csv\n- ideas.md\n- reading-list.md\nEOF"
+    ask = ("ask_user_question", {"question": {"prompt": "Which report?", "options": [{"label": "q1"}, {"label": "q2"}]}})
+    fenced = '```json\n["hero.png", "icon-192.png", "screenshot-home.png"]\n```'
+    cases = {
+        "read-config": ([[("read", {"path": "config/app.yaml"})], "6432"], [
+            (["6432"], "answered without using read/bash/search"),
+            ([[("read", {"path": "config/app.yaml"})], "6432 (the server uses 8080)"], "answer also mentions '8080'"),
+            (['<tool_call>{"name": "read", "arguments": {"path": "config/app.yaml"}}</tool_call>'], "tool call written as text"),
+            ([[("read", "{not json")], "6432"], "answered without using read/bash/search")]),
+        "edit-json": ([[("edit", {"path": "settings.json", "edits": [{"oldText": '"max_items": 50', "newText": '"max_items": 200'}]})], "Done."], [
+            ([[("edit", {"path": "settings.json", "old_string": "50", "new_string": "200"})], "Done."], "max_items=50, expected 200"),
+            ([[("bash", {"command": "echo '{\"max_items\": 200}' > settings.json"})], "Done."], "theme was removed")]),
+        "count-csv": ([[("bash", {"command": "wc -l data/orders.csv"})], "37"], [
+            ([[("bash", {"command": "wc -l data/orders.csv"})], "38"], "answered 38, expected 37")]),
+        "index-notes": ([[("bash", {"command": heredoc})], "Created notes/INDEX.md."], [
+            ([[("bash", {"command": "echo '- ideas.md' > notes/INDEX.md"})], "Done."], "notes/INDEX.md has no bullet for 2026-03-02-meeting.md"),
+            ([[("write", {"path": "notes/INDEX.md", "content": "- ideas.md\n"})], "Done."], "notes/INDEX.md not created")]),
+        "web-lookup": ([[("memory_retrieve", {"query": "rust"})], [("search_web", {"query": "latest stable Rust release"})], "I could not confirm it."], [
+            (["Rust 1.80."], "never called search_web")]),
+        "no-tool-math": (["391"], [
+            ([[("memory_retrieve", {"query": "17*23"})], "391"], "called a tool when none was needed (memory_retrieve)")]),
+        "ambiguous-rename": ([[("ls", {"path": "reports"})], [ask], "Which report should I rename?"], [
+            ([[("bash", {"command": "mv reports/q1-summary.md reports/final.md"})], "Renamed."], "tried to change files without asking (bash)"),
+            (["Which report do you mean?"], "asked in plain text instead of ask_user_question")]),
+        "json-filenames": ([[("ls", {"path": "assets"})], '["hero.png", "icon-192.png", "screenshot-home.png"]'], [
+            ([[("ls", {"path": "assets"})], fenced], "wrapped in a code fence"),
+            ([[("ls", {"path": "assets"})], 'Here: ["hero.png"]'], "not only a JSON array"),
+            ([[("ls", {"path": "assets"})], '["assets/hero.png"]'], "names ['assets/hero.png'] != ['hero.png', 'icon-192.png', 'screenshot-home.png']")]),
+    }
+    assert set(cases) == {t["id"] for t in pack["tasks"]}
+    run = lambda task, steps, turns=6: run_agent_task(scripted_model(steps), "m", task, 0, full, {}, "llamacpp", turns, 100,
+                                                      pack.get("vfs_base"), pack["workspace"])
+    for task in pack["tasks"]:
+        good, bad = cases[task["id"]]
+        rec = run(task, good)
+        assert rec["passed"], (task["id"], rec["reason"], rec["tool_calls"])
+        for steps, reason in bad:
+            rec = run(task, steps)
+            assert not rec["passed"] and rec["reason"] == reason, (task["id"], rec["reason"], reason)
+    loop = run(pack["tasks"][0], [[("ls", {})]] * 6)
+    assert loop["reason"] == "no final answer within 6 turns" and loop["turns"] == 6
+    notes = next(t for t in pack["tasks"] if t["id"] == "index-notes")
+    assert run(notes, [[("bash", {"command": heredoc})]] * 6)["reason"] == "no final answer within 6 turns (work was correct)"
+    files = next(t for t in pack["tasks"] if t["id"] == "json-filenames")
+    assert run(files, [[("ls", {"path": "assets"})], '["assets/hero.png", "assets/icon-192.png", "assets/screenshot-home.png"]'])["passed"]
+    web = next(t for t in pack["tasks"] if t["id"] == "web-lookup")
+    rec = run(web, [[("search_web", {"query": "rust stable"})], "Rust 1.92.0"])
+    assert rec["passed"] and "1.92.0" in rec["tool_calls"][0]["result"]
+
+    def overflow(payload):
+        raise RuntimeError("HTTP 400: the request exceeds the available context size")
+
+    rec = run_agent_task(overflow, "m", pack["tasks"][0], 0, full, {}, "llamacpp", 6, 100, None, pack["workspace"])
+    assert rec["reason"] == "request failed: context window exceeded"
+    return list(cases)
 
 
 def main():
@@ -834,12 +2146,28 @@ def main():
     p.add_argument("--concurrency", default="")
     p.add_argument("--context-window", type=int)
     p.set_defaults(fn=cmd_speed)
+    p = sub.add_parser("agent")
+    p.add_argument("--base-url", required=True)
+    p.add_argument("--model")
+    p.add_argument("--pack", default=str(DEFAULT_AGENT_PACK))
+    p.add_argument("--out", required=True)
+    p.add_argument("--label", default="main")
+    p.add_argument("--conditions", default="full,lean")
+    p.add_argument("--samples", type=int)
+    p.add_argument("--max-turns", dest="max_turns", type=int)
+    p.add_argument("--parallel", type=int, default=1)
+    p.add_argument("--only", default="")
+    p.add_argument("--context-window", type=int)
+    p.add_argument("--temperature", type=float)
+    p.add_argument("--top-p", dest="top_p", type=float)
+    p.add_argument("--min-p", dest="min_p", type=float)
+    p.set_defaults(fn=cmd_agent)
     p = sub.add_parser("tables")
     p.add_argument("--dir", required=True)
     p.set_defaults(fn=cmd_tables)
     p = sub.add_parser("chart")
     p.add_argument("--dir", required=True)
-    p.add_argument("--kind", choices=["speed", "capability"], default="speed")
+    p.add_argument("--kind", choices=["speed", "capability", "agent"], default="speed")
     p.add_argument("--title", required=True)
     p.add_argument("--subtitle")
     p.add_argument("--footnote")
