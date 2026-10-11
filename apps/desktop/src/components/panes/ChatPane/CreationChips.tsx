@@ -1,4 +1,6 @@
 import { Icon as IconifyIcon } from "@iconify/react";
+import { useSetAtom } from "jotai";
+import { newEvaluationDialogOpenAtom } from "@/components/evaluations/state";
 import { getSkillIcon } from "@/lib/skillVisual";
 import { cn } from "@/lib/utils";
 
@@ -18,6 +20,7 @@ export interface CreationType {
    *  so the chip still hands the user a usable starting point instead of
    *  quoting a skill that would fail the pre-send guard. */
   examplePrompt?: string;
+  opensNewEvaluation?: boolean;
 }
 
 const CREATION_TYPES: CreationType[] = [
@@ -59,8 +62,7 @@ const CREATION_TYPES: CreationType[] = [
   {
     skillId: "run-model-eval",
     label: "Model eval",
-    examplePrompt:
-      "Install the local-model-review combo, then test the model I have running locally: find it, measure its speed, run the capability spot check, and write a conclusion pack.",
+    opensNewEvaluation: true,
   },
 ];
 
@@ -71,13 +73,16 @@ export function CreationChips({
   onPick: (type: CreationType) => void;
   className?: string;
 }) {
+  const openNewEvaluation = useSetAtom(newEvaluationDialogOpenAtom);
   return (
     <div className={cn("flex flex-wrap items-center gap-1.5", className)}>
       {CREATION_TYPES.map((type) => (
         <button
           className="inline-flex items-center gap-1.5 rounded-full border border-border bg-background px-2.5 py-1 font-medium text-[13px] text-foreground/80 transition-colors hover:bg-accent hover:text-foreground"
           key={type.skillId}
-          onClick={() => onPick(type)}
+          onClick={() =>
+            type.opensNewEvaluation ? openNewEvaluation(true) : onPick(type)
+          }
           type="button"
         >
           <IconifyIcon className="size-3.5" icon={getSkillIcon(type.skillId)} />
