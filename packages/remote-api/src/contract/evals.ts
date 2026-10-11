@@ -198,7 +198,7 @@ export const evalsContract = {
         targets: z.array(evalTargetSchema).max(8).optional(),
       }),
     )
-    .output(evaluationSchema),
+    .output(evaluationSchema.extend({ kickoff_error: z.string().nullable() })),
   update: oc
     .input(
       evalIdInput.extend({

@@ -385,7 +385,7 @@ export function buildDataLayer(params: {
   if (capability.length > 0) {
     const pack = capability[0];
     limitations.push(
-      `Capability is a fixed spot check (${pack?.pack ?? "general"} v${pack?.pack_version ?? "?"}), not a benchmark score; small differences are within sampling noise.`,
+      `Capability is a fixed spot check (${packLabel(pack?.pack, pack?.pack_version)}), not a benchmark score; small differences are within sampling noise.`,
     );
   }
   if (agent.length > 0) {
@@ -523,7 +523,16 @@ function cell(value: number | null, digits = 1): string {
   if (value === null) {
     return "–";
   }
-  return digits === 0 ? String(Math.round(value)) : String(Math.round(value * 10 ** digits) / 10 ** digits);
+  return digits === 0
+    ? Math.round(value).toLocaleString("en-US")
+    : String(Math.round(value * 10 ** digits) / 10 ** digits);
+}
+
+export function packLabel(pack: string | null | undefined, version: number | string | null | undefined): string {
+  if (!pack) {
+    return version != null ? `v${version}` : "unknown pack";
+  }
+  return version != null && !pack.endsWith(`-v${version}`) ? `${pack} v${version}` : pack;
 }
 
 export function dataLayerMarkdown(layer: EvalDataLayer, options: { chartRefs?: Record<string, string> } = {}): string {
@@ -568,7 +577,7 @@ export function dataLayerMarkdown(layer: EvalDataLayer, options: { chartRefs?: R
 
   if (layer.capability.length > 0) {
     const pack = layer.capability[0];
-    out.push(`## Capability (${pack?.pack ?? "general"} v${pack?.pack_version ?? "?"})`, "");
+    out.push(`## Capability (${packLabel(pack?.pack, pack?.pack_version)})`, "");
     chartRef("capability", "Capability pass rate");
     const categories = [...new Set(layer.capability.flatMap((entry) => Object.keys(entry.by_category)))];
     out.push(`| Category | ${layer.capability.map((entry) => entry.label).join(" | ")} |`);
@@ -596,7 +605,7 @@ export function dataLayerMarkdown(layer: EvalDataLayer, options: { chartRefs?: R
 
   if (layer.agent.length > 0) {
     const pack = layer.agent[0];
-    out.push(`## Agent fitness (${pack?.pack ?? "agent"} v${pack?.pack_version ?? "?"})`, "");
+    out.push(`## Agent fitness (${packLabel(pack?.pack, pack?.pack_version)})`, "");
     out.push(
       "`full` sends the real holaOS tool set and system prompt; `lean` sends 8 core tools and a short prompt.",
       "",
@@ -835,8 +844,8 @@ export function renderReportHtml(input: ReportDocumentInput): string {
     question_type: evaluation.questionType,
     plan: input.plan,
     packs: {
-      capability: layer.capability[0] ? `${layer.capability[0].pack}@${layer.capability[0].pack_version}` : null,
-      agent: layer.agent[0] ? `${layer.agent[0].pack}@${layer.agent[0].pack_version}` : null,
+      capability: layer.capability[0] ? packLabel(layer.capability[0].pack, layer.capability[0].pack_version) : null,
+      agent: layer.agent[0] ? packLabel(layer.agent[0].pack, layer.agent[0].pack_version) : null,
     },
     generated_at: layer.generated_at,
     relation: evaluation.relation,
@@ -992,9 +1001,9 @@ export function shareBody(params: {
     }
   }
   const footer = "\n\nFull report with tables, method and data: report.html (attached).";
-  const head = [params.evaluation.question, "", ...(highlights.length > 0 ? ["Key numbers:", ...highlights, ""] : [])].join("\n");
   const opinion = params.opinionMarkdown.trim();
-  let body = opinion ? `${opinion}\n\n${head}` : head;
+  const keyNumbers = highlights.length > 0 ? ["Key numbers:", ...highlights].join("\n") : "";
+  let body = [params.evaluation.question, opinion, keyNumbers].filter(Boolean).join("\n\n");
   if (body.length + footer.length > limit) {
     body = `${body.slice(0, Math.max(0, limit - footer.length - 1)).trimEnd()}…`;
   }

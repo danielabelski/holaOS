@@ -85,8 +85,21 @@ export interface EvaluationServiceDeps {
 
 type Wire = Record<string, unknown>;
 
+function evaluationTargetsOf(record: EvaluationRecord): EvalTarget[] {
+  const seen = new Map<string, EvalTarget>();
+  const planRuns = record.plan && Array.isArray(record.plan.runs) ? (record.plan.runs as EvalPlanRun[]) : [];
+  const requested = Array.isArray(record.source?.requested_targets) ? (record.source.requested_targets as EvalTarget[]) : [];
+  for (const target of planRuns.length > 0 ? planRuns.map((run) => run.target) : requested) {
+    if (target?.model_id && target.base_url) {
+      seen.set(targetKey(target), target);
+    }
+  }
+  return [...seen.values()];
+}
+
 export function evaluationToWire(record: EvaluationRecord): Wire {
   return {
+    targets: evaluationTargetsOf(record),
     eval_id: record.evalId,
     title: record.title,
     question_type: record.questionType,
@@ -182,7 +195,12 @@ export function estimatePlanMinutes(runs: EvalPlanRun[]): number {
 
 export function validatePlan(
   rawPlan: unknown,
-  options: { questionType: string; requireGeneralPack: boolean; reservedKeys?: Set<string> },
+  options: {
+    questionType: string;
+    requireGeneralPack: boolean;
+    reservedKeys?: Set<string>;
+    recomputeEstimate?: boolean;
+  },
 ): EvalPlan {
   const parsed = evalPlanSchema.safeParse(rawPlan);
   if (!parsed.success) {
@@ -222,7 +240,8 @@ export function validatePlan(
   }
   return {
     ...plan,
-    estimate_minutes: plan.estimate_minutes ?? estimatePlanMinutes(plan.runs),
+    estimate_minutes:
+      options.recomputeEstimate || plan.estimate_minutes == null ? estimatePlanMinutes(plan.runs) : plan.estimate_minutes,
   };
 }
 
@@ -328,7 +347,9 @@ export function renderEvaluationAgentContext(params: {
     "",
     `- Question (${record.questionType.replace("_", " ")}): ${record.question}`,
     `- Status: ${record.status}`,
-    `- Data files: ${path.join(params.evalDir, "data")} (read them with your file tools to find evidence)`,
+    runs.length > 0
+      ? `- Data files: ${path.join(params.evalDir, "data")} (read them with your file tools to find evidence)`
+      : "- Nothing has run yet; there are no data files.",
     `- Analyst model: ${record.brainModel ?? params.defaultModel ?? "default"}${(record.brainModel ?? params.defaultModel ?? "").startsWith("local_") ? " (runs on this machine; speed tests wait until you are idle)" : ""}`,
     "",
     "How to work:",
@@ -446,10 +467,7 @@ export class EvaluationService {
       evaluations: evaluations.map((record) => {
         const runs = this.runsOf(record.evalId);
         const count = (status: string) => runs.filter((run) => run.status === status).length;
-        const targets = new Set<string>();
-        for (const run of record.plan && Array.isArray(record.plan.runs) ? (record.plan.runs as EvalPlanRun[]) : []) {
-          targets.add(run.target.model_id);
-        }
+        const targets = new Set(evaluationTargetsOf(record).map((target) => target.model_id));
         return {
           ...evaluationToWire(record),
           run_counts: {
@@ -518,8 +536,13 @@ export class EvaluationService {
       `Type: ${record.questionType.replace("_", " ")}`,
       ...(targetLines.length > 0 ? ["Models to test:", ...targetLines] : []),
     ].join("\n");
-    await this.deps.queueSessionMessage({ sessionId, text, model: record.brainModel });
-    return evaluationToWire(record);
+    let kickoffError: string | null = null;
+    try {
+      await this.deps.queueSessionMessage({ sessionId, text, model: record.brainModel });
+    } catch (error) {
+      kickoffError = error instanceof Error ? error.message : String(error);
+    }
+    return { ...evaluationToWire(record), kickoff_error: kickoffError };
   }
 
   update(input: { evalId: string; title?: string; brainModel?: string | null; includeRawData?: boolean }): Wire {
@@ -534,7 +557,7 @@ export class EvaluationService {
     return evaluationToWire(record ?? this.require(input.evalId));
   }
 
-  setPlan(input: { evalId: string; plan: unknown }): Wire {
+  setPlan(input: { evalId: string; plan: unknown }, options: { keepEstimate?: boolean } = {}): Wire {
     const record = this.require(input.evalId);
     if (record.status !== "draft" && record.status !== "planned") {
       throw new EvaluationServiceError(
@@ -542,7 +565,11 @@ export class EvaluationService {
         "the plan is locked once the evaluation has started; propose a follow-up experiment instead",
       );
     }
-    const plan = validatePlan(input.plan, { questionType: record.questionType, requireGeneralPack: false });
+    const plan = validatePlan(input.plan, {
+      questionType: record.questionType,
+      requireGeneralPack: false,
+      recomputeEstimate: !options.keepEstimate,
+    });
     const updated = this.deps.store.updateEvaluation({
       workspaceId: this.ws,
       evalId: record.evalId,
@@ -984,7 +1011,7 @@ export class EvaluationService {
 
   agentSetPlan(sessionId: string, plan: unknown): Wire {
     const record = this.requireForSession(sessionId);
-    const updated = this.setPlan({ evalId: record.evalId, plan });
+    const updated = this.setPlan({ evalId: record.evalId, plan }, { keepEstimate: true });
     return {
       ok: true,
       status: updated.status,
