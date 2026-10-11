@@ -733,6 +733,9 @@ export class EvaluationService {
     }
     const removed = this.deps.store.deleteEvaluation({ workspaceId: this.ws, evalId: record.evalId });
     fs.rmSync(this.deps.evalDir(record.evalId), { recursive: true, force: true });
+    if (record.sessionId && this.deps.store.getSession({ workspaceId: this.ws, sessionId: record.sessionId })) {
+      this.deps.store.deleteSession({ workspaceId: this.ws, sessionId: record.sessionId });
+    }
     return { success: removed };
   }
 

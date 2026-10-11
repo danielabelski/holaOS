@@ -5,6 +5,7 @@ import { useAtom, useSetAtom } from "jotai";
 import { type ReactNode, useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 import { overlayOpenCountAtom } from "@/components/layout/shell/overlay-presence";
+import { notifyMainSessionsChanged } from "@/components/layout/shell/useWorkspaceLists";
 import { Button } from "@/components/ui/button";
 import { Loader2, RotateCw } from "@/components/ui/icons";
 import { Input } from "@/components/ui/input";
@@ -107,6 +108,7 @@ function NewEvaluationForm({ onClose }: { onClose: () => void }) {
         await queryClient.invalidateQueries({
           queryKey: remoteApiQuery.evals.list.key(),
         });
+        notifyMainSessionsChanged();
         onClose();
         openEvaluation(created);
         if (created.kickoff_error) {

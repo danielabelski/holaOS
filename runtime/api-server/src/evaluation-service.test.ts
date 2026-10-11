@@ -140,9 +140,11 @@ function setup(options: { failKind?: string } = {}) {
     evalDir,
     localTargets: () => [target],
     defaultModel: () => "holaboss_model_proxy/gpt-5.5",
-    createSession: () => {
+    createSession: ({ title }) => {
       sessionCounter += 1;
-      return `session-${sessionCounter}`;
+      const sessionId = `session-${sessionCounter}`;
+      store.ensureSession({ workspaceId, sessionId, kind: "main_session", title });
+      return sessionId;
     },
     queueSessionMessage: async (message) => {
       queued.push(message);
@@ -409,7 +411,10 @@ test("cancelling before anything finished returns to the editable plan", async (
   assert.equal(cancelled.evaluation.status, "planned");
   assert.deepEqual(cancelled.runs, []);
   context.service.setPlan({ evalId, plan: { ...fullPlan, notes: "edited" } });
+  const sessionId = String(created.session_id);
+  assert.ok(context.store.getSession({ workspaceId, sessionId }));
   assert.equal(context.service.delete({ evalId }).success, true);
+  assert.equal(context.store.getSession({ workspaceId, sessionId }), null);
 });
 
 test("engine marks runs interrupted by a restart as failed", async () => {

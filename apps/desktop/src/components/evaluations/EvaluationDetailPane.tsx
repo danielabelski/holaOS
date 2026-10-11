@@ -3,6 +3,8 @@ import { useAtom, useSetAtom } from "jotai";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import { workspaceOverlayAtom } from "@/components/layout/shell/state/ui";
+import { useStartNewChat } from "@/components/layout/shell/useStartNewChat";
+import { notifyMainSessionsChanged } from "@/components/layout/shell/useWorkspaceLists";
 import { displayModelLabel } from "@/components/panes/ChatPane/helpers";
 
 function analystModelLabel(token: string): string {
@@ -33,6 +35,7 @@ import {
 } from "@/components/ui/icons";
 import { RenameDialog } from "@/components/ui/rename-dialog";
 import { remoteApiQuery } from "@/lib/remoteApiQuery";
+import { useWorkspaceSelection } from "@/lib/workspaceSelection";
 import { DistributeSection } from "./DistributeSection";
 import {
   useEvaluationDetail,
@@ -255,6 +258,8 @@ function DetailHeader({
   onDeleted: () => void;
 }) {
   const queryClient = useQueryClient();
+  const { selectedWorkspaceId } = useWorkspaceSelection();
+  const { startNewChat } = useStartNewChat(selectedWorkspaceId || null);
   const evalId = evaluation.eval_id;
   const invalidate = useInvalidateEvaluation(evalId);
   const openEvaluation = useOpenEvaluation();
@@ -281,7 +286,9 @@ function DetailHeader({
         queryClient.removeQueries({
           queryKey: remoteApiQuery.evals.get.key({ input: { evalId } }),
         });
+        notifyMainSessionsChanged();
         onDeleted();
+        void startNewChat();
       },
       onError: (cause) =>
         toast.error(errorMessage(cause, "Couldn't delete the evaluation.")),
@@ -462,7 +469,7 @@ function DetailHeader({
       />
       <ConfirmDialog
         confirmLabel="Delete"
-        description="Its plan, runs and report are removed. The chat stays in your sessions."
+        description="Its plan, runs, report and chat are removed."
         destructive
         onConfirm={() => {
           setConfirmDelete(false);

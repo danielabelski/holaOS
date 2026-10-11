@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSetAtom } from "jotai";
 import { useState } from "react";
 import { toast } from "sonner";
+import { notifyMainSessionsChanged } from "@/components/layout/shell/useWorkspaceLists";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import {
@@ -66,10 +67,12 @@ export function EvaluationsPane() {
 
   const deleteMutation = useMutation(
     remoteApiQuery.evals.delete.mutationOptions({
-      onSuccess: () =>
-        queryClient.invalidateQueries({
+      onSuccess: async () => {
+        await queryClient.invalidateQueries({
           queryKey: remoteApiQuery.evals.list.key(),
-        }),
+        });
+        notifyMainSessionsChanged();
+      },
       onError: (cause) =>
         toast.error(errorMessage(cause, "Couldn't delete the evaluation.")),
     }),
@@ -111,7 +114,7 @@ export function EvaluationsPane() {
         confirmLabel="Delete"
         description={
           pendingDelete
-            ? `"${pendingDelete.title}" and its results will be removed. Its chat stays in your sessions.`
+            ? `"${pendingDelete.title}", its results and its chat will be removed.`
             : undefined
         }
         destructive
@@ -199,6 +202,11 @@ function EvaluationRow({
   const counts = evaluation.run_counts;
   const busy = isBusy(evaluation);
   const meta: string[] = [questionTypeLabel(evaluation.question_type)];
+  if (evaluation.relation === "version") {
+    meta.push("New version");
+  } else if (evaluation.relation === "reproduction") {
+    meta.push("Reproduction");
+  }
   if (evaluation.targets.length > 0) {
     meta.push(evaluation.targets.join(" vs "));
   }
