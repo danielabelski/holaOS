@@ -70,6 +70,12 @@ import {
 } from "./workspace-skills.js";
 import { resolveProductRuntimeConfig } from "./runtime-config.js";
 import {
+  currentDefaultModel,
+  evaluationDir,
+  localEvalTargets,
+  renderEvaluationAgentContext,
+} from "./evaluation-service.js";
+import {
   normalizeHarnessId,
   requireRuntimeHarnessAdapter,
   requireRuntimeHarnessPlugin,
@@ -90,6 +96,7 @@ import {
   writeComposioInlineCache,
 } from "../../harnesses/src/composio-inline-cache.js";
 import { NATIVE_WEB_SEARCH_TOOL_IDS } from "../../harnesses/src/native-web-search-tools.js";
+import { EVAL_RUNTIME_TOOL_IDS } from "../../harnesses/src/runtime-agent-tools.js";
 
 type LoggerLike = Pick<typeof console, "warn">;
 
@@ -820,6 +827,41 @@ function previewSessionAttachmentTurnText(text: string): string {
   return `${collapsed.slice(0, SESSION_ATTACHMENT_TEXT_PREVIEW_MAX_LENGTH - 1).trimEnd()}…`;
 }
 
+function loadEvaluationContext(params: {
+  workspaceRoot: string;
+  workspaceId: string;
+  sessionId: string;
+  logger?: LoggerLike;
+}): string | null {
+  const sandboxRoot = path.dirname(params.workspaceRoot);
+  const dbPath = defaultHostStateDbPathForSandbox(sandboxRoot);
+  if (!fs.existsSync(dbPath)) {
+    return null;
+  }
+  const store = new RuntimeStateStore({ workspaceRoot: params.workspaceRoot, sandboxRoot, dbPath });
+  try {
+    const record = store.getEvaluationBySessionId({ workspaceId: params.workspaceId, sessionId: params.sessionId });
+    if (!record) {
+      return null;
+    }
+    return renderEvaluationAgentContext({
+      store,
+      workspaceId: params.workspaceId,
+      record,
+      evalDir: evaluationDir(store, params.workspaceId, record.evalId),
+      targets: localEvalTargets(),
+      defaultModel: currentDefaultModel(),
+    });
+  } catch (error) {
+    params.logger?.warn?.(
+      `Failed to load evaluation context session_id=${params.sessionId}: ${errorMessage(error)}`,
+    );
+    return null;
+  } finally {
+    store.close();
+  }
+}
+
 function loadSessionAttachmentContext(params: {
   workspaceRoot: string;
   workspaceId: string;
@@ -1490,6 +1532,7 @@ function buildAgentRuntimeConfigRequest(params: {
   operatorSurfaceContext?: AgentOperatorSurfaceContext | null;
   pendingUserMemoryContext?: AgentPendingUserMemoryContext | null;
   sessionAttachmentContext?: AgentSessionAttachmentContext | null;
+  evaluationContext?: string | null;
   /** When set, this is a HolaApp session: the agent gets STRICTLY that app's MCP
    *  tools — no runtime/browser tools, no workspace skills, no extra tools. */
   appScope?: string | null;
@@ -1508,17 +1551,19 @@ function buildAgentRuntimeConfigRequest(params: {
     isDelegatingFrontSessionKind({
       sessionKind: normalizedSessionKind,
     });
+  const keepEvaluationTool = (toolId: string) =>
+    Boolean(params.evaluationContext) || !EVAL_RUNTIME_TOOL_IDS.has(toolId);
   const extraTools = projectExtraToolIdsForSession({
     harnessId: params.harnessId,
     sessionKind: normalizedSessionKind,
     extraToolIds: params.extraToolIds,
     appScope: params.appScope,
-  });
+  }).filter(keepEvaluationTool);
   const runtimeToolIds = projectRuntimeToolIdsForSession({
     sessionKind: normalizedSessionKind,
     runtimeToolIds: params.runtimeToolIds,
     appScope: params.appScope,
-  });
+  }).filter(keepEvaluationTool);
   const browserToolIds = projectBrowserToolIdsForSession({
     sessionKind: normalizedSessionKind,
     browserToolIds: params.browserToolIds,
@@ -1535,14 +1580,14 @@ function buildAgentRuntimeConfigRequest(params: {
         sessionKind: "subagent",
         extraToolIds: params.delegatedExtraToolIds ?? params.extraToolIds,
         appScope: params.appScope,
-      })
+      }).filter((toolId) => !EVAL_RUNTIME_TOOL_IDS.has(toolId))
     : null;
   const delegatedRuntimeToolIds = delegatedCapabilitySnapshotEligible
     ? projectRuntimeToolIdsForSession({
         sessionKind: "subagent",
         runtimeToolIds: params.runtimeToolIds,
         appScope: params.appScope,
-      })
+      }).filter((toolId) => !EVAL_RUNTIME_TOOL_IDS.has(toolId))
     : null;
   const delegatedBrowserToolIds = delegatedCapabilitySnapshotEligible
     ? projectBrowserToolIdsForSession({
@@ -1592,6 +1637,7 @@ function buildAgentRuntimeConfigRequest(params: {
     operator_surface_context: params.operatorSurfaceContext ?? undefined,
     pending_user_memory_context: params.pendingUserMemoryContext ?? undefined,
     session_attachment_context: params.sessionAttachmentContext ?? undefined,
+    evaluation_context: params.evaluationContext ?? undefined,
     selected_model: firstNonEmptyString(params.request.model) ?? undefined,
     default_provider_id: defaultProviderId(),
     session_mode: defaultSessionMode(),
@@ -2855,6 +2901,17 @@ export async function executeTsRunnerRequest(
           logger,
         }),
     );
+    const evaluationContext = measureBootstrapStage(
+      bootstrapStageTimingsMs,
+      "load_evaluation_context",
+      () =>
+        loadEvaluationContext({
+          workspaceRoot: bootstrap.workspaceRoot,
+          workspaceId: request.workspace_id,
+          sessionId: request.session_id,
+          logger,
+        }),
+    );
     const runtimeConfig = measureBootstrapStage(
       bootstrapStageTimingsMs,
       "project_runtime_config",
@@ -2898,6 +2955,7 @@ export async function executeTsRunnerRequest(
             operatorSurfaceContext,
             pendingUserMemoryContext,
             sessionAttachmentContext,
+            evaluationContext,
             appScope,
           }),
         ),

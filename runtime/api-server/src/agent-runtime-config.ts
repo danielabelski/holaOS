@@ -64,6 +64,7 @@ export interface AgentRuntimeConfigCliRequest {
   operator_surface_context?: AgentOperatorSurfaceContext | null;
   pending_user_memory_context?: AgentPendingUserMemoryContext | null;
   session_attachment_context?: AgentSessionAttachmentContext | null;
+  evaluation_context?: string | null;
   selected_model?: string | null;
   default_provider_id: string;
   session_mode: string;
@@ -1791,6 +1792,7 @@ export function projectAgentRuntimeConfig(
     operatorSurfaceContext: request.operator_surface_context ?? null,
     pendingUserMemoryContext: request.pending_user_memory_context ?? null,
     sessionAttachmentContext: request.session_attachment_context ?? null,
+    evaluationContext: request.evaluation_context ?? null,
     capabilityManifest,
     delegatedCapabilityManifest,
     toolNodeContext: toolNodeContextForPrompt,

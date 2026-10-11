@@ -1641,6 +1641,36 @@ export const RUNTIME_AGENT_TOOL_DEFINITIONS: RuntimeAgentToolDefinition[] = [
     path: "/api/v1/local-models/register",
     description: runtimeToolBaseDefinition("local_models_register").description
   },
+  {
+    id: runtimeToolBaseDefinition("eval_get").id,
+    method: "GET",
+    path: "/api/v1/evaluations/agent",
+    description: runtimeToolBaseDefinition("eval_get").description
+  },
+  {
+    id: runtimeToolBaseDefinition("eval_set_plan").id,
+    method: "POST",
+    path: "/api/v1/evaluations/agent/plan",
+    description: runtimeToolBaseDefinition("eval_set_plan").description
+  },
+  {
+    id: runtimeToolBaseDefinition("eval_propose_followup").id,
+    method: "POST",
+    path: "/api/v1/evaluations/agent/followups",
+    description: runtimeToolBaseDefinition("eval_propose_followup").description
+  },
+  {
+    id: runtimeToolBaseDefinition("eval_write_opinion").id,
+    method: "POST",
+    path: "/api/v1/evaluations/agent/opinion",
+    description: runtimeToolBaseDefinition("eval_write_opinion").description
+  },
+  {
+    id: runtimeToolBaseDefinition("eval_draft_posts").id,
+    method: "POST",
+    path: "/api/v1/evaluations/agent/posts",
+    description: runtimeToolBaseDefinition("eval_draft_posts").description
+  },
 ];
 
 export class RuntimeAgentToolsServiceError extends Error {
