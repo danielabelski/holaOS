@@ -195,7 +195,7 @@ function DataPanel({
             </div>
           ) : null}
           {markdown ? (
-            <div className="overflow-x-auto">
+            <div className="overflow-x-auto text-sm [&_table]:text-xs [&_td]:whitespace-nowrap [&_th]:whitespace-nowrap">
               <SimpleMarkdown className="chat-markdown">{markdown}</SimpleMarkdown>
             </div>
           ) : null}
@@ -367,8 +367,9 @@ function OpinionPanel({
             {unverified.length === 1
               ? "This number in your text isn't linked to the data: "
               : "These numbers in your text aren't linked to the data: "}
-            <span className="font-mono">{unverified.join(", ")}</span>. Insert
-            them from the list below so they can't drift from the results.
+            <span className="font-mono">{unverified.join(", ")}</span>. Cite
+            measured numbers from the list below so they can't drift from the
+            results.
             {dirty ? " (Checked against your last save.)" : ""}
           </Callout>
         ) : null}
@@ -551,7 +552,7 @@ function PublishPanel({
               Include raw data
             </span>
             <span className="text-muted-foreground text-xs">
-              Adds data.csv with every sample, so others can check your numbers.
+              Puts every task's raw output in report.html so others can check your numbers.
             </span>
           </span>
         </div>

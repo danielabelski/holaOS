@@ -14,6 +14,7 @@ import {
   formatMinutes,
   formatScalar,
   isRecord,
+  pluralize,
   proposalStatus,
   RUN_KIND_LABELS,
   readTarget,
@@ -247,7 +248,7 @@ function describeProposalRun(run: unknown): string {
     }
   }
   if (typeof run.samples === "number") {
-    parts.push(`${run.samples} samples`);
+    parts.push(pluralize(run.samples, "sample"));
   }
   return parts.length > 0 ? parts.join(" · ") : formatScalar(run);
 }

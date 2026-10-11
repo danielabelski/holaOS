@@ -34,6 +34,7 @@ import {
   type EvaluationDetail,
   errorMessage,
   formatMinutes,
+  pluralize,
   RUN_KIND_LABELS,
   readTarget,
   targetDetail,
@@ -586,7 +587,7 @@ function ReadOnlyRunRow({ run }: { run: EvalPlanRun }) {
     );
   }
   if (run.samples) {
-    parts.push(`${run.samples} samples`);
+    parts.push(pluralize(run.samples, "sample"));
   }
   if (run.sampling?.temperature != null) {
     parts.push(`temp ${run.sampling.temperature}`);
