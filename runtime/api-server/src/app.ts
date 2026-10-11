@@ -46,6 +46,7 @@ import {
   CronjobsServiceError,
   CapabilitiesServiceError,
   ChannelsServiceError,
+  EvalsServiceError,
   type OutputRecord as RemoteOutputRecord,
   type NotificationRecord as RemoteNotificationRecord,
   type CronjobRecord as RemoteCronjobRecord,
@@ -58,6 +59,15 @@ import {
 import { mountRemoteApiMcp } from "@holaboss/remote-api/mcp";
 import { mountRuntimeToolsMcp } from "./runtime-tools-mcp.js";
 import { registerLocalModelRoutes } from "./local-model-routes.js";
+import { EvaluationEngine } from "./evaluation-engine.js";
+import { bundledHolaevalPath, registerEvaluationAgentRoutes } from "./evaluation-routes.js";
+import {
+  EvaluationService,
+  EvaluationServiceError,
+  currentDefaultModel,
+  evaluationDir,
+  localEvalTargets,
+} from "./evaluation-service.js";
 import { resolveProductRuntimeConfig } from "./runtime-config.js";
 
 // Org-owned sessions: the org active RIGHT NOW (from runtime-config.json, which
@@ -248,6 +258,7 @@ import { materializeSkill } from "./workspace-skills-catalog.js";
 import { importSkillFromGithub, importSkillFromUpload, previewSkillFromGithub, SkillImportError } from "./workspace-skill-import.js";
 import { importPluginAsCapability } from "./import-plugin.js";
 import {
+  buildRunnerEnv,
   NativeRunnerExecutor,
   RunnerExecutorError,
   type RunnerExecutorLike,
@@ -3119,6 +3130,109 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
       model: view.model,
       updated_at: view.updatedAt,
     }) as unknown as RemoteChannelConnection;
+  const evaluationEngine = new EvaluationEngine({
+    store,
+    workspaceId: resolveCanonicalWs,
+    evalDir: (evalId) => evaluationDir(store, resolveCanonicalWs(), evalId),
+    holaevalPath: bundledHolaevalPath,
+    env: buildRunnerEnv,
+    contextWindowFor: (target) =>
+      localEvalTargets().find(
+        (option) =>
+          option.model_id === target.model_id &&
+          (option.provider_id === target.provider_id || option.base_url === target.base_url),
+      )?.context_window ?? null,
+    waitForBrainIdle: async (evalId) => {
+      const workspaceId = resolveCanonicalWs();
+      const evaluation = store.getEvaluation({ workspaceId, evalId });
+      const brain = evaluation?.brainModel ?? currentDefaultModel() ?? "";
+      if (!evaluation?.sessionId || !brain.startsWith("local_")) {
+        return;
+      }
+      const deadline = Date.now() + 15 * 60_000;
+      while (Date.now() < deadline) {
+        const state = store.getRuntimeState({ workspaceId, sessionId: evaluation.sessionId });
+        const status = (state?.status ?? "IDLE").toUpperCase();
+        if (status !== "BUSY" && status !== "QUEUED") {
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 3000));
+      }
+    },
+    onSettled: (event) => {
+      void evaluationService.onRunsSettled(event).catch((error: unknown) => {
+        app.log.warn(
+          { event: "evaluation.settled_notify", outcome: "error", eval_id: event.evalId, err: error },
+          "evaluation settle notification failed",
+        );
+      });
+    },
+    onError: (error, context) => {
+      app.log.error(
+        { event: "evaluation.run", outcome: "error", run_id: context.runId, err: error },
+        "evaluation run crashed",
+      );
+    },
+  });
+  const evaluationService: EvaluationService = new EvaluationService({
+    store,
+    engine: evaluationEngine,
+    workspaceId: resolveCanonicalWs,
+    evalDir: (evalId) => evaluationDir(store, resolveCanonicalWs(), evalId),
+    localTargets: localEvalTargets,
+    defaultModel: currentDefaultModel,
+    pythonEnv: buildRunnerEnv,
+    createSession: ({ title }) => {
+      const sessionId = randomUUID();
+      store.ensureSession({
+        workspaceId: resolveCanonicalWs(),
+        sessionId,
+        kind: "main_session",
+        title,
+        orgId: currentActiveOrgId(),
+      });
+      return sessionId;
+    },
+    queueSessionMessage: async ({ sessionId, text, model }) => {
+      const headers: Record<string, string> = { "content-type": "application/json" };
+      const token = (process.env.SANDBOX_RUNTIME_API_TOKEN ?? "").trim();
+      if (token) {
+        headers.authorization = `Bearer ${token}`;
+      }
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/v1/agent-sessions/queue",
+        headers,
+        payload: { workspace_id: resolveCanonicalWs(), session_id: sessionId, text, ...(model ? { model } : {}) },
+      });
+      if (response.statusCode >= 400) {
+        throw new Error(`queue message failed (${response.statusCode}): ${response.body.slice(0, 300)}`);
+      }
+    },
+  });
+  const evalsCall = async <T>(run: () => T | Promise<T>): Promise<T> => {
+    try {
+      return await run();
+    } catch (error) {
+      if (error instanceof EvaluationServiceError) {
+        throw new EvalsServiceError(error.code, { message: error.message });
+      }
+      throw error;
+    }
+  };
+  registerEvaluationAgentRoutes(app, () => evaluationService);
+  app.addHook("onReady", async () => {
+    try {
+      evaluationEngine.recoverInterruptedRuns();
+      evaluationEngine.wake();
+    } catch (error) {
+      app.log.warn({ event: "evaluation.recover", outcome: "error", err: error }, "evaluation recovery skipped");
+    }
+  });
+  app.addHook("onClose", async () => {
+    evaluationEngine.stop();
+  });
+
   const buildRemoteApiBaseContext = (): Omit<
     RemoteApiContext,
     "requestId" | "logger"
@@ -3651,6 +3765,27 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
           }
           return record as unknown as RemoteWorkspaceCapability;
         },
+      },
+      evals: {
+        list: (input) => evalsCall(() => evaluationService.list(input) as never),
+        get: (input) => evalsCall(() => evaluationService.get(input) as never),
+        targets: () => evalsCall(() => evaluationService.targets() as never),
+        create: (input) => evalsCall(() => evaluationService.create(input) as never),
+        update: (input) => evalsCall(() => evaluationService.update(input) as never),
+        setPlan: (input) => evalsCall(() => evaluationService.setPlan(input) as never),
+        start: (input) => evalsCall(() => evaluationService.start(input) as never),
+        cancel: (input) => evalsCall(() => evaluationService.cancel(input) as never),
+        retryRun: (input) => evalsCall(() => evaluationService.retryRun(input) as never),
+        decideProposal: (input) => evalsCall(() => evaluationService.decideProposal(input) as never),
+        saveOpinion: (input) => evalsCall(() => evaluationService.saveOpinion(input) as never),
+        report: (input) => evalsCall(() => evaluationService.report(input) as never),
+        exportReport: (input) => evalsCall(() => evaluationService.exportReport(input) as never),
+        publish: (input) => evalsCall(() => evaluationService.publish(input) as never),
+        setReportUrl: (input) => evalsCall(() => evaluationService.setReportUrl(input) as never),
+        saveDistribution: (input) => evalsCall(() => evaluationService.saveDistribution(input) as never),
+        createVersion: (input) => evalsCall(() => evaluationService.createVersion(input) as never),
+        importReproduction: (input) => evalsCall(() => evaluationService.importReproduction(input) as never),
+        delete: (input) => evalsCall(() => evaluationService.delete(input) as never),
       },
       skills: {
         // The skill catalog now lives in the marketplace (the single source of
