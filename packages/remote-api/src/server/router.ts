@@ -2,6 +2,7 @@ import { capabilitiesRouter } from "./capabilities";
 import { os } from "./base";
 import { channelsRouter } from "./channels";
 import { cronjobsRouter } from "./cronjobs";
+import { evalsRouter } from "./evals";
 import { memoryRouter } from "./memory";
 import { notificationsRouter } from "./notifications";
 import { outputsRouter } from "./outputs";
@@ -15,6 +16,7 @@ export const remoteApiRouter = os.router({
   capabilities: capabilitiesRouter,
   skills: skillsRouter,
   channels: channelsRouter,
+  evals: evalsRouter,
 });
 
 export type RemoteApiRouter = typeof remoteApiRouter;

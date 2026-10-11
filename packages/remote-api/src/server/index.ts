@@ -7,6 +7,7 @@ export {
   CronjobsServiceError,
   CapabilitiesServiceError,
   ChannelsServiceError,
+  EvalsServiceError,
 } from "./context";
 export type {
   RemoteApiContext,
@@ -18,6 +19,8 @@ export type {
   CapabilitiesService,
   ChannelsService,
   ChannelsServiceErrorCode,
+  EvalsService,
+  EvalsServiceErrorCode,
 } from "./context";
 export {
   createConsoleRemoteApiLogger,
