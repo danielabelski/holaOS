@@ -110,7 +110,7 @@ function fakeHolaeval(options: { failKind?: string } = {}) {
   return { spawnImpl, calls };
 }
 
-function setup(options: { failKind?: string } = {}) {
+function setup(options: { failKind?: string; isBlocked?: () => boolean } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "hb-evaluation-service-"));
   tempDirs.push(root);
   const store = new RuntimeStateStore({ dbPath: path.join(root, "runtime.db"), workspaceRoot: path.join(root, "workspace") });
@@ -127,6 +127,7 @@ function setup(options: { failKind?: string } = {}) {
     env: () => ({ ...process.env }),
     spawnImpl: fake.spawnImpl,
     fetchImpl: (async () => new Response("{}", { status: 200 })) as typeof fetch,
+    isBlocked: options.isBlocked,
     onSettled: (event) => {
       settled.push(event);
       void service.onRunsSettled(event);
@@ -429,4 +430,19 @@ test("engine marks runs interrupted by a restart as failed", async () => {
   const recovered = context.store.getEvaluationRun({ workspaceId, runId: String(first?.runId) });
   assert.equal(recovered?.status, "failed");
   assert.match(String(recovered?.error), /restarted/);
+});
+
+test("queued runs wait while a benchmark holds the machine", async () => {
+  let blocked = true;
+  const context = setup({ isBlocked: () => blocked });
+  const created = await context.service.create({ questionType: "single_model", question: "Usable?" });
+  const evalId = String(created.eval_id);
+  context.service.setPlan({ evalId, plan: fullPlan });
+  await startAndDrain(context, evalId);
+  assert.equal(context.fake.calls.length, 0);
+  assert.ok(context.store.listEvaluationRuns({ workspaceId, evalId }).every((run) => run.status === "queued"));
+  blocked = false;
+  await context.engine.drainForTest();
+  assert.ok(context.fake.calls.length > 0);
+  assert.ok(context.store.listEvaluationRuns({ workspaceId, evalId }).every((run) => run.status === "done"));
 });

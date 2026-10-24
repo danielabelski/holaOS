@@ -8,6 +8,7 @@ export {
   CapabilitiesServiceError,
   ChannelsServiceError,
   EvalsServiceError,
+  BenchServiceError,
 } from "./context";
 export type {
   RemoteApiContext,
@@ -21,6 +22,8 @@ export type {
   ChannelsServiceErrorCode,
   EvalsService,
   EvalsServiceErrorCode,
+  BenchService,
+  BenchServiceErrorCode,
 } from "./context";
 export {
   createConsoleRemoteApiLogger,

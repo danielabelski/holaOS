@@ -33,6 +33,8 @@ export interface EvaluationEngineDeps {
   fetchImpl?: typeof fetch;
   contextWindowFor?: (target: Record<string, unknown>) => number | null;
   waitForBrainIdle?: (evalId: string) => Promise<void>;
+  /** While true, queued runs wait; call wake() once it clears. */
+  isBlocked?: () => boolean;
   onSettled?: (event: EvaluationSettledEvent) => void;
   onError?: (error: unknown, context: { runId: string }) => void;
 }
@@ -201,7 +203,7 @@ export class EvaluationEngine {
   }
 
   private async drain(): Promise<void> {
-    while (!this.stopped) {
+    while (!this.stopped && !this.deps.isBlocked?.()) {
       const run = this.nextQueuedRun();
       if (!run) {
         return;

@@ -78,6 +78,14 @@ function baseContext(): Omit<RemoteApiContext, "identity"> {
       importReproduction: notUsed,
       delete: notUsed,
     },
+    bench: {
+      start: notUsed,
+      get: notUsed,
+      current: notUsed,
+      cancel: notUsed,
+      record: notUsed,
+      setArtifacts: notUsed,
+    },
     capabilities: {
       catalog: notUsed,
       listInstalled: notUsed,
@@ -105,6 +113,7 @@ export function makeTestContext(
     channels: { ...base.channels, ...overrides.channels },
     capabilities: { ...base.capabilities, ...overrides.capabilities },
     evals: { ...base.evals, ...overrides.evals },
+    bench: { ...base.bench, ...overrides.bench },
     identity: overrides.identity,
   };
 }

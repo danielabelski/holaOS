@@ -47,6 +47,8 @@ import {
   CapabilitiesServiceError,
   ChannelsServiceError,
   EvalsServiceError,
+  BenchServiceError,
+  type BenchServiceErrorCode,
   type OutputRecord as RemoteOutputRecord,
   type NotificationRecord as RemoteNotificationRecord,
   type CronjobRecord as RemoteCronjobRecord,
@@ -59,6 +61,7 @@ import {
 import { mountRemoteApiMcp } from "@holaboss/remote-api/mcp";
 import { mountRuntimeToolsMcp } from "./runtime-tools-mcp.js";
 import { registerLocalModelRoutes } from "./local-model-routes.js";
+import { BenchError, BenchRunner } from "./bench-runner.js";
 import { EvaluationEngine } from "./evaluation-engine.js";
 import { bundledHolaevalPath, registerEvaluationAgentRoutes } from "./evaluation-routes.js";
 import {
@@ -3130,12 +3133,14 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
       model: view.model,
       updated_at: view.updatedAt,
     }) as unknown as RemoteChannelConnection;
+  let benchRunner: BenchRunner | null = null;
   const evaluationEngine = new EvaluationEngine({
     store,
     workspaceId: resolveCanonicalWs,
     evalDir: (evalId) => evaluationDir(store, resolveCanonicalWs(), evalId),
     holaevalPath: bundledHolaevalPath,
     env: buildRunnerEnv,
+    isBlocked: () => benchRunner?.busy ?? false,
     contextWindowFor: (target) =>
       localEvalTargets().find(
         (option) =>
@@ -3221,6 +3226,38 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
     }
   };
   registerEvaluationAgentRoutes(app, () => evaluationService);
+  const benchDir = () => path.join(store.workspaceDir(resolveCanonicalWs()), "bench");
+  const bench = new BenchRunner({
+    stateDir: benchDir,
+    runDir: (runId) => path.join(benchDir(), runId),
+    holaevalPath: bundledHolaevalPath,
+    packsDir: () => path.join(path.dirname(bundledHolaevalPath()), "packs"),
+    env: buildRunnerEnv,
+    appVersion: () => process.env.HOLABOSS_DESKTOP_APP_VERSION?.trim() || "dev",
+    isBusy: () => evaluationEngine.busyWith !== null,
+    onIdle: () => evaluationEngine.wake(),
+    ...(process.env.HOLABOSS_EMBEDDED_RUNTIME === "1" ? {} : { findBinary: () => null }),
+  });
+  benchRunner = bench;
+  const BENCH_SERVICE_ERRORS: Partial<Record<BenchError["code"], BenchServiceErrorCode>> = {
+    busy: "BUSY",
+    invalid_subject: "INVALID_SUBJECT",
+    unknown_suite: "UNKNOWN_SUITE",
+    not_found: "NOT_FOUND",
+    not_ready: "NOT_READY",
+    invalid_artifacts: "INVALID_ARTIFACTS",
+  };
+  const benchCall = async <T>(run: () => T | Promise<T>): Promise<T> => {
+    try {
+      return await run();
+    } catch (error) {
+      const code = error instanceof BenchError ? BENCH_SERVICE_ERRORS[error.code] : undefined;
+      if (code) {
+        throw new BenchServiceError(code, { message: (error as Error).message });
+      }
+      throw error;
+    }
+  };
   app.addHook("onReady", async () => {
     try {
       evaluationEngine.recoverInterruptedRuns();
@@ -3228,9 +3265,13 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
     } catch (error) {
       app.log.warn({ event: "evaluation.recover", outcome: "error", err: error }, "evaluation recovery skipped");
     }
+    void bench.recover().catch((error: unknown) => {
+      app.log.warn({ event: "bench.recover", outcome: "error", err: error }, "bench orphan cleanup skipped");
+    });
   });
   app.addHook("onClose", async () => {
     evaluationEngine.stop();
+    await bench.shutdown();
   });
 
   const buildRemoteApiBaseContext = (): Omit<
@@ -3786,6 +3827,21 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
         createVersion: (input) => evalsCall(() => evaluationService.createVersion(input) as never),
         importReproduction: (input) => evalsCall(() => evaluationService.importReproduction(input) as never),
         delete: (input) => evalsCall(() => evaluationService.delete(input) as never),
+      },
+      bench: {
+        start: (input) => benchCall(() => bench.start(input) as never),
+        get: (input) => benchCall(() => bench.get(input.run_id, input.after ?? 0) as never),
+        current: () => ({ run: bench.current() as never }),
+        cancel: (input) => benchCall(() => bench.cancel(input.run_id) as never),
+        record: (input) => benchCall(() => ({ record: bench.record(input.run_id) })),
+        setArtifacts: (input) =>
+          benchCall(() => ({
+            record: bench.setArtifacts(input.run_id, {
+              recording: input.recording,
+              cards: input.cards,
+              recording_offset_s: input.recording_offset_s,
+            }),
+          })),
       },
       skills: {
         // The skill catalog now lives in the marketplace (the single source of

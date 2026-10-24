@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Evaluate an OpenAI-compatible model server that is already running.
 
-Subcommands: probe, speed, run, agent, tables, chart, selftest. Standard library only.
+Subcommands: probe, speed, run, bench, agent, tables, chart, selftest. Standard library only.
+bench talks to Ollama's native API instead, because /v1 cannot set the context size.
 """
 
 import argparse
@@ -25,6 +26,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+HOLAEVAL_VERSION = "1.1.0"
 HERE = Path(__file__).resolve().parent
 DEFAULT_PACK = HERE / "packs" / "general-v1.json"
 OTHER_VENDORS = {
@@ -208,6 +210,79 @@ def machine_info():
         if shutil.which("nvidia-smi"):
             out = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"], capture_output=True, text=True)
             info["gpus"] = [g.strip() for g in out.stdout.splitlines() if g.strip()]
+    elif sys.platform == "win32":
+        info.update(windows_machine_info())
+    return info
+
+
+def windows_machine_info():
+    import ctypes
+    import winreg
+
+    info = {}
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DESCRIPTION\System\CentralProcessor\0") as key:
+            info["cpu"] = winreg.QueryValueEx(key, "ProcessorNameString")[0].strip()
+    except OSError:
+        pass
+
+    class MemoryStatus(ctypes.Structure):
+        _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong), ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong), ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong), ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong), ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+    class PowerStatus(ctypes.Structure):
+        _fields_ = [("ACLineStatus", ctypes.c_byte), ("BatteryFlag", ctypes.c_byte), ("BatteryLifePercent", ctypes.c_byte),
+                    ("SystemStatusFlag", ctypes.c_byte), ("BatteryLifeTime", ctypes.c_ulong), ("BatteryFullLifeTime", ctypes.c_ulong)]
+
+    try:
+        mem = MemoryStatus()
+        mem.dwLength = ctypes.sizeof(MemoryStatus)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(mem)):
+            info["memory_gb"] = round(mem.ullTotalPhys / 2**30)
+        power = PowerStatus()
+        if ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(power)):
+            info["power"] = {1: "AC", 0: "battery"}.get(power.ACLineStatus)
+    except (AttributeError, OSError):
+        pass
+    # AdapterRAM in WMI is 32-bit and caps at 4 GB; the driver's qwMemorySize is the real figure.
+    gpus = []
+    display_class = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, display_class) as cls:
+            for i in range(winreg.QueryInfoKey(cls)[0]):
+                sub = winreg.EnumKey(cls, i)
+                if not sub.isdigit():
+                    continue
+                try:
+                    with winreg.OpenKey(cls, sub) as key:
+                        name = winreg.QueryValueEx(key, "DriverDesc")[0]
+                        vram = None
+                        for value in ("HardwareInformation.qwMemorySize", "HardwareInformation.MemorySize"):
+                            try:
+                                raw = winreg.QueryValueEx(key, value)[0]
+                                vram = int.from_bytes(raw, "little") if isinstance(raw, bytes) else int(raw)
+                                break
+                            except OSError:
+                                continue
+                except OSError:
+                    continue
+                if "Microsoft Basic" in name or "Remote Display" in name:
+                    continue
+                gpus.append(f"{name}, {round(vram / 2**20)} MiB" if vram else name)
+    except OSError:
+        pass
+    if shutil.which("nvidia-smi"):
+        try:
+            out = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
+                                 capture_output=True, text=True, timeout=10)
+            nvidia = [g.strip() for g in out.stdout.splitlines() if g.strip()]
+            gpus = nvidia + [g for g in gpus if "NVIDIA" not in g]
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    if gpus:
+        info["gpus"] = gpus
     return info
 
 
@@ -621,6 +696,265 @@ def cmd_speed(args):
     (out / f"speed-{args.label}.json").write_text(json.dumps(
         {"label": args.label, "model": model, "engine": info["engine"], "base_url": base, "gen_tokens": args.gen,
          "reps": args.reps, "context_window": ctx_window, "depths": rows, "concurrency": conc}, indent=2))
+
+
+# ---------- bench: one-click suite on Ollama's native API ----------
+
+DEFAULT_SUITE = HERE / "packs" / "suite-standard-1.0.json"
+BENCH_KEEP_ALIVE = "30m"
+RELOAD_THRESHOLD_S = 0.5
+SAMPLING_OPTIONS = ("temperature", "top_p", "top_k", "min_p", "repeat_penalty", "presence_penalty")
+
+
+def ollama_post(root, path, payload, timeout):
+    req = urllib.request.Request(root + path, data=json.dumps(payload).encode(), method="POST")
+    req.add_header("Content-Type", "application/json")
+    try:
+        return urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = json.loads(exc.read() or b"{}").get("error")
+        except ValueError:
+            detail = None
+        raise RuntimeError(f"HTTP {exc.code}: {detail or exc.reason}") from None
+
+
+def ollama_chat(root, payload, on_text=None, timeout=900):
+    """Stream /api/chat. Times are client-side; the *_s engine fields come from Ollama's final chunk."""
+    started = time.perf_counter()
+    first = last = None
+    content, thinking, tool_calls = [], [], []
+    final = {}
+    with ollama_post(root, "/api/chat", dict(payload, stream=True), timeout) as r:
+        for raw in r:
+            line = raw.strip()
+            if not line:
+                continue
+            evt = json.loads(line)
+            if evt.get("error"):
+                raise RuntimeError(evt["error"])
+            msg = evt.get("message") or {}
+            piece = msg.get("content") or ""
+            thought = msg.get("thinking") or ""
+            if piece or thought or msg.get("tool_calls"):
+                now = time.perf_counter()
+                first = first or now
+                last = now
+            content.append(piece)
+            thinking.append(thought)
+            tool_calls.extend(msg.get("tool_calls") or [])
+            if on_text and (piece or thought):
+                on_text(thought + piece)
+            if evt.get("done"):
+                final = evt
+                break
+    ns = lambda key: (final.get(key) or 0) / 1e9
+    return {
+        "ttft_s": first - started if first else None,
+        "gen_s": last - first if first and last else None,
+        "total_s": time.perf_counter() - started,
+        "content": "".join(content),
+        "thinking": "".join(thinking),
+        "tool_calls": tool_calls or None,
+        "done_reason": final.get("done_reason"),
+        "eval_count": final.get("eval_count") or 0,
+        "eval_s": ns("eval_duration"),
+        "prompt_eval_count": final.get("prompt_eval_count") or 0,
+        "prompt_eval_s": ns("prompt_eval_duration"),
+        "load_s": ns("load_duration"),
+    }
+
+
+def strip_think(text):
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)
+    cut = text.find("<think>")
+    return (text[:cut] if cut >= 0 else text).strip()
+
+
+def loaded_model(root, model):
+    running = try_json(root + "/api/ps") or {}
+    for m in running.get("models", []):
+        if m.get("name") == model or m.get("model") == model:
+            size, vram = m.get("size"), m.get("size_vram")
+            return {"model_bytes": size, "vram_bytes": vram,
+                    "cpu_offload": bool(size and vram is not None and vram < size)}
+    return {"model_bytes": None, "vram_bytes": None, "cpu_offload": None}
+
+
+class Emitter:
+    """JSON lines on stdout; text deltas are batched so the run view gets ~10 updates a second."""
+
+    def __init__(self):
+        self.pending = []
+        self.task = None
+        self.flushed_at = 0.0
+
+    def __call__(self, event, **fields):
+        self.flush()
+        print(json.dumps({"event": event, "t": round(time.time(), 3), **fields}, ensure_ascii=False), flush=True)
+
+    def text(self, delta):
+        self.pending.append(delta)
+        if time.perf_counter() - self.flushed_at > 0.1:
+            self.flush()
+
+    def flush(self):
+        if self.pending:
+            # Ollama streams one token per chunk, so n is the token count of this delta.
+            print(json.dumps({"event": "text", "task": self.task, "delta": "".join(self.pending), "n": len(self.pending)},
+                             ensure_ascii=False), flush=True)
+            self.pending = []
+        self.flushed_at = time.perf_counter()
+
+
+def speed_task_id(depth):
+    return "speed@0" if depth == 0 else f"speed@{depth // 1024}k"
+
+
+def bench_speed(root, model, depth, cfg, base_options, extra, emit):
+    task = speed_task_id(depth)
+    emit.task = task
+    emit("task_start", task=task, kind="speed", depth=depth)
+    runs = []
+    reps = cfg.get("warmup_reps", 1) + cfg["reps"]
+    # filler_text estimates 4.2 chars/token; the warmup's real count rescales it so depth holds for any tokenizer.
+    filler_tokens = depth
+    for rep in range(reps):
+        def request():
+            nonce = "%08x" % random.getrandbits(32)
+            prefix = " ".join(filler_text(filler_tokens, seed=f"{nonce}{depth}")) + "\n\n" if depth else ""
+            payload = {"model": model, "messages": [{"role": "user", "content": f"[{nonce}] {prefix}{COUNT_PROMPT}"}],
+                       "options": dict(base_options, temperature=0, num_predict=cfg["gen_tokens"]),
+                       "keep_alive": BENCH_KEEP_ALIVE, **extra}
+            return ollama_chat(root, payload, on_text=emit.text)
+        r = request()
+        if rep < cfg.get("warmup_reps", 1):
+            if depth and r["prompt_eval_count"]:
+                filler_tokens = round(filler_tokens * depth / r["prompt_eval_count"])
+            continue
+        reloaded = r["load_s"] > RELOAD_THRESHOLD_S
+        if reloaded:
+            r = request()
+            reloaded = r["load_s"] > RELOAD_THRESHOLD_S
+        n = r["eval_count"]
+        runs.append({
+            "ttft_ms": round(r["ttft_s"] * 1000) if r["ttft_s"] else None,
+            "completion_tokens": n,
+            "prompt_tokens": r["prompt_eval_count"],
+            "decode_tps": round((n - 1) / r["gen_s"], 1) if r["gen_s"] and n > 1 else None,
+            "engine_decode_tps": round(n / r["eval_s"], 1) if r["eval_s"] and n else None,
+            "engine_prefill_tps": round(r["prompt_eval_count"] / r["prompt_eval_s"], 1) if r["prompt_eval_s"] else None,
+            "load_ms": round(r["load_s"] * 1000),
+            "reloaded": reloaded,
+            "seconds": round(r["total_s"], 2),
+        })
+    metrics = {"depth": depth, "runs": runs}
+    for key in ("ttft_ms", "decode_tps", "engine_decode_tps", "engine_prefill_tps"):
+        vals = [run[key] for run in runs if run.get(key)]
+        if vals:
+            metrics[key] = round(statistics.mean(vals), 1)
+            metrics[key + "_sd"] = round(statistics.pstdev(vals), 1)
+    metrics.update(loaded_model(root, model))
+    result = {"task": task, "kind": "speed", "status": "ok", "metrics": metrics,
+              "tokens": sum(run["completion_tokens"] for run in runs), "time": round(sum(run["seconds"] for run in runs), 1)}
+    emit("task_done", task=task, kind="speed", decode_tps=metrics.get("decode_tps"), ttft_ms=metrics.get("ttft_ms"))
+    return result
+
+
+def bench_task(root, model, task, samples, base_options, extra, capabilities, emit):
+    emit.task = task["id"]
+    emit("task_start", task=task["id"], kind="task", category=task["category"], samples=samples)
+    if task.get("tools") and "tools" not in capabilities:
+        emit("task_done", task=task["id"], kind="task", status="unsupported")
+        return {"task": task["id"], "kind": "task", "category": task["category"], "status": "unsupported",
+                "reason": "this Ollama model has no tools capability", "pass": None, "passed": 0, "samples": 0,
+                "score": None, "tokens": 0, "time": 0}
+    recs = []
+    for sample in range(samples):
+        payload = {"model": model, "messages": build_messages(task),
+                   "options": dict(base_options, num_predict=task.get("max_tokens", 6000)),
+                   "keep_alive": BENCH_KEEP_ALIVE, **extra}
+        if task.get("tools"):
+            payload["tools"] = task["tools"]
+        try:
+            r = ollama_chat(root, payload, on_text=emit.text)
+            raw = r["content"]
+            resp = {"content": strip_think(raw), "tool_calls": r["tool_calls"],
+                    "finish_reason": "length" if r["done_reason"] == "length" else "stop",
+                    "usage": {"prompt_tokens": r["prompt_eval_count"], "completion_tokens": r["eval_count"]}}
+            hay = task.get("haystack")
+            if hay and r["prompt_eval_count"] and r["prompt_eval_count"] < 0.7 * hay["approx_tokens"]:
+                resp["prompt_truncated"] = True
+            passed, reason = grade(task, resp, {"engine": "ollama", "identity": []})
+            rec = {"sample": sample, "passed": bool(passed), "reason": reason, "tokens": r["eval_count"],
+                   "seconds": round(r["total_s"], 2), "content": raw, "thinking": r["thinking"], "tool_calls": r["tool_calls"]}
+        except Exception as exc:
+            rec = {"sample": sample, "passed": False, "reason": f"request failed: {exc}", "tokens": 0, "seconds": 0}
+        recs.append(rec)
+        emit("sample_done", task=task["id"], sample=sample, passed=rec["passed"], reason=rec["reason"])
+    passed = sum(rec["passed"] for rec in recs)
+    reasons = {}
+    for rec in recs:
+        if not rec["passed"]:
+            reasons[rec["reason"] or "failed"] = reasons.get(rec["reason"] or "failed", 0) + 1
+    errored = all(rec["reason"] and rec["reason"].startswith("request failed") for rec in recs)
+    result = {"task": task["id"], "kind": "task", "category": task["category"], "status": "error" if errored else "ok",
+              "pass": passed == samples, "passed": passed, "samples": samples, "score": round(passed / samples, 3),
+              "reasons": reasons, "tokens": sum(rec["tokens"] for rec in recs),
+              "time": round(sum(rec["seconds"] for rec in recs), 1), "attempts": recs}
+    emit("task_done", task=task["id"], kind="task", status=result["status"], passed=passed, samples=samples)
+    return result
+
+
+def cmd_bench(args):
+    root = server_root(args.base_url.strip().rstrip("/"))
+    pack_path = Path(args.pack)
+    pack = load_pack(pack_path)
+    subject = json.loads(Path(args.subject).read_text()) if args.subject else {}
+    model = args.model
+    emit = Emitter()
+    started = time.time()
+    show = http_json(root + "/api/show", {"model": model}, timeout=60)
+    capabilities = show.get("capabilities") or []
+    sampling = {k: v for k, v in dict(pack.get("sampling") or {}, **(subject.get("sampling") or {})).items() if k in SAMPLING_OPTIONS}
+    extra = {"think": subject["think"]} if "think" in subject else {}
+    base_options = {"num_ctx": pack["num_ctx"]}
+    samples = args.samples or pack.get("samples", 3)
+    emit("start", model=model, suite=f"{pack['id']}@{pack['version']}", capabilities=capabilities)
+
+    emit.task = "warmup"
+    emit("task_start", task="warmup", kind="warmup")
+    warm = ollama_chat(root, {"model": model, "messages": [{"role": "user", "content": "Reply with OK."}],
+                              "options": dict(base_options, temperature=0, num_predict=16),
+                              "keep_alive": BENCH_KEEP_ALIVE, **extra})
+    emit("task_done", task="warmup", kind="warmup", load_ms=round(warm["load_s"] * 1000))
+
+    results = []
+    only = [s for s in (args.only or "").split(",") if s]
+    for depth in pack["speed"]["depths"]:
+        if not only or speed_task_id(depth) in only:
+            results.append(bench_speed(root, model, depth, pack["speed"], base_options, extra, emit))
+    for task in pack["tasks"]:
+        if not only or task["id"] in only:
+            results.append(bench_task(root, model, task, samples, dict(base_options, **sampling), extra, capabilities, emit))
+
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    record = {
+        "suite": {"id": pack["id"], "version": pack["version"], "sha256": sha256_file(pack_path)},
+        "test_agent": {"executor": f"holaeval@{HOLAEVAL_VERSION}", "judge": f"holaeval@{HOLAEVAL_VERSION}"},
+        "model": model,
+        "capabilities": capabilities,
+        "request": {"num_ctx": pack["num_ctx"], "sampling": sampling, "samples": samples, "keep_alive": BENCH_KEEP_ALIVE, **extra},
+        "warmup_load_ms": round(warm["load_s"] * 1000),
+        "machine": machine_info(),
+        "results": results,
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started)),
+        "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "wall_seconds": round(time.time() - started, 1),
+    }
+    (out / f"bench-{args.label}.json").write_text(json.dumps(record, indent=2, ensure_ascii=False))
+    emit("done", file=str(out / f"bench-{args.label}.json"))
 
 
 # ---------- agent: virtual workspace ----------
@@ -1969,7 +2303,137 @@ def cmd_selftest(_args):
     assert normalize_base("localhost:8080") == "http://localhost:8080/v1"
     assert normalize_base("http://127.0.0.1:11434/v1/") == "http://127.0.0.1:11434/v1"
     agent_ids = selftest_agent()
-    print(f"selftest ok ({len(ids)} tasks in {pack['id']}, {len(agent_ids)} agent tasks)")
+    bench_ids = selftest_bench()
+    print(f"selftest ok ({len(ids)} tasks in {pack['id']}, {len(agent_ids)} agent tasks, {len(bench_ids)} bench results)")
+
+
+MERGE_OK = ("def merge_intervals(intervals):\n    out = []\n    for s, e in sorted(intervals):\n"
+            "        if out and s <= out[-1][1]:\n            out[-1][1] = max(out[-1][1], e)\n"
+            "        else:\n            out.append([s, e])\n    return out\n")
+
+
+def fake_ollama(capabilities, model="m:q4", port=0, version="0.12.6"):
+    """Minimal Ollama: version, tags, pull, show, ps and streaming chat. Returns (server, root, requests)."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    requests = []
+
+    def script(prompt, body):
+        if body.get("tools"):
+            return [], [{"function": {"name": "search_flights", "arguments": {"origin": "SFO", "destination": "NRT", "date": "2026-11-03"}}}]
+        if COUNT_PROMPT in prompt:
+            return ["one", ", two"] * (body["options"]["num_predict"] // 2), None
+        if "merge_intervals" in prompt:
+            return ["<think>```python\ndef merge_intervals(x):\n    return x\n```</think>", f"```python\n{MERGE_OK}```"], None
+        if "blue vault" in prompt:
+            return ["<think>maybe 0000-AA</think>", "7391-QX"], None
+        return ["OK"], None
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+        def reply(self, obj, code=200):
+            data = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            if self.path == "/api/version":
+                return self.reply({"version": version})
+            if self.path == "/api/tags":
+                return self.reply({"models": [{"name": model, "model": model, "digest": "fakedigest"}]})
+            if self.path == "/api/ps":
+                return self.reply({"models": [{"name": model, "model": model, "size": 2000, "size_vram": 1500}]})
+            self.reply({"error": "not found"}, 404)
+
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            requests.append((self.path, body))
+            if self.path == "/api/show":
+                return self.reply({"capabilities": capabilities})
+            if self.path == "/api/pull":
+                self.send_response(200)
+                self.end_headers()
+                for line in ({"status": "pulling manifest"}, {"status": "downloading", "completed": 1, "total": 1}, {"status": "success"}):
+                    self.wfile.write(json.dumps(line).encode() + b"\n")
+                return
+            if body.get("tools") and "tools" not in capabilities:
+                return self.reply({"error": f"{model} does not support tools"}, 400)
+            prompt = body["messages"][-1]["content"]
+            chunks, calls = script(prompt, body)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.end_headers()
+            for chunk in chunks:
+                self.wfile.write(json.dumps({"message": {"role": "assistant", "content": chunk}, "done": False}).encode() + b"\n")
+            if calls:
+                self.wfile.write(json.dumps({"message": {"role": "assistant", "content": "", "tool_calls": calls}, "done": False}).encode() + b"\n")
+            n = max(len(chunks), 1)
+            self.wfile.write(json.dumps({"message": {"role": "assistant", "content": ""}, "done": True, "done_reason": "stop",
+                                         "eval_count": n, "eval_duration": n * 10_000_000, "prompt_eval_count": len(prompt) // 4,
+                                         "prompt_eval_duration": 20_000_000, "load_duration": 1_000_000}).encode() + b"\n")
+
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, f"http://127.0.0.1:{server.server_address[1]}", requests
+
+
+def selftest_bench():
+    import contextlib
+    import io
+
+    assert strip_think("<think>a</think>\nB") == "B" and strip_think("A<think>unfinished") == "A"
+    assert speed_task_id(0) == "speed@0" and speed_task_id(8192) == "speed@8k"
+    suite = load_pack(DEFAULT_SUITE)
+    general = {t["id"]: t for t in load_pack(DEFAULT_PACK)["tasks"]}
+    assert all(t == general[t["id"]] for t in suite["tasks"]), "suite tasks must stay identical to general-v1"
+
+    def bench(capabilities, **overrides):
+        server, root, requests = fake_ollama(capabilities)
+        with tempfile.TemporaryDirectory() as d:
+            ns = argparse.Namespace(base_url=root, model="m:q4", pack=str(DEFAULT_SUITE), subject=None, out=d,
+                                    label="t", samples=None, only="")
+            for key, value in overrides.items():
+                setattr(ns, key, value)
+            buf = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(buf):
+                    cmd_bench(ns)
+            finally:
+                server.shutdown()
+            record = json.loads((Path(d) / "bench-t.json").read_text())
+        events = [json.loads(line) for line in buf.getvalue().splitlines()]
+        return record, events, requests
+
+    record, events, requests = bench(["completion", "tools"])
+    by_task = {r["task"]: r for r in record["results"]}
+    assert list(by_task) == ["speed@0", "speed@8k", "code-intervals", "tool-flight", "needle-8k"], list(by_task)
+    for tid in ("code-intervals", "tool-flight", "needle-8k"):
+        assert (by_task[tid]["passed"], by_task[tid]["samples"], by_task[tid]["pass"]) == (3, 3, True), (tid, by_task[tid]["reasons"])
+    speed = by_task["speed@0"]["metrics"]
+    assert len(speed["runs"]) == 3 and speed["decode_tps"] and speed["cpu_offload"] is True and speed["vram_bytes"] == 1500
+    deep = [run["prompt_tokens"] for run in by_task["speed@8k"]["metrics"]["runs"]]
+    assert all(abs(n - 8192) < 0.05 * 8192 for n in deep), f"8k depth not calibrated: {deep}"
+    chats = [body for path, body in requests if path == "/api/chat"]
+    assert all(body["options"]["num_ctx"] == suite["num_ctx"] and body["keep_alive"] == BENCH_KEEP_ALIVE for body in chats)
+    count = [body for body in chats if COUNT_PROMPT in body["messages"][-1]["content"]]
+    assert len(count) == 8 and all(b["options"]["temperature"] == 0 and b["options"]["num_predict"] == 256 for b in count)
+    assert len({b["messages"][-1]["content"] for b in count}) == 8, "speed prompts must differ so Ollama cannot reuse its prompt cache"
+    graded = [body for body in chats if body not in count and body["options"].get("num_predict") != 16]
+    assert len(graded) == 9 and all(b["options"]["temperature"] == suite["sampling"]["temperature"] for b in graded)
+    assert record["suite"]["id"] == "suite-standard" and len(record["suite"]["sha256"]) == 64
+    kinds = [e["event"] for e in events]
+    assert kinds[0] == "start" and kinds[-1] == "done" and "text" in kinds and kinds.count("sample_done") == 9
+    assert sum(e["n"] for e in events if e["event"] == "text" and e["task"] == "speed@0") == 4 * 256
+
+    record, _, requests = bench(["completion"], only="tool-flight")
+    assert record["results"][0]["status"] == "unsupported" and record["results"][0]["pass"] is None
+    assert not any(body.get("tools") for path, body in requests if path == "/api/chat")
+    return list(by_task)
 
 
 def scripted_model(steps):
@@ -2146,6 +2610,16 @@ def main():
     p.add_argument("--concurrency", default="")
     p.add_argument("--context-window", type=int)
     p.set_defaults(fn=cmd_speed)
+    p = sub.add_parser("bench")
+    p.add_argument("--base-url", required=True)
+    p.add_argument("--model", required=True)
+    p.add_argument("--pack", default=str(DEFAULT_SUITE))
+    p.add_argument("--subject")
+    p.add_argument("--out", required=True)
+    p.add_argument("--label", default="main")
+    p.add_argument("--samples", type=int)
+    p.add_argument("--only", default="")
+    p.set_defaults(fn=cmd_bench)
     p = sub.add_parser("agent")
     p.add_argument("--base-url", required=True)
     p.add_argument("--model")

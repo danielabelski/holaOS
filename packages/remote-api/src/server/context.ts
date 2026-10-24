@@ -17,6 +17,8 @@ type SkillsInputs = RemoteApiInputs["skills"];
 type SkillsOutputs = RemoteApiOutputs["skills"];
 type EvalsInputs = RemoteApiInputs["evals"];
 type EvalsOutputs = RemoteApiOutputs["evals"];
+type BenchInputs = RemoteApiInputs["bench"];
+type BenchOutputs = RemoteApiOutputs["bench"];
 
 type MaybePromise<T> = T | Promise<T>;
 
@@ -189,6 +191,19 @@ export interface EvalsService {
 }
 
 /**
+ * The runtime-supplied one-click benchmark. `start` throws {@link BenchServiceError} for input it
+ * refuses; failures during a run are reported on the run itself.
+ */
+export interface BenchService {
+  start(input: BenchInputs["start"]): MaybePromise<BenchOutputs["start"]>;
+  get(input: BenchInputs["get"]): MaybePromise<BenchOutputs["get"]>;
+  current(input: BenchInputs["current"]): MaybePromise<BenchOutputs["current"]>;
+  cancel(input: BenchInputs["cancel"]): MaybePromise<BenchOutputs["cancel"]>;
+  record(input: BenchInputs["record"]): MaybePromise<BenchOutputs["record"]>;
+  setArtifacts(input: BenchInputs["setArtifacts"]): MaybePromise<BenchOutputs["setArtifacts"]>;
+}
+
+/**
  * Authenticated caller identity for a request. Present once the Remote boundary
  * verifies an OAuth-scoped workspace token (roadmap B1); absent on the
  * in-process path (the runtime supplies no token). The authz middleware no-ops
@@ -213,6 +228,7 @@ export interface RemoteApiContext {
   skills: SkillsCatalogService;
   channels: ChannelsService;
   evals: EvalsService;
+  bench: BenchService;
   /** Authenticated caller identity; absent on the in-process path (no-op authz). */
   identity?: RemoteApiIdentity;
   /** Correlation id for this request; echoed in every log line on both sides. */
@@ -259,6 +275,24 @@ export class EvalsServiceError extends Error {
   constructor(code: EvalsServiceErrorCode, options?: { message?: string }) {
     super(options?.message ?? code);
     this.name = "EvalsServiceError";
+    this.code = code;
+  }
+}
+
+export type BenchServiceErrorCode =
+  | "BUSY"
+  | "INVALID_SUBJECT"
+  | "UNKNOWN_SUITE"
+  | "NOT_FOUND"
+  | "NOT_READY"
+  | "INVALID_ARTIFACTS";
+
+export class BenchServiceError extends Error {
+  readonly code: BenchServiceErrorCode;
+
+  constructor(code: BenchServiceErrorCode, options?: { message?: string }) {
+    super(options?.message ?? code);
+    this.name = "BenchServiceError";
     this.code = code;
   }
 }

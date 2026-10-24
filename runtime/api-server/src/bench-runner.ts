@@ -1,0 +1,479 @@
+import { type ChildProcess, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+import {
+  type BenchHighlight,
+  type BenchSubject,
+  type RunRecord,
+  BenchSubjectError,
+  type HolaevalBenchOutput,
+  buildRunRecord,
+  minOllamaVersion,
+  parseBenchSubject,
+} from "./bench-run-record.js";
+import {
+  OLLAMA_DOWNLOAD_URL,
+  type OllamaEvidence,
+  OllamaInstance,
+  OllamaInstanceError,
+  type OllamaPullProgress,
+  type UserLoadedModel,
+  cleanupOrphanOllama,
+  compareOllamaVersions,
+  findOllamaBinary,
+  unloadUserModel,
+  userLoadedModels,
+} from "./ollama-instance.js";
+
+export const BENCH_SUITES: Readonly<Record<string, string>> = {
+  "suite-standard@1.0": "suite-standard-1.0.json",
+};
+
+const STDERR_TAIL_BYTES = 4000;
+const BENCH_LABEL = "main";
+const BUSY_SAMPLE_MS = 1000;
+export const BUSY_CPU_PCT = 25;
+
+export type BenchStatus = "running" | "done" | "failed" | "cancelled";
+export type BenchPhase = "preflight" | "starting" | "pulling" | "running" | "finishing";
+export type BenchErrorCode =
+  | "busy"
+  | "invalid_subject"
+  | "unknown_suite"
+  | "not_found"
+  | "not_ready"
+  | "invalid_artifacts"
+  | "ollama_missing"
+  | "ollama_too_old"
+  | "user_models_loaded"
+  | "start_failed"
+  | "pull_failed"
+  | "bench_failed";
+
+export interface BenchEvent {
+  seq: number;
+  at: number;
+  type: string;
+  [field: string]: unknown;
+}
+
+export interface BenchRunState {
+  run_id: string;
+  status: BenchStatus;
+  phase: BenchPhase;
+  suite: string;
+  subject: BenchSubject;
+  error: { code: BenchErrorCode; message: string; details?: Record<string, unknown> } | null;
+  run_dir: string;
+  record_path: string | null;
+  started_at: string;
+  finished_at: string | null;
+}
+
+export class BenchError extends Error {
+  readonly code: BenchErrorCode;
+  readonly details?: Record<string, unknown>;
+
+  constructor(code: BenchErrorCode, message: string, details?: Record<string, unknown>) {
+    super(message);
+    this.name = "BenchError";
+    this.code = code;
+    this.details = details;
+  }
+}
+
+export interface BenchInstance {
+  readonly baseUrl: string;
+  start(): Promise<{ baseUrl: string; version: string }>;
+  assertMinVersion(minVersion: string): void;
+  pull(model: string, onProgress?: (progress: OllamaPullProgress) => void): Promise<void>;
+  digest(model: string): Promise<string | null>;
+  evidence(): OllamaEvidence;
+  stop(): Promise<void>;
+}
+
+type SpawnImpl = (command: string, args: string[], options: { cwd: string; env: NodeJS.ProcessEnv }) => ChildProcess;
+
+export interface BenchRunnerDeps {
+  stateDir: () => string;
+  runDir: (runId: string) => string;
+  holaevalPath: () => string;
+  packsDir: () => string;
+  env: () => NodeJS.ProcessEnv;
+  appVersion: () => string;
+  python?: string;
+  isBusy?: () => boolean;
+  onIdle?: () => void;
+  findBinary?: () => string | null;
+  createInstance?: (binary: string) => BenchInstance;
+  userModels?: () => Promise<UserLoadedModel[]>;
+  unloadUserModel?: (name: string) => Promise<void>;
+  spawnImpl?: SpawnImpl;
+  fetchImpl?: typeof fetch;
+  cpuBusy?: () => Promise<number | null>;
+}
+
+/** Share of CPU time spent busy across all cores over a short window. */
+export async function measureCpuBusy(windowMs = BUSY_SAMPLE_MS): Promise<number | null> {
+  const totals = () =>
+    os.cpus().reduce(
+      (sum, cpu) => {
+        const { idle, ...rest } = cpu.times;
+        const busy = Object.values(rest).reduce((a, b) => a + b, 0);
+        return { busy: sum.busy + busy, all: sum.all + busy + idle };
+      },
+      { busy: 0, all: 0 },
+    );
+  const before = totals();
+  await new Promise((resolve) => setTimeout(resolve, windowMs));
+  const after = totals();
+  const all = after.all - before.all;
+  return all > 0 ? Math.round(((after.busy - before.busy) / all) * 100) : null;
+}
+
+interface RunEntry {
+  state: BenchRunState;
+  events: BenchEvent[];
+  unloadUserModels: boolean;
+  child: ChildProcess | null;
+  instance: BenchInstance | null;
+  cancelled: boolean;
+}
+
+export class BenchRunner {
+  private readonly deps: BenchRunnerDeps;
+  private readonly runs = new Map<string, RunEntry>();
+  private active: string | null = null;
+
+  constructor(deps: BenchRunnerDeps) {
+    this.deps = deps;
+  }
+
+  get busy(): boolean {
+    return this.active !== null;
+  }
+
+  async recover(): Promise<boolean> {
+    return await cleanupOrphanOllama(this.deps.stateDir(), this.deps.fetchImpl);
+  }
+
+  async shutdown(): Promise<void> {
+    const entry = this.active ? this.runs.get(this.active) : undefined;
+    if (entry) {
+      entry.cancelled = true;
+      entry.child?.kill("SIGTERM");
+      await entry.instance?.stop();
+    }
+  }
+
+  start(input: { subject: unknown; suite: string; unload_user_models?: boolean }): BenchRunState {
+    if (this.active || this.deps.isBusy?.()) {
+      throw new BenchError("busy", "Another benchmark or evaluation is running. Wait for it to finish.");
+    }
+    let subject: BenchSubject;
+    try {
+      subject = parseBenchSubject(input.subject);
+    } catch (error) {
+      if (error instanceof BenchSubjectError) {
+        throw new BenchError("invalid_subject", error.message);
+      }
+      throw error;
+    }
+    if (!BENCH_SUITES[input.suite]) {
+      throw new BenchError("unknown_suite", `Unknown suite ${input.suite}.`);
+    }
+    const runId = randomUUID();
+    const runDir = this.deps.runDir(runId);
+    fs.mkdirSync(runDir, { recursive: true });
+    fs.writeFileSync(path.join(runDir, "subject.json"), `${JSON.stringify(subject, null, 2)}\n`);
+    const entry: RunEntry = {
+      state: {
+        run_id: runId,
+        status: "running",
+        phase: "preflight",
+        suite: input.suite,
+        subject,
+        error: null,
+        run_dir: runDir,
+        record_path: null,
+        started_at: new Date().toISOString(),
+        finished_at: null,
+      },
+      events: [],
+      unloadUserModels: input.unload_user_models === true,
+      child: null,
+      instance: null,
+      cancelled: false,
+    };
+    this.runs.set(runId, entry);
+    this.active = runId;
+    this.emit(entry, "run_started", { suite: input.suite, subject_id: subject.id });
+    void this.execute(entry);
+    return { ...entry.state };
+  }
+
+  current(): BenchRunState | null {
+    const entry = this.active ? this.runs.get(this.active) : undefined;
+    return entry ? { ...entry.state } : null;
+  }
+
+  get(runId: string, after = 0): { run: BenchRunState; events: BenchEvent[] } {
+    const entry = this.runs.get(runId);
+    if (!entry) {
+      throw new BenchError("not_found", "benchmark run not found");
+    }
+    return { run: { ...entry.state }, events: entry.events.filter((event) => event.seq > after) };
+  }
+
+  record(runId: string): Record<string, unknown> {
+    const entry = this.runs.get(runId);
+    if (!entry) {
+      throw new BenchError("not_found", "benchmark run not found");
+    }
+    if (!entry.state.record_path) {
+      throw new BenchError("not_ready", "the run has not produced a Run Record");
+    }
+    return JSON.parse(fs.readFileSync(entry.state.record_path, "utf8")) as Record<string, unknown>;
+  }
+
+  /** Called by the desktop once the recording and cards exist; `recording_offset_s` is how long after run start recording began. */
+  setArtifacts(
+    runId: string,
+    input: { recording: { file: string; scored_run: boolean } | null; cards: string[]; recording_offset_s?: number },
+  ): Record<string, unknown> {
+    const record = this.record(runId) as unknown as RunRecord;
+    const entry = this.runs.get(runId) as RunEntry;
+    const inRunDir = (file: string) => {
+      const name = path.basename(file);
+      if (!fs.existsSync(path.join(entry.state.run_dir, name))) {
+        throw new BenchError("invalid_artifacts", `${name} is not in this run's directory.`);
+      }
+      return name;
+    };
+    const offset = input.recording ? (input.recording_offset_s ?? 0) : 0;
+    record.artifacts = {
+      recording: input.recording ? { file: inRunDir(input.recording.file), scored_run: input.recording.scored_run } : null,
+      cards: input.cards.map(inRunDir),
+      highlights: benchHighlights(entry.events).map((h) => ({ ...h, t: Math.max(0, Math.round((h.t - offset) * 10) / 10) })),
+    };
+    fs.writeFileSync(entry.state.record_path as string, `${JSON.stringify(record, null, 2)}\n`);
+    return record as unknown as Record<string, unknown>;
+  }
+
+  cancel(runId: string): BenchRunState {
+    const entry = this.runs.get(runId);
+    if (!entry) {
+      throw new BenchError("not_found", "benchmark run not found");
+    }
+    if (entry.state.status === "running") {
+      entry.cancelled = true;
+      entry.child?.kill("SIGTERM");
+      void entry.instance?.stop();
+    }
+    return { ...entry.state };
+  }
+
+  private emit(entry: RunEntry, type: string, fields: Record<string, unknown> = {}): void {
+    entry.events.push({ ...fields, seq: entry.events.length + 1, at: Date.now(), type });
+  }
+
+  private setPhase(entry: RunEntry, phase: BenchPhase): void {
+    entry.state.phase = phase;
+    this.emit(entry, "phase", { phase });
+  }
+
+  private throwIfCancelled(entry: RunEntry): void {
+    if (entry.cancelled) {
+      throw new BenchError("bench_failed", "cancelled");
+    }
+  }
+
+  private async execute(entry: RunEntry): Promise<void> {
+    const { subject } = entry.state;
+    let instance: BenchInstance | null = null;
+    try {
+      const binary = (this.deps.findBinary ?? (() => findOllamaBinary()))();
+      if (!binary) {
+        throw new BenchError("ollama_missing", "Ollama is not installed.", { download_url: OLLAMA_DOWNLOAD_URL });
+      }
+      const loaded = await (this.deps.userModels ?? (() => userLoadedModels(this.deps.fetchImpl)))();
+      if (loaded.length > 0) {
+        if (!entry.unloadUserModels) {
+          throw new BenchError(
+            "user_models_loaded",
+            "Your own Ollama has models in memory. They would slow the benchmark down.",
+            { models: loaded },
+          );
+        }
+        const unload = this.deps.unloadUserModel ?? ((name: string) => unloadUserModel(name, this.deps.fetchImpl));
+        for (const model of loaded) {
+          await unload(model.name);
+        }
+        this.emit(entry, "user_models_unloaded", { models: loaded.map((model) => model.name) });
+      }
+
+      const cpuBusy = await (this.deps.cpuBusy ?? measureCpuBusy)();
+      if (cpuBusy !== null && cpuBusy >= BUSY_CPU_PCT) {
+        this.emit(entry, "machine_busy", { cpu_busy_pct: cpuBusy });
+      }
+
+      const packPath = path.join(this.deps.packsDir(), BENCH_SUITES[entry.state.suite]);
+      const pack = JSON.parse(fs.readFileSync(packPath, "utf8")) as { min_ollama_version?: string };
+      instance = (this.deps.createInstance ?? ((bin: string) => new OllamaInstance({ binary: bin, stateDir: this.deps.stateDir() })))(binary);
+      entry.instance = instance;
+      this.setPhase(entry, "starting");
+      const { version } = await instance.start();
+      this.emit(entry, "engine_ready", { engine: "ollama", version });
+      const floor = minOllamaVersion(pack.min_ollama_version, subject, compareOllamaVersions);
+      if (floor) {
+        instance.assertMinVersion(floor);
+      }
+      this.throwIfCancelled(entry);
+
+      this.setPhase(entry, "pulling");
+      await instance.pull(subject.ollama.tag, (progress) => this.emit(entry, "pull_progress", { ...progress }));
+      const digest = await instance.digest(subject.ollama.tag);
+      this.throwIfCancelled(entry);
+
+      this.setPhase(entry, "running");
+      const bench = await this.runHolaeval(entry, instance.baseUrl, packPath);
+
+      this.setPhase(entry, "finishing");
+      const record = buildRunRecord({
+        runId: entry.state.run_id,
+        bench,
+        subject,
+        digest,
+        evidence: instance.evidence(),
+        appVersion: this.deps.appVersion(),
+        artifacts: { recording: null, cards: [], highlights: benchHighlights(entry.events) },
+        conditions: { cpu_busy_pct: cpuBusy },
+      });
+      const recordPath = path.join(entry.state.run_dir, "run-record.json");
+      fs.writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`);
+      entry.state.record_path = recordPath;
+      entry.state.status = "done";
+    } catch (error) {
+      if (entry.cancelled) {
+        entry.state.status = "cancelled";
+      } else {
+        entry.state.status = "failed";
+        entry.state.error =
+          error instanceof BenchError || error instanceof OllamaInstanceError
+            ? { code: error.code, message: error.message, ...(error instanceof BenchError && error.details ? { details: error.details } : {}) }
+            : { code: "bench_failed", message: error instanceof Error ? error.message : String(error) };
+      }
+    } finally {
+      await instance?.stop().catch(() => undefined);
+      entry.instance = null;
+      entry.state.finished_at = new Date().toISOString();
+      this.emit(entry, "run_finished", { status: entry.state.status });
+      fs.writeFileSync(
+        path.join(entry.state.run_dir, "events.jsonl"),
+        entry.events.map((event) => JSON.stringify(event)).join("\n") + "\n",
+      );
+      this.active = null;
+      this.deps.onIdle?.();
+    }
+  }
+
+  private async runHolaeval(entry: RunEntry, baseUrl: string, packPath: string): Promise<HolaevalBenchOutput> {
+    const runDir = entry.state.run_dir;
+    const args = [
+      "-I",
+      this.deps.holaevalPath(),
+      "bench",
+      "--base-url",
+      baseUrl,
+      "--model",
+      entry.state.subject.ollama.tag,
+      "--pack",
+      packPath,
+      "--subject",
+      path.join(runDir, "subject.json"),
+      "--out",
+      runDir,
+      "--label",
+      BENCH_LABEL,
+    ];
+    const spawnImpl: SpawnImpl = this.deps.spawnImpl ?? ((command, spawnArgs, options) => spawn(command, spawnArgs, options));
+    const python = this.deps.python ?? (process.platform === "win32" ? "python" : "python3");
+    const child = spawnImpl(python, args, { cwd: runDir, env: { ...this.deps.env(), PYTHONUNBUFFERED: "1" } });
+    entry.child = child;
+    let stderr = "";
+    let buffer = "";
+    const onLine = (line: string) => {
+      if (!line.startsWith("{")) {
+        return;
+      }
+      try {
+        const { event, t: _t, ...fields } = JSON.parse(line) as Record<string, unknown>;
+        if (typeof event === "string") {
+          this.emit(entry, event, fields);
+        }
+      } catch {
+        // not an event line
+      }
+    };
+    child.stdout?.setEncoding("utf8");
+    child.stderr?.setEncoding("utf8");
+    child.stdout?.on("data", (chunk: string) => {
+      buffer += chunk;
+      let newline = buffer.indexOf("\n");
+      while (newline >= 0) {
+        onLine(buffer.slice(0, newline).trim());
+        buffer = buffer.slice(newline + 1);
+        newline = buffer.indexOf("\n");
+      }
+    });
+    child.stderr?.on("data", (chunk: string) => {
+      stderr = (stderr + chunk).slice(-STDERR_TAIL_BYTES);
+    });
+    const code = await new Promise<number | null>((resolve) => {
+      child.on("error", (error) => {
+        stderr += `\n${error.message}`;
+        resolve(-1);
+      });
+      child.on("close", (exitCode) => {
+        onLine(buffer.trim());
+        resolve(exitCode);
+      });
+    });
+    entry.child = null;
+    this.throwIfCancelled(entry);
+    if (code !== 0) {
+      const last = stderr.trim().split("\n").pop() ?? `exited with code ${code}`;
+      throw new BenchError("bench_failed", `The benchmark stopped: ${last}`);
+    }
+    return JSON.parse(fs.readFileSync(path.join(runDir, `bench-${BENCH_LABEL}.json`), "utf8")) as HolaevalBenchOutput;
+  }
+}
+
+/** Seconds from `run_started`, which is when the desktop starts recording. */
+export function benchHighlights(events: BenchEvent[]): BenchHighlight[] {
+  const origin = events.find((event) => event.type === "run_started")?.at;
+  if (origin === undefined) {
+    return [];
+  }
+  const at = (event: BenchEvent) => Math.round((event.at - origin) / 100) / 10;
+  const highlights: BenchHighlight[] = [];
+  const seen = new Set<string>();
+  for (const event of events) {
+    const task = typeof event.task === "string" ? event.task : undefined;
+    if (!task || task === "warmup") {
+      continue;
+    }
+    if (event.type === "text" && !seen.has(task)) {
+      seen.add(task);
+      highlights.push({ t: at(event), label: "first_token", task });
+    } else if (event.type === "task_done") {
+      highlights.push({ t: at(event), label: event.status === "error" ? "error" : "task_done", task });
+    } else if (event.type === "sample_done" && typeof event.reason === "string" && event.reason.startsWith("request failed")) {
+      highlights.push({ t: at(event), label: "error", task });
+    }
+  }
+  return highlights;
+}
