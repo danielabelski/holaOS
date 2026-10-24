@@ -2,6 +2,7 @@ import type { BenchRun, BenchRunSummary, BenchSubject } from "@holaboss/remote-a
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import {
+  ArrowUpRight,
   Check,
   Download,
   ExternalLink,
@@ -362,7 +363,7 @@ function FinishedPanel({ finished, runDir, onRunAgain }: { finished: FinishedRun
       <div className="flex flex-wrap gap-2">
         {publishedUrl ? (
           <Button onClick={() => void window.electronAPI.ui.openExternalUrl(publishedUrl)} size="sm" type="button">
-            <ExternalLink className="size-3.5" />
+            <ArrowUpRight className="size-3.5" />
             View on HolaHub
           </Button>
         ) : (
