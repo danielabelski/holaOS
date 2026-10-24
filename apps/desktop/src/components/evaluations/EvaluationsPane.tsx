@@ -34,6 +34,7 @@ import {
 } from "./format";
 import { StatusPill } from "./parts";
 import { ReproduceDialog } from "./ReproduceDialog";
+import { RunBenchmarkButton } from "./RunBenchmarkButton";
 import { newEvaluationDialogOpenAtom } from "./state";
 import { useOpenEvaluation } from "./useOpenEvaluation";
 
@@ -93,6 +94,7 @@ export function EvaluationsPane() {
               <Upload className="size-3.5" />
               Reproduce from report
             </Button>
+            <RunBenchmarkButton />
             <Button
               className="h-7 gap-1.5"
               onClick={() => setNewDialogOpen(true)}

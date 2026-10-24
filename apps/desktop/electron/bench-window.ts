@@ -16,14 +16,13 @@ import {
   BENCH_CARD_SIZE,
   BENCH_WINDOW_SIZE,
   type BenchDeepLink,
-  benchSubjectUrl,
+  benchCatalog,
   isBenchRunDir,
   isCardName,
+  loadBenchContext,
   xIntentUrl,
 } from "./bench-links";
 import type { BenchKitFile, BenchWindowContext } from "../shared/bench-protocol";
-
-const SUBJECT_FETCH_TIMEOUT_MS = 10_000;
 
 export interface BenchWindowDeps {
   preloadPath: string;
@@ -41,33 +40,12 @@ export function createBenchWindowController(deps: BenchWindowDeps) {
   let win: BrowserWindow | null = null;
   let context: BenchWindowContext | null = null;
 
-  async function fetchSubject(link: BenchDeepLink): Promise<BenchWindowContext> {
-    const base: BenchWindowContext = {
-      subject: null,
-      subject_id: link.subjectId,
-      suite: link.suite,
-      error: null,
-      result_base_url: deps.resultBaseUrl(),
-    };
-    const subjectsBaseUrl = deps.subjectsBaseUrl();
-    if (!subjectsBaseUrl) {
-      return { ...base, error: "Model pages are not configured in this build." };
-    }
-    try {
-      const response = await (deps.fetchImpl ?? fetch)(benchSubjectUrl(subjectsBaseUrl, link.subjectId), {
-        signal: AbortSignal.timeout(SUBJECT_FETCH_TIMEOUT_MS),
-      });
-      if (!response.ok) {
-        return { ...base, error: `Could not load this model (${response.status}).` };
-      }
-      return { ...base, subject: (await response.json()) as Record<string, unknown> };
-    } catch {
-      return { ...base, error: "Could not load this model. Check your connection and open the link again." };
-    }
-  }
-
   async function open(link: BenchDeepLink): Promise<void> {
-    context = await fetchSubject(link);
+    context = await loadBenchContext(link, {
+      subjectsBaseUrl: deps.subjectsBaseUrl(),
+      resultBaseUrl: deps.resultBaseUrl(),
+      fetchImpl: deps.fetchImpl,
+    });
     if (win && !win.isDestroyed()) {
       win.webContents.send("bench:context", context);
       if (win.isMinimized()) {
@@ -228,5 +206,5 @@ export function createBenchWindowController(deps: BenchWindowDeps) {
     });
   }
 
-  return { open, register, window: currentWindow };
+  return { open, register, window: currentWindow, catalog: benchCatalog };
 }

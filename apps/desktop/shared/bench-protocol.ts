@@ -15,3 +15,10 @@ export interface BenchKitFile {
   path?: string;
   text?: string;
 }
+
+export interface BenchCatalogEntry {
+  id: string;
+  name: string;
+  vendor: string | null;
+  quant: string;
+}

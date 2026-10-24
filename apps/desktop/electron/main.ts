@@ -1,6 +1,6 @@
 // holaboss-2026.616.1 bundle cycle: cdhash 1ee72b15 stuck in Apple notary; bump bytes to force fresh ticket.
 import { loadDesktopEnv } from "./desktopEnv";
-import { parseBenchDeepLink } from "./bench-links";
+import { benchLinkFromApp, parseBenchDeepLink } from "./bench-links";
 import { createBenchWindowController } from "./bench-window";
 import { applyLoginShellPathToEnv } from "./shell-path";
 import { ensureExtractedWindowsRuntime } from "./runtime-archive";
@@ -28086,6 +28086,14 @@ app.whenReady().then(async () => {
     },
   );
   benchWindow.register();
+  handleTrustedIpc("bench:catalog", ["main"], () => benchWindow.catalog());
+  handleTrustedIpc("bench:open", ["main"], async (_event, subjectId: unknown) => {
+    const link = benchLinkFromApp(subjectId);
+    if (!link) {
+      throw new Error("Unknown model.");
+    }
+    await benchWindow.open(link);
+  });
   handleTrustedIpc(
     "clipboard:readImage",
     ["main"],

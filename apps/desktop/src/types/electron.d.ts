@@ -2441,6 +2441,11 @@ declare global {
 			writeText: (text: string) => Promise<void>;
 		};
 		bench: {
+			/** Main window only: the models that can be benchmarked, and opening the bench window for one. */
+			catalog: () => Promise<
+				import("../../shared/bench-protocol").BenchCatalogEntry[]
+			>;
+			open: (subjectId: string) => Promise<void>;
 			getContext: () => Promise<
 				import("../../shared/bench-protocol").BenchWindowContext | null
 			>;

@@ -1,4 +1,8 @@
-import type { BenchKitFile, BenchWindowContext } from "../shared/bench-protocol.js";
+import type {
+	BenchCatalogEntry,
+	BenchKitFile,
+	BenchWindowContext,
+} from "../shared/bench-protocol.js";
 import {
 	type ChatStartInput,
 	HOST_EMPLOYEES_CHANGED_EVENT,
@@ -1746,6 +1750,10 @@ contextBridge.exposeInMainWorld("electronAPI", {
 			ipcRenderer.invoke("clipboard:writeText", text) as Promise<void>,
 	},
 	bench: {
+		catalog: () =>
+			ipcRenderer.invoke("bench:catalog") as Promise<BenchCatalogEntry[]>,
+		open: (subjectId: string) =>
+			ipcRenderer.invoke("bench:open", subjectId) as Promise<void>,
 		getContext: () =>
 			ipcRenderer.invoke("bench:getContext") as Promise<BenchWindowContext | null>,
 		onContext: (listener: (context: BenchWindowContext) => void) => {
