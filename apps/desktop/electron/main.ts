@@ -1850,6 +1850,13 @@ const benchWindow = createBenchWindowController({
     (HUB_APP_BASE_URL ? `${HUB_APP_BASE_URL}/bench/subjects` : ""),
   resultBaseUrl: () => (HUB_APP_BASE_URL ? `${HUB_APP_BASE_URL}/bench/runs` : ""),
   workspaceRoot: () => path.join(runtimeSandboxRoot(), "workspace"),
+  hubApiBaseUrl: () =>
+    AUTH_BASE_URL && HUB_APP_BASE_URL ? `${AUTH_BASE_URL}/gateway/hub` : "",
+  cookieHeader: () => authCookieHeader(),
+  submitterName: async () => {
+    const user = await getAuthenticatedUser().catch(() => null);
+    return typeof user?.name === "string" ? user.name.trim() : "";
+  },
 });
 
 // Where web HolaApp MCP servers are reached — an SSE MCP at

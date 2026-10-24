@@ -11,6 +11,11 @@ export interface BenchWindowContext {
   show_run_id: string | null;
 }
 
+/** Publishing a finished run to its public HolaHub page. */
+export type BenchPublishResult =
+  | { ok: true; id: string; url: string }
+  | { ok: false; reason: "signed_out" | "not_configured" };
+
 export interface BenchKitFile {
   name: string;
   /** Exactly one of `path` (a file in the run directory) or `text`. */

@@ -2471,6 +2471,10 @@ declare global {
 				files: import("../../shared/bench-protocol").BenchKitFile[],
 			) => Promise<{ path: string | null }>;
 			showInFolder: (runDir: string) => Promise<void>;
+			/** Publishes a finished run to its public HolaHub page. */
+			publish: (
+				runDir: string,
+			) => Promise<import("../../shared/bench-protocol").BenchPublishResult>;
 			share: (
 				runDir: string,
 				cardFile: string,

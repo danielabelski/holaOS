@@ -1,6 +1,7 @@
 import type {
 	BenchCatalogEntry,
 	BenchKitFile,
+	BenchPublishResult,
 	BenchWindowContext,
 } from "../shared/bench-protocol.js";
 import {
@@ -1785,6 +1786,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
 			) as Promise<{ path: string | null }>,
 		showInFolder: (runDir: string) =>
 			ipcRenderer.invoke("bench:showInFolder", runDir) as Promise<void>,
+		publish: (runDir: string) =>
+			ipcRenderer.invoke("bench:publish", runDir) as Promise<BenchPublishResult>,
 		share: (runDir: string, cardFile: string, text: string, url: string) =>
 			ipcRenderer.invoke(
 				"bench:share",

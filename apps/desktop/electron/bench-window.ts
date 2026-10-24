@@ -21,9 +21,10 @@ import {
   isBenchRunDir,
   isCardName,
   loadBenchContext,
+  publishBenchRun,
   xIntentUrl,
 } from "./bench-links";
-import type { BenchKitFile, BenchWindowContext } from "../shared/bench-protocol";
+import type { BenchKitFile, BenchPublishResult, BenchWindowContext } from "../shared/bench-protocol";
 
 export interface BenchWindowDeps {
   preloadPath: string;
@@ -34,6 +35,12 @@ export interface BenchWindowDeps {
   resultBaseUrl: () => string;
   /** `<sandbox>/workspace`, the parent of every workspace directory. */
   workspaceRoot: () => string;
+  /** HolaHub's API through the BFF, e.g. `<api>/gateway/hub`; empty disables publishing. */
+  hubApiBaseUrl: () => string;
+  /** The signed-in session's cookie, or "" when signed out. */
+  cookieHeader: () => string;
+  /** Who the public page says ran it. */
+  submitterName: () => Promise<string>;
   fetchImpl?: typeof fetch;
 }
 
@@ -177,6 +184,16 @@ export function createBenchWindowController(deps: BenchWindowDeps) {
     await shell.openExternal(xIntentUrl(text, url));
   }
 
+  async function publish(runDir: string): Promise<BenchPublishResult> {
+    return publishBenchRun(assertRunDir(runDir), {
+      hubApiBaseUrl: deps.hubApiBaseUrl(),
+      resultBaseUrl: deps.resultBaseUrl(),
+      cookie: deps.cookieHeader(),
+      submitterName: deps.submitterName,
+      fetchImpl: deps.fetchImpl,
+    });
+  }
+
   function showInFolder(runDir: string): void {
     const dir = assertRunDir(runDir);
     shell.showItemInFolder(path.join(dir, "run-record.json"));
@@ -208,6 +225,7 @@ export function createBenchWindowController(deps: BenchWindowDeps) {
       exportKit(runDir, suggestedName, files),
     );
     fromBenchWindow("bench:showInFolder", (runDir: string) => showInFolder(runDir));
+    fromBenchWindow("bench:publish", (runDir: string) => publish(runDir));
     fromBenchWindow("bench:share", (runDir: string, cardFile: string, text: string, url: string) =>
       share(runDir, cardFile, text, url),
     );

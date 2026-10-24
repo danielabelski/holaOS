@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
@@ -10,6 +12,7 @@ import {
   isCardName,
   loadBenchContext,
   parseBenchDeepLink,
+  publishBenchRun,
   xIntentUrl,
 } from "./bench-links.js";
 
@@ -104,4 +107,75 @@ test("an unknown model with no HolaHub copy reports an error", async () => {
   const context = await loadBenchContext({ subjectId: "nope", suite: "suite-standard@1.0" }, deps(notFound));
   assert.equal(context.subject, null);
   assert.match(context.error ?? "", /404/);
+});
+
+const RUN_ID = "65d4e76d-73d6-41a4-bd0a-d3faa38507d1";
+
+async function runDirWithCards(cards: string[]) {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "bench-publish-"));
+  await fs.writeFile(path.join(dir, "run-record.json"), JSON.stringify({ schema: "hola.run-record/0.1", run_id: RUN_ID }));
+  for (const card of cards) {
+    await fs.writeFile(path.join(dir, card), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+  }
+  return dir;
+}
+
+function hubStub(status: number, body: unknown) {
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const fetchImpl = (async (url: string, init: RequestInit) => {
+    calls.push({ url, init });
+    return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+  }) as unknown as typeof fetch;
+  return { calls, fetchImpl };
+}
+
+const publishOptions = (overrides: Partial<Parameters<typeof publishBenchRun>[1]> = {}) => ({
+  hubApiBaseUrl: "https://api.example/gateway/hub",
+  resultBaseUrl: "https://hub.example/bench/runs/",
+  cookie: "session=abc",
+  submitterName: async () => "Ada",
+  ...overrides,
+});
+
+test("publishing sends the record and the cards that exist, with the session", async () => {
+  const dir = await runDirWithCards(["benchmark-card.png"]);
+  const hub = hubStub(201, { id: RUN_ID });
+  const result = await publishBenchRun(dir, publishOptions({ fetchImpl: hub.fetchImpl }));
+  assert.deepEqual(result, { ok: true, id: RUN_ID, url: `https://hub.example/bench/runs/${RUN_ID}` });
+  assert.equal(hub.calls[0]?.url, "https://api.example/gateway/hub/bench/runs");
+  assert.equal((hub.calls[0]?.init.headers as Record<string, string>).cookie, "session=abc");
+  const sent = JSON.parse(String(hub.calls[0]?.init.body));
+  assert.equal(sent.run_record.run_id, RUN_ID);
+  assert.deepEqual(Object.keys(sent.cards), ["benchmark"]);
+  assert.equal(sent.submitter_name, "Ada");
+});
+
+test("publishing without a session or a hub never calls out", async () => {
+  const dir = await runDirWithCards([]);
+  const hub = hubStub(201, { id: RUN_ID });
+  assert.deepEqual(await publishBenchRun(dir, publishOptions({ cookie: "", fetchImpl: hub.fetchImpl })), {
+    ok: false,
+    reason: "signed_out",
+  });
+  assert.deepEqual(await publishBenchRun(dir, publishOptions({ hubApiBaseUrl: "", fetchImpl: hub.fetchImpl })), {
+    ok: false,
+    reason: "not_configured",
+  });
+  assert.equal(hub.calls.length, 0);
+});
+
+test("an expired session reads as signed out, and a refusal says why", async () => {
+  const dir = await runDirWithCards([]);
+  assert.deepEqual(await publishBenchRun(dir, publishOptions({ fetchImpl: hubStub(401, { error: "unauthorized" }).fetchImpl })), {
+    ok: false,
+    reason: "signed_out",
+  });
+  await assert.rejects(
+    publishBenchRun(dir, publishOptions({ fetchImpl: hubStub(409, { error: "run_id_taken" }).fetchImpl })),
+    /Another account already published this run/,
+  );
+  await assert.rejects(
+    publishBenchRun(dir, publishOptions({ fetchImpl: hubStub(201, { id: "../../x" }).fetchImpl })),
+    /could not publish/,
+  );
 });

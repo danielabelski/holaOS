@@ -6,6 +6,7 @@ import {
   Download,
   ExternalLink,
   FolderOpen,
+  Globe,
   Loader2,
   Play,
   RotateCw,
@@ -17,7 +18,7 @@ import {
 import { holabossLogoUrl } from "@/lib/assetPaths";
 import { remoteApi } from "@/lib/remoteApiClient";
 import { cn } from "@/lib/utils";
-import type { BenchWindowContext } from "../../../shared/bench-protocol";
+import type { BenchPublishResult, BenchWindowContext } from "../../../shared/bench-protocol";
 import { cardAssets } from "./cardAssets";
 import { benchmarkCardHtml, capabilityCardHtml } from "./cards";
 import { kitFileName, narrationScript, resultsCsv, shareText } from "./kit";
@@ -260,10 +261,42 @@ function RunError({ run, onRetry, onUnloadAndRun }: { run: BenchRun; onRetry: ()
   );
 }
 
+const PUBLISH_REFUSED: Record<Extract<BenchPublishResult, { ok: false }>["reason"], string> = {
+  signed_out: "Sign in to holaOS in the main window to publish.",
+  not_configured: "Publishing isn't set up in this build.",
+};
+
 function FinishedPanel({ finished, runDir, onRunAgain }: { finished: FinishedRun; runDir: string; onRunAgain: () => void }) {
-  const [busy, setBusy] = useState<"kit" | "share" | null>(null);
+  const [busy, setBusy] = useState<"kit" | "share" | "publish" | null>(null);
   const [note, setNote] = useState<string | null>(null);
+  const [publishedUrl, setPublishedUrl] = useState<string | null>(null);
   const machineBusy = wasBusy(finished.record);
+  // The card's QR code and the post both link to the run's page, so it has to exist first.
+  const ensurePublished = async (): Promise<string | null> => {
+    if (publishedUrl) {
+      return publishedUrl;
+    }
+    const result = await window.electronAPI.bench.publish(runDir);
+    if (!result.ok) {
+      setNote(PUBLISH_REFUSED[result.reason]);
+      return null;
+    }
+    setPublishedUrl(result.url);
+    return result.url;
+  };
+  const publish = async () => {
+    setBusy("publish");
+    setNote(null);
+    try {
+      if (await ensurePublished()) {
+        setNote("Published. Anyone with the link can see this run.");
+      }
+    } catch (error) {
+      setNote(error instanceof Error ? error.message : "Could not publish.");
+    } finally {
+      setBusy(null);
+    }
+  };
   const exportKit = async () => {
     setBusy("kit");
     setNote(null);
@@ -293,8 +326,13 @@ function FinishedPanel({ finished, runDir, onRunAgain }: { finished: FinishedRun
       return;
     }
     setBusy("share");
+    setNote(null);
     try {
-      await window.electronAPI.bench.share(runDir, card.file, shareText(finished.record), finished.url);
+      const url = await ensurePublished();
+      if (!url) {
+        return;
+      }
+      await window.electronAPI.bench.share(runDir, card.file, shareText(finished.record), url);
       setNote("Card copied. Paste it into your post.");
     } catch (error) {
       setNote(error instanceof Error ? error.message : "Could not share.");
@@ -322,7 +360,18 @@ function FinishedPanel({ finished, runDir, onRunAgain }: { finished: FinishedRun
         <img alt={card.name} className="w-full rounded-lg ring-1 ring-border" key={card.name} src={card.dataUrl} />
       ))}
       <div className="flex flex-wrap gap-2">
-        <Button disabled={busy !== null} onClick={() => void exportKit()} size="sm" type="button">
+        {publishedUrl ? (
+          <Button onClick={() => void window.electronAPI.ui.openExternalUrl(publishedUrl)} size="sm" type="button">
+            <ExternalLink className="size-3.5" />
+            View on HolaHub
+          </Button>
+        ) : (
+          <Button disabled={busy !== null} onClick={() => void publish()} size="sm" type="button">
+            {busy === "publish" ? <Loader2 className="size-3.5 animate-spin" /> : <Globe className="size-3.5" />}
+            Publish to HolaHub
+          </Button>
+        )}
+        <Button disabled={busy !== null} onClick={() => void exportKit()} size="sm" type="button" variant="outline">
           {busy === "kit" ? <Loader2 className="size-3.5 animate-spin" /> : <Download className="size-3.5" />}
           Export creator kit
         </Button>
@@ -607,7 +656,7 @@ export function BenchApp() {
 
         <section className="flex min-h-0 flex-col gap-4 overflow-y-auto border-border border-l p-4">
           {finished && !isRunning ? (
-            <FinishedPanel finished={finished} onRunAgain={() => subject && void start(subject)} runDir={finished.runDir} />
+            <FinishedPanel finished={finished} key={finished.record.run_id} onRunAgain={() => subject && void start(subject)} runDir={finished.runDir} />
           ) : (
             <div className="flex flex-col gap-4 px-1">
               <Label>What this measures</Label>

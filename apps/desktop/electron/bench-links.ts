@@ -1,5 +1,6 @@
+import fs from "node:fs/promises";
 import path from "node:path";
-import type { BenchCatalogEntry, BenchWindowContext } from "../shared/bench-protocol";
+import type { BenchCatalogEntry, BenchPublishResult, BenchWindowContext } from "../shared/bench-protocol";
 import { BUNDLED_BENCH_SUBJECTS } from "../shared/bench-subjects";
 
 export const BENCH_DEEP_LINK_HOST = "bench";
@@ -13,6 +14,12 @@ const SUBJECT_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,99}$/;
 const SUITE_PATTERN = /^[a-z0-9-]+@[0-9][0-9.]*$/;
 const RUN_DIR_NAME_PATTERN = /^[0-9a-f-]{36}$/;
 const CARD_NAME_PATTERN = /^[a-z0-9-]+$/;
+/** Card files in a run directory, by the name HolaHub stores them under. */
+const PUBLISHED_CARDS = [
+  ["benchmark", "benchmark-card.png"],
+  ["capability", "capability-card.png"],
+] as const;
+const PUBLISH_TIMEOUT_MS = 30_000;
 
 export interface BenchDeepLink {
   subjectId: string;
@@ -108,4 +115,51 @@ export function isCardName(name: string): boolean {
 export function xIntentUrl(text: string, url: string): string {
   const params = new URLSearchParams({ text, url });
   return `https://twitter.com/intent/tweet?${params.toString()}`;
+}
+
+export interface BenchPublishOptions {
+  /** HolaHub's API through the BFF, e.g. `<api>/gateway/hub`; empty disables publishing. */
+  hubApiBaseUrl: string;
+  /** e.g. `<HolaHub>/bench/runs`. */
+  resultBaseUrl: string;
+  /** The signed-in session's cookie, or "" when signed out. */
+  cookie: string;
+  submitterName: () => Promise<string>;
+  fetchImpl?: typeof fetch;
+}
+
+/** Sends a finished run's record and cards to HolaHub, which decides what the run is worth. */
+export async function publishBenchRun(runDir: string, options: BenchPublishOptions): Promise<BenchPublishResult> {
+  if (!options.hubApiBaseUrl) {
+    return { ok: false, reason: "not_configured" };
+  }
+  if (!options.cookie) {
+    return { ok: false, reason: "signed_out" };
+  }
+  const runRecord = JSON.parse(await fs.readFile(path.join(runDir, "run-record.json"), "utf8"));
+  const cards: Record<string, string> = {};
+  for (const [card, file] of PUBLISHED_CARDS) {
+    const bytes = await fs.readFile(path.join(runDir, file)).catch(() => null);
+    if (bytes) {
+      cards[card] = bytes.toString("base64");
+    }
+  }
+  const response = await (options.fetchImpl ?? fetch)(`${options.hubApiBaseUrl}/bench/runs`, {
+    method: "POST",
+    headers: { "content-type": "application/json", cookie: options.cookie },
+    body: JSON.stringify({ run_record: runRecord, cards, submitter_name: await options.submitterName() }),
+    signal: AbortSignal.timeout(PUBLISH_TIMEOUT_MS),
+  });
+  if (response.status === 401) {
+    return { ok: false, reason: "signed_out" };
+  }
+  const body = (await response.json().catch(() => null)) as { id?: string; error?: string } | null;
+  if (!(response.ok && body?.id && RUN_DIR_NAME_PATTERN.test(body.id))) {
+    throw new Error(
+      body?.error === "run_id_taken"
+        ? "Another account already published this run."
+        : `HolaHub could not publish the run (${body?.error ?? response.status}).`,
+    );
+  }
+  return { ok: true, id: body.id, url: `${options.resultBaseUrl.replace(/\/+$/, "")}/${body.id}` };
 }
