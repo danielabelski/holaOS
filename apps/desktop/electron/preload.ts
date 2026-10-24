@@ -1,3 +1,4 @@
+import type { BenchKitFile, BenchWindowContext } from "../shared/bench-protocol.js";
 import {
 	type ChatStartInput,
 	HOST_EMPLOYEES_CHANGED_EVENT,
@@ -1743,6 +1744,45 @@ contextBridge.exposeInMainWorld("electronAPI", {
 			) as Promise<ClipboardImagePayload | null>,
 		writeText: (text: string) =>
 			ipcRenderer.invoke("clipboard:writeText", text) as Promise<void>,
+	},
+	bench: {
+		getContext: () =>
+			ipcRenderer.invoke("bench:getContext") as Promise<BenchWindowContext | null>,
+		onContext: (listener: (context: BenchWindowContext) => void) => {
+			const wrapped = (
+				_event: Electron.IpcRendererEvent,
+				context: BenchWindowContext,
+			) => listener(context);
+			ipcRenderer.on("bench:context", wrapped);
+			return () => ipcRenderer.removeListener("bench:context", wrapped);
+		},
+		renderCard: (runDir: string, name: string, html: string) =>
+			ipcRenderer.invoke("bench:renderCard", runDir, name, html) as Promise<{
+				file: string;
+				dataUrl: string;
+			}>,
+		saveRecording: (runDir: string, bytes: Uint8Array, extension: string) =>
+			ipcRenderer.invoke(
+				"bench:saveRecording",
+				runDir,
+				bytes,
+				extension,
+			) as Promise<{ file: string }>,
+		exportKit: (runDir: string, suggestedName: string, files: BenchKitFile[]) =>
+			ipcRenderer.invoke(
+				"bench:exportKit",
+				runDir,
+				suggestedName,
+				files,
+			) as Promise<{ path: string | null }>,
+		share: (runDir: string, cardFile: string, text: string, url: string) =>
+			ipcRenderer.invoke(
+				"bench:share",
+				runDir,
+				cardFile,
+				text,
+				url,
+			) as Promise<void>,
 	},
 	bff: {
 		/**

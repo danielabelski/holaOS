@@ -1,5 +1,7 @@
 // holaboss-2026.616.1 bundle cycle: cdhash 1ee72b15 stuck in Apple notary; bump bytes to force fresh ticket.
 import { loadDesktopEnv } from "./desktopEnv";
+import { parseBenchDeepLink } from "./bench-links";
+import { createBenchWindowController } from "./bench-window";
 import { applyLoginShellPathToEnv } from "./shell-path";
 import { ensureExtractedWindowsRuntime } from "./runtime-archive";
 import {
@@ -725,6 +727,11 @@ function focusMainWindow(): void {
 // off before the fallthrough, so an action link is never misread as an auth
 // token — which is what an unrecognised hostname becomes.
 function dispatchDeepLink(targetUrl: string): void {
+  const bench = parseBenchDeepLink(deepLinkUrl(targetUrl));
+  if (bench) {
+    void benchWindow.open(bench);
+    return;
+  }
   const openApp = maybeOpenAppUrl(targetUrl);
   if (openApp) {
     handleOpenAppDeepLink(openApp);
@@ -1824,6 +1831,27 @@ const HUB_APP_BASE_URL = ((): string => {
     return "";
   }
 })();
+// One-click benchmark window. Model configs and public result pages live on HolaHub.
+const benchWindow = createBenchWindowController({
+  preloadPath: path.join(__dirname, "preload.cjs"),
+  loadRenderer: async (win, query) => {
+    if (isDev) {
+      const url = new URL(RESOLVED_DEV_SERVER_URL);
+      for (const [key, value] of Object.entries(query)) {
+        url.searchParams.set(key, value);
+      }
+      await win.loadURL(url.toString());
+    } else {
+      await win.loadFile(path.join(__dirname, "../dist/index.html"), { query });
+    }
+  },
+  subjectsBaseUrl: () =>
+    configuredRemoteBaseUrl(["HOLABOSS_BENCH_SUBJECTS_URL"]) ||
+    (HUB_APP_BASE_URL ? `${HUB_APP_BASE_URL}/bench/subjects` : ""),
+  resultBaseUrl: () => (HUB_APP_BASE_URL ? `${HUB_APP_BASE_URL}/bench/runs` : ""),
+  workspaceRoot: () => path.join(runtimeSandboxRoot(), "workspace"),
+});
+
 // Where web HolaApp MCP servers are reached — an SSE MCP at
 // `<base>/mcp/<holaAppId>/sse`. The gateway treats `/mcp/*` as auth-exempt
 // pass-through to the workflow-backend (the servers do their own bearer auth),
@@ -1896,13 +1924,16 @@ const RUNTIME_MODEL_CATALOG_REFRESH_INTERVAL_MS = 3 * 60 * 1000;
 const RUNTIME_MODEL_CATALOG_REFRESH_FAILURE_BACKOFF_MS = 60 * 1000;
 const RUNTIME_MODEL_CATALOG_FETCH_TIMEOUT_MS = 8_000;
 
-type TrustedIpcSenderScope = "main" | "auth-popup";
+type TrustedIpcSenderScope = "main" | "auth-popup" | "bench";
 
 function trustedIpcSenderWindow(
   scope: TrustedIpcSenderScope,
 ): BrowserWindow | null {
   if (scope === "main") {
     return mainWindow && !mainWindow.isDestroyed() ? mainWindow : null;
+  }
+  if (scope === "bench") {
+    return benchWindow.window();
   }
   return authPopupWindow && !authPopupWindow.isDestroyed()
     ? authPopupWindow
@@ -27645,7 +27676,7 @@ app.whenReady().then(async () => {
   // gets a real-time stream + can poll this IPC for the same state in
   // microseconds. (Boot timing: shaved ~1s off the splash by removing
   // the redundant probe round-trip from this hot path.)
-  handleTrustedIpc("runtime:getStatus", ["main", "auth-popup"], () =>
+  handleTrustedIpc("runtime:getStatus", ["main", "auth-popup", "bench"], () =>
     Promise.resolve(runtimeStatus),
   );
   handleTrustedIpc("runtime:getDbMaintenance", ["main"], () =>
@@ -28049,11 +28080,12 @@ app.whenReady().then(async () => {
   );
   handleTrustedIpc(
     "ui:openExternalUrl",
-    ["main", "auth-popup"],
+    ["main", "auth-popup", "bench"],
     async (_event, rawUrl: string) => {
       await openExternalUrl(rawUrl);
     },
   );
+  benchWindow.register();
   handleTrustedIpc(
     "clipboard:readImage",
     ["main"],

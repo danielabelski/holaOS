@@ -2440,6 +2440,37 @@ declare global {
 			readImage: () => Promise<ClipboardImagePayload | null>;
 			writeText: (text: string) => Promise<void>;
 		};
+		bench: {
+			getContext: () => Promise<
+				import("../../shared/bench-protocol").BenchWindowContext | null
+			>;
+			onContext: (
+				listener: (
+					context: import("../../shared/bench-protocol").BenchWindowContext,
+				) => void,
+			) => () => void;
+			renderCard: (
+				runDir: string,
+				name: string,
+				html: string,
+			) => Promise<{ file: string; dataUrl: string }>;
+			saveRecording: (
+				runDir: string,
+				bytes: Uint8Array,
+				extension: string,
+			) => Promise<{ file: string }>;
+			exportKit: (
+				runDir: string,
+				suggestedName: string,
+				files: import("../../shared/bench-protocol").BenchKitFile[],
+			) => Promise<{ path: string | null }>;
+			share: (
+				runDir: string,
+				cardFile: string,
+				text: string,
+				url: string,
+			) => Promise<void>;
+		};
 		bff: {
 			fetch: (
 				req: import("../../shared/bff-fetch-protocol").BffFetchRequest,
