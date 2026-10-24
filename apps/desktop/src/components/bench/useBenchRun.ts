@@ -5,6 +5,7 @@ import { remoteApi } from "@/lib/remoteApiClient";
 const POLL_MS = 200;
 const STREAM_CHARS = 1600;
 const TPS_WINDOW_MS = 1000;
+const RATE_HISTORY = 120;
 
 export type BenchStepKind = "warmup" | "speed" | "task";
 
@@ -31,6 +32,12 @@ export const SUITE_PLAN: Record<string, Array<Pick<BenchStep, "id" | "kind" | "l
   ],
 };
 
+export interface BenchMachine {
+  cpu?: string;
+  memory_gb?: number;
+  gpus?: string[];
+}
+
 export interface BenchProgress {
   steps: BenchStep[];
   currentStep: string | null;
@@ -39,6 +46,10 @@ export interface BenchProgress {
   pull: { status: string; completed?: number; total?: number } | null;
   cpuBusyPct: number | null;
   runStartedAt: number | null;
+  machine: BenchMachine | null;
+  engineVersion: string | null;
+  /** Live decode rate samples for the current speed step, oldest first. */
+  rateHistory: number[];
 }
 
 export function initialProgress(suite: string): BenchProgress {
@@ -50,6 +61,9 @@ export function initialProgress(suite: string): BenchProgress {
     pull: null,
     cpuBusyPct: null,
     runStartedAt: null,
+    machine: null,
+    engineVersion: null,
+    rateHistory: [],
   };
 }
 
@@ -72,6 +86,12 @@ export function applyBenchEvents(
       case "run_started":
         next = { ...next, runStartedAt: event.at };
         break;
+      case "start":
+        next = { ...next, machine: (event.machine as BenchMachine | undefined) ?? null };
+        break;
+      case "engine_ready":
+        next = { ...next, engineVersion: typeof event.version === "string" ? event.version : null };
+        break;
       case "machine_busy":
         next = { ...next, cpuBusyPct: typeof event.cpu_busy_pct === "number" ? event.cpu_busy_pct : null };
         break;
@@ -88,7 +108,14 @@ export function applyBenchEvents(
       case "task_start":
         if (task) {
           recent.length = 0;
-          next = { ...next, currentStep: task, stream: "", liveTps: null, steps: updateStep(next.steps, task, { state: "running" }) };
+          next = {
+            ...next,
+            currentStep: task,
+            stream: "",
+            liveTps: null,
+            rateHistory: [],
+            steps: updateStep(next.steps, task, { state: "running" }),
+          };
         }
         break;
       case "text":
@@ -99,10 +126,12 @@ export function applyBenchEvents(
           }
           const span = recent.length > 1 ? (recent[recent.length - 1].at - recent[0].at) / 1000 : 0;
           const tokens = recent.slice(1).reduce((sum, entry) => sum + entry.n, 0);
+          const liveTps = span > 0.3 ? tokens / span : next.liveTps;
           next = {
             ...next,
             stream: (next.stream + String(event.delta ?? "")).slice(-STREAM_CHARS),
-            liveTps: span > 0.3 ? tokens / span : next.liveTps,
+            liveTps,
+            rateHistory: liveTps === null ? next.rateHistory : [...next.rateHistory, liveTps].slice(-RATE_HISTORY),
           };
         }
         break;

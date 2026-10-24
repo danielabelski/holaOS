@@ -1,12 +1,16 @@
 import {
   type RunRecordView,
-  TASK_LABELS,
+  TASK_INFO,
   engineLabel,
+  explainReason,
   formatMs,
   formatTps,
   hardwareLabel,
+  readingComparison,
   speedResult,
   taskResults,
+  topReason,
+  wasBusy,
 } from "./record";
 
 function csvCell(value: unknown): string {
@@ -24,13 +28,14 @@ export function resultsCsv(record: RunRecordView): string {
   return `${[header, ...rows].map((row) => row.map(csvCell).join(",")).join("\n")}\n`;
 }
 
-function taskLine(record: RunRecordView): string {
+function taskSummary(record: RunRecordView): string {
   return taskResults(record)
     .map((task) => {
-      const label = TASK_LABELS[task.task] ?? task.task;
-      return task.status === "unsupported" ? `${label}: not supported on Ollama` : `${label}: ${task.passed}/${task.samples}`;
+      const info = TASK_INFO[task.task];
+      const name = info?.short ?? task.task;
+      return task.status === "unsupported" ? `${name} n/a` : `${name} ${task.passed}/${task.samples}`;
     })
-    .join("; ");
+    .join(" · ");
 }
 
 function timestamp(seconds: number): string {
@@ -38,28 +43,56 @@ function timestamp(seconds: number): string {
   return `${Math.floor(whole / 60)}:${String(whole % 60).padStart(2, "0")}`;
 }
 
-/** A plain-data script a creator can read over the recording; every number comes from the Run Record. */
+function capabilityPost(record: RunRecordView): string {
+  const lines = taskResults(record).map((task) => {
+    const info = TASK_INFO[task.task];
+    const title = info?.title ?? task.task;
+    if (task.status === "unsupported") {
+      return `${title}: not supported by this Ollama build`;
+    }
+    const reason = task.passed < task.samples ? topReason(task) : null;
+    return `${title}: ${task.passed}/${task.samples}${reason ? ` (${explainReason(reason)})` : ""}`;
+  });
+  return `Capability, 3 tries each, graded by code:\n${lines.join("\n")}`;
+}
+
+/** Ready-to-post copy for a creator; every number comes from the Run Record. */
 export function narrationScript(record: RunRecordView, url: string): string {
   const shallow = speedResult(record, "speed@0");
   const deep = speedResult(record, "speed@8k");
-  const offload = shallow?.cpu_offload ? " Part of the model ran on the CPU, so it does not fully fit in GPU memory." : "";
+  const reading = readingComparison(shallow?.decode_tps);
+  const hardware = hardwareLabel(record);
+  const busy = wasBusy(record);
   const lines = [
-    `# ${record.subject.name} on ${hardwareLabel(record)}`,
+    `# ${record.subject.name} on ${hardware}`,
     "",
-    `${record.subject.name} (${record.subject.quant}) running locally on ${hardwareLabel(record)} with ${engineLabel(record)}.`,
-    "",
-    `- Decode speed: ${formatTps(shallow?.decode_tps)} tokens per second, first token in ${formatMs(shallow?.ttft_ms)}.`,
-    `- With 8K tokens of context: ${formatTps(deep?.decode_tps)} tokens per second, first token in ${formatMs(deep?.ttft_ms)}.${offload}`,
-    `- Capability check (3 tries each, graded by a program): ${taskLine(record)}.`,
-    "",
-    `Suite ${record.suite.id}@${record.suite.version}. Full results: ${url}`,
   ];
+  if (busy !== null) {
+    lines.push(`> Other apps used ${busy}% of the CPU during this run, so speed is likely low. Run again on an idle machine before posting.`, "");
+  }
+  lines.push(
+    "## Post",
+    "",
+    shareText(record),
+    url,
+    "",
+    "## Thread",
+    "",
+    `1/ ${record.subject.name} (${record.subject.quant}) running locally on ${hardware} with ${engineLabel(record)}: ${formatTps(shallow?.decode_tps)} tokens a second, first token in ${formatMs(shallow?.ttft_ms)}.${reading ? ` That is about ${Math.round(reading.wordsPerSecond)} words a second.` : ""}`,
+    "",
+    `2/ With 8K tokens already in the context it still does ${formatTps(deep?.decode_tps)} tok/s, and the first token arrives in ${formatMs(deep?.ttft_ms)}.${shallow?.cpu_offload ? " Part of the model ran on the CPU because it did not fit in GPU memory." : ""}`,
+    "",
+    `3/ ${capabilityPost(record)}`,
+    "",
+    `4/ Same suite (${record.suite.id}@${record.suite.version}) on any machine, so results compare like for like. Full run record: ${url}`,
+  );
   const highlights = record.artifacts.highlights;
   if (highlights.length > 0) {
-    lines.push("", "## Moments in the recording", "");
+    lines.push("", "## Voice-over", "");
     for (const h of highlights) {
-      const what = h.label === "first_token" ? "first token" : h.label === "error" ? "error" : "done";
-      lines.push(`- ${timestamp(h.t)} ${h.task ?? ""} ${what}`.replace(/\s+/g, " ").trim());
+      const name = TASK_INFO[h.task ?? ""]?.title ?? (h.task === "speed@0" ? "Speed" : h.task === "speed@8k" ? "Speed at 8K" : h.task ?? "");
+      const what = h.label === "first_token" ? "starts" : h.label === "error" ? "hits an error" : "done";
+      lines.push(`- ${timestamp(h.t)} ${name} ${what}`);
     }
   }
   return `${lines.join("\n")}\n`;
@@ -67,7 +100,8 @@ export function narrationScript(record: RunRecordView, url: string): string {
 
 export function shareText(record: RunRecordView): string {
   const shallow = speedResult(record, "speed@0");
-  return `${record.subject.name} on my ${hardwareLabel(record)}: ${formatTps(shallow?.decode_tps)} tok/s, first token in ${formatMs(shallow?.ttft_ms)}. Measured with holaOS.`;
+  const deep = speedResult(record, "speed@8k");
+  return `${record.subject.name} on my ${hardwareLabel(record)}: ${formatTps(shallow?.decode_tps)} tok/s, first token in ${formatMs(shallow?.ttft_ms)}, ${formatTps(deep?.decode_tps)} tok/s with 8K of context. ${taskSummary(record)}. Measured locally with holaOS.`;
 }
 
 export function kitFileName(record: RunRecordView): string {

@@ -5,7 +5,9 @@ import { BUNDLED_BENCH_SUBJECTS } from "../shared/bench-subjects";
 export const BENCH_DEEP_LINK_HOST = "bench";
 export const BENCH_DEFAULT_SUITE = "suite-standard@1.0";
 export const BENCH_WINDOW_SIZE = { width: 1280, height: 720 } as const;
+/** Cards lay out at 1200×675 CSS px and are captured at 2× so they stay sharp on X and Retina screens. */
 export const BENCH_CARD_SIZE = { width: 1200, height: 675 } as const;
+export const BENCH_CARD_SCALE = 2;
 
 const SUBJECT_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,99}$/;
 const SUITE_PATTERN = /^[a-z0-9-]+@[0-9][0-9.]*$/;

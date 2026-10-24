@@ -920,7 +920,8 @@ def cmd_bench(args):
     extra = {"think": subject["think"]} if "think" in subject else {}
     base_options = {"num_ctx": pack["num_ctx"]}
     samples = args.samples or pack.get("samples", 3)
-    emit("start", model=model, suite=f"{pack['id']}@{pack['version']}", capabilities=capabilities)
+    machine = machine_info()
+    emit("start", model=model, suite=f"{pack['id']}@{pack['version']}", capabilities=capabilities, machine=machine)
 
     emit.task = "warmup"
     emit("task_start", task="warmup", kind="warmup")
@@ -947,7 +948,7 @@ def cmd_bench(args):
         "capabilities": capabilities,
         "request": {"num_ctx": pack["num_ctx"], "sampling": sampling, "samples": samples, "keep_alive": BENCH_KEEP_ALIVE, **extra},
         "warmup_load_ms": round(warm["load_s"] * 1000),
-        "machine": machine_info(),
+        "machine": machine,
         "results": results,
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started)),
         "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),

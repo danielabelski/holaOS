@@ -2,9 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type { BenchEvent } from "@holaboss/remote-api/contract";
-import { benchmarkCardHtml, capabilityCardHtml } from "./cards";
+import { benchmarkCardHtml, capabilityCardHtml, modelFontSize } from "./cards";
 import { kitFileName, narrationScript, resultsCsv, shareText } from "./kit";
-import { type RunRecordView, hardwareLabel } from "./record";
+import { type RunRecordView, explainReason, hardwareLabel, readingComparison } from "./record";
 import { preferredRecordingMime } from "./recording";
 import { applyBenchEvents, initialProgress } from "./useBenchRun";
 
@@ -26,23 +26,26 @@ const record: RunRecordView = {
     { task: "speed@8k", kind: "speed", status: "ok", metrics: { depth: 8192, decode_tps: 85.4, ttft_ms: 3301.7 } },
     { task: "code-intervals", kind: "task", category: "code", status: "ok", passed: 3, samples: 3 },
     { task: "tool-flight", kind: "task", category: "tool", status: "unsupported", passed: 0, samples: 0 },
-    { task: "needle-8k", kind: "task", category: "long_context", status: "ok", passed: 2, samples: 3 },
+    { task: "needle-8k", kind: "task", category: "long_context", status: "ok", passed: 2, samples: 3, reasons: { "answer missing '7391-QX'": 1 } },
   ],
   artifacts: { highlights: [{ t: 3.4, label: "first_token", task: "speed@0" }, { t: 72.2, label: "task_done", task: "needle-8k" }] },
   started_at: "2026-10-24T06:40:05Z",
 };
 const url = "https://hub.holaos.ai/bench/runs/6f1c2a9e-3b7d-4e1a-9c55-0d2f8e7a4b11";
 
-test("the benchmark card leads with decode speed and shows the machine and link", () => {
-  const html = benchmarkCardHtml(record, url);
-  assert.match(html, />102<\/span>/);
+const assets = { url, fontCss: "", qrSvg: '<svg id="qr"></svg>' };
+
+test("the benchmark card leads with decode speed and carries the machine and a QR code", () => {
+  const html = benchmarkCardHtml(record, assets);
+  assert.match(html, /class="big">102</);
   assert.match(html, /62 ms/);
-  assert.match(html, /85\.4 tok\/s/);
-  assert.match(html, /1\.9 GB/);
-  assert.doesNotMatch(html, /Partly on CPU/);
+  assert.match(html, /85\.4<small>tok\/s/);
+  assert.match(html, /1\.9 GB<small>on GPU/);
+  assert.match(html, /≈ <b>77 words a second<\/b>, 19× faster than you read/);
   assert.match(html, /Apple M4 Max · 64 GB/);
-  assert.match(html, /hub\.holaos\.ai\/bench\/runs\/6f1c2a9e/);
-  assert.match(html, /Ollama 0\.40\.10/);
+  assert.match(html, /<svg id="qr"><\/svg>/);
+  assert.match(html, />hub\.holaos\.ai</);
+  assert.match(html, /suite-standard@1\.0/);
 });
 
 test("a model that spills to the CPU is labelled on the card", () => {
@@ -51,22 +54,55 @@ test("a model that spills to the CPU is labelled on the card", () => {
   if (speed.kind === "speed") {
     speed.metrics.cpu_offload = true;
   }
-  assert.match(benchmarkCardHtml(spilled, url), /Partly on CPU/);
+  assert.match(benchmarkCardHtml(spilled, assets), /Partly on CPU/);
 });
 
-test("the capability card shows x/3 and keeps unsupported apart from failed", () => {
-  const html = capabilityCardHtml(record, url);
-  assert.match(html, /Code · unit tests/);
-  assert.match(html, />3\/3</);
-  assert.match(html, />2\/3</);
+test("a run on a busy machine says so on both cards instead of the reading comparison", () => {
+  const busy = structuredClone(record);
+  busy.runtime.conditions = { cpu_busy_pct: 40 };
+  const html = benchmarkCardHtml(busy, assets);
+  assert.match(html, /Measured while other apps used 40% of the CPU/);
+  assert.doesNotMatch(html, /words a second/);
+  assert.match(capabilityCardHtml(busy, assets), /Measured while other apps used 40% of the CPU/);
+  const calm = structuredClone(record);
+  calm.runtime.conditions = { cpu_busy_pct: 12 };
+  assert.doesNotMatch(benchmarkCardHtml(calm, assets), /Measured while/);
+});
+
+test("the capability card shows x/3, explains a miss and keeps unsupported apart from failed", () => {
+  const html = capabilityCardHtml(record, assets);
+  assert.match(html, /Writes a Python function that has to pass hidden unit tests/);
+  assert.match(html, /class="score num">3\/3</);
+  assert.match(html, /class="score num">2\/3</);
+  assert.match(html, /answer did not contain the fact/);
   assert.match(html, /Not supported on Ollama/);
   assert.doesNotMatch(html, />0\/0</);
+});
+
+test("grader reasons read as plain language", () => {
+  assert.equal(explainReason("destination='Tokyo' not in ['TYO', 'NRT', 'HND']"), 'destination = "Tokyo" · expected TYO / NRT / HND');
+  assert.equal(explainReason("tests failed: AssertionError"), "failed a hidden unit test");
+  assert.equal(explainReason("called book_hotel instead of search_flights"), "called book_hotel() instead of search_flights()");
+  assert.equal(explainReason("something new"), "something new");
+});
+
+test("long model names get a smaller size so they stay on the card", () => {
+  assert.equal(modelFontSize("MiniCPM5-2B", 56), 56);
+  assert.ok(modelFontSize("Qwen3-Coder-30B-A3B-Instruct", 56) < 40);
+  assert.equal(modelFontSize("x".repeat(80), 56), 34);
+});
+
+test("reading comparison uses 0.75 words a token and 4 words a second", () => {
+  const reading = readingComparison(102);
+  assert.equal(Math.round(reading?.wordsPerSecond ?? 0), 77);
+  assert.equal(Math.round(reading?.timesReading ?? 0), 19);
+  assert.equal(readingComparison(undefined), null);
 });
 
 test("text from the model config is escaped in cards", () => {
   const hostile = structuredClone(record);
   hostile.subject.name = '<img src=x onerror="alert(1)">';
-  const html = benchmarkCardHtml(hostile, url) + capabilityCardHtml(hostile, url);
+  const html = benchmarkCardHtml(hostile, assets) + capabilityCardHtml(hostile, assets);
   assert.doesNotMatch(html, /<img src=x/);
   assert.match(html, /&lt;img src=x onerror=&quot;alert\(1\)&quot;&gt;/);
 });
@@ -77,12 +113,21 @@ test("the kit carries a CSV, a data-only script and a dated name", () => {
   assert.equal(csv[1], "speed@0,speed,ok,,,102.1,62,,2033702665,false");
   assert.equal(csv[4], "tool-flight,task,unsupported,0,0,,,,,");
   const script = narrationScript(record, url);
-  assert.match(script, /102 tokens per second, first token in 62 ms/);
-  assert.match(script, /Tool calling: not supported on Ollama/);
-  assert.match(script, /- 0:03 speed@0 first token/);
-  assert.match(script, /- 1:12 needle-8k done/);
+  assert.match(script, /## Post\n\nMiniCPM5-2B on my Apple M4 Max · 64 GB: 102 tok\/s/);
+  assert.match(script, /1\/ MiniCPM5-2B \(Q4_K_M\) running locally on Apple M4 Max · 64 GB with Ollama 0\.40\.10: 102 tokens a second, first token in 62 ms\. That is about 77 words a second\./);
+  assert.match(script, /Tool calling: not supported by this Ollama build/);
+  assert.match(script, /Long context: 2\/3 \(answer did not contain the fact\)/);
+  assert.match(script, /- 0:03 Speed starts/);
+  assert.match(script, /- 1:12 Long context done/);
+  assert.doesNotMatch(script, /likely low/);
   assert.equal(kitFileName(record), "openbmb-minicpm5-2b-2026-10-24-holaos-kit.zip");
-  assert.equal(shareText(record), "MiniCPM5-2B on my Apple M4 Max · 64 GB: 102 tok/s, first token in 62 ms. Measured with holaOS.");
+  assert.equal(
+    shareText(record),
+    "MiniCPM5-2B on my Apple M4 Max · 64 GB: 102 tok/s, first token in 62 ms, 85.4 tok/s with 8K of context. Code 3/3 · Tools n/a · 8K recall 2/3. Measured locally with holaOS.",
+  );
+  const busy = structuredClone(record);
+  busy.runtime.conditions = { cpu_busy_pct: 70 };
+  assert.match(narrationScript(busy, url), /Other apps used 70% of the CPU during this run/);
 });
 
 test("a discrete GPU names the card, not the CPU", () => {

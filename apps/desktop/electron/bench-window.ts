@@ -13,6 +13,7 @@ import {
 } from "electron";
 import JSZip from "jszip";
 import {
+  BENCH_CARD_SCALE,
   BENCH_CARD_SIZE,
   BENCH_WINDOW_SIZE,
   type BenchDeepLink,
@@ -100,7 +101,13 @@ export function createBenchWindowController(deps: BenchWindowDeps) {
       ...BENCH_CARD_SIZE,
       useContentSize: true,
       show: false,
-      webPreferences: { offscreen: true, contextIsolation: true, nodeIntegration: false, sandbox: true, javascript: true },
+      webPreferences: {
+        offscreen: { deviceScaleFactor: BENCH_CARD_SCALE },
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: true,
+        javascript: true,
+      },
     });
     try {
       const htmlPath = path.join(tempDir, "card.html");
@@ -108,9 +115,10 @@ export function createBenchWindowController(deps: BenchWindowDeps) {
       await renderWindow.loadFile(htmlPath);
       await renderWindow.webContents.executeJavaScript("document.fonts.ready.then(() => true)");
       let image = await renderWindow.webContents.capturePage();
+      const target = { width: BENCH_CARD_SIZE.width * BENCH_CARD_SCALE, height: BENCH_CARD_SIZE.height * BENCH_CARD_SCALE };
       const size = image.getSize();
-      if (size.width !== BENCH_CARD_SIZE.width || size.height !== BENCH_CARD_SIZE.height) {
-        image = image.resize({ ...BENCH_CARD_SIZE, quality: "best" });
+      if (size.width !== target.width || size.height !== target.height) {
+        image = image.resize({ ...target, quality: "best" });
       }
       const file = path.join(dir, `${name}.png`);
       await fs.writeFile(file, image.toPNG());
@@ -166,6 +174,11 @@ export function createBenchWindowController(deps: BenchWindowDeps) {
     await shell.openExternal(xIntentUrl(text, url));
   }
 
+  function showInFolder(runDir: string): void {
+    const dir = assertRunDir(runDir);
+    shell.showItemInFolder(path.join(dir, "run-record.json"));
+  }
+
   function currentWindow(): BrowserWindow | null {
     return win && !win.isDestroyed() ? win : null;
   }
@@ -191,6 +204,7 @@ export function createBenchWindowController(deps: BenchWindowDeps) {
     fromBenchWindow("bench:exportKit", (runDir: string, suggestedName: string, files: BenchKitFile[]) =>
       exportKit(runDir, suggestedName, files),
     );
+    fromBenchWindow("bench:showInFolder", (runDir: string) => showInFolder(runDir));
     fromBenchWindow("bench:share", (runDir: string, cardFile: string, text: string, url: string) =>
       share(runDir, cardFile, text, url),
     );

@@ -29,23 +29,76 @@ export interface TaskResult {
 }
 
 export interface RunRecordView {
+  schema?: string;
   run_id: string;
   suite: { id: string; version: string };
   subject: { id: string; name: string; vendor: string | null; quant: string; tag: string; version: string | null; digest_registered: boolean };
   runtime: {
     hardware: { cpu?: string; memory_gb?: number; gpus?: string[]; model?: string };
     provider: { engine: string; version: string | null };
+    conditions?: { cpu_busy_pct: number | null };
   };
   results: Array<SpeedResult | TaskResult>;
   artifacts: { highlights: Array<{ t: number; label: string; task?: string }> };
   started_at: string;
 }
 
-export const TASK_LABELS: Record<string, string> = {
-  "code-intervals": "Code · unit tests",
-  "tool-flight": "Tool calling",
-  "needle-8k": "Long context · 8K needle",
+export const TASK_INFO: Record<string, { title: string; short: string; what: string }> = {
+  "code-intervals": { title: "Code", short: "Code", what: "Writes a Python function that has to pass hidden unit tests" },
+  "tool-flight": { title: "Tool calling", short: "Tools", what: "Picks the right one of two tools and fills in its arguments" },
+  "needle-8k": { title: "Long context", short: "8K recall", what: "Finds a single fact buried in 8,000 tokens of text" },
 };
+
+export const BUSY_CPU_PCT = 25;
+
+export function wasBusy(record: RunRecordView): number | null {
+  const busy = record.runtime.conditions?.cpu_busy_pct ?? null;
+  return busy !== null && busy >= BUSY_CPU_PCT ? busy : null;
+}
+
+/** Grader reasons are written for engineers; this phrases the common ones for a card. */
+export function explainReason(reason: string): string {
+  const notIn = reason.match(/^(\w+)=(['"])(.*)\2 not in \[(.+)\]$/);
+  if (notIn) {
+    const expected = notIn[4].replace(/'/g, "").split(/,\s*/).join(" / ");
+    return `${notIn[1]} = "${notIn[3]}" · expected ${expected}`;
+  }
+  const called = reason.match(/^called (\w+) instead of (\w+)$/);
+  if (called) {
+    return `called ${called[1]}() instead of ${called[2]}()`;
+  }
+  const plain: Array<[RegExp, string]> = [
+    [/^tests failed/, "failed a hidden unit test"],
+    [/^tests timed out/, "code ran past the time limit"],
+    [/^no tool call/, "answered in text instead of calling a tool"],
+    [/^ran out of tokens/, "ran out of tokens before answering"],
+    [/^answer missing/, "answer did not contain the fact"],
+    [/^prompt was truncated/, "the prompt did not fit the context window"],
+  ];
+  for (const [pattern, phrase] of plain) {
+    if (pattern.test(reason)) {
+      return phrase;
+    }
+  }
+  return reason.length > 80 ? `${reason.slice(0, 79)}…` : reason;
+}
+
+export function topReason(task: TaskResult): string | null {
+  const entries = Object.entries(task.reasons ?? {}).sort((a, b) => b[1] - a[1]);
+  return entries[0]?.[0] ?? null;
+}
+
+// About 0.75 English words per token, and 240 words a minute for a fluent adult reader.
+const WORDS_PER_TOKEN = 0.75;
+const READING_WORDS_PER_SECOND = 4;
+
+export function readingComparison(tokensPerSecond: number | undefined): { wordsPerSecond: number; timesReading: number } | null {
+  if (!tokensPerSecond) {
+    return null;
+  }
+  const wordsPerSecond = tokensPerSecond * WORDS_PER_TOKEN;
+  return { wordsPerSecond, timesReading: wordsPerSecond / READING_WORDS_PER_SECOND };
+}
 
 export function speedResult(record: RunRecordView, task: string): SpeedMetrics | null {
   const result = record.results.find((entry) => entry.task === task && entry.kind === "speed");

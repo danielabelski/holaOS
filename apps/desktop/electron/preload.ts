@@ -1783,6 +1783,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
 				suggestedName,
 				files,
 			) as Promise<{ path: string | null }>,
+		showInFolder: (runDir: string) =>
+			ipcRenderer.invoke("bench:showInFolder", runDir) as Promise<void>,
 		share: (runDir: string, cardFile: string, text: string, url: string) =>
 			ipcRenderer.invoke(
 				"bench:share",

@@ -2469,6 +2469,7 @@ declare global {
 				suggestedName: string,
 				files: import("../../shared/bench-protocol").BenchKitFile[],
 			) => Promise<{ path: string | null }>;
+			showInFolder: (runDir: string) => Promise<void>;
 			share: (
 				runDir: string,
 				cardFile: string,
