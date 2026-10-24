@@ -33,12 +33,14 @@ import {
   relativeTime,
 } from "./format";
 import { StatusPill } from "./parts";
+import { BenchmarkRunList } from "./BenchmarkRunList";
 import { ReproduceDialog } from "./ReproduceDialog";
 import { RunBenchmarkButton } from "./RunBenchmarkButton";
 import { newEvaluationDialogOpenAtom } from "./state";
 import { useOpenEvaluation } from "./useOpenEvaluation";
 
 const LIST_POLL_MS = 4000;
+const BENCH_POLL_MS = 15_000;
 
 function isBusy(evaluation: EvaluationSummary): boolean {
   return (
@@ -65,6 +67,14 @@ export function EvaluationsPane() {
     }),
   );
   const evaluations = listQuery.data?.evaluations ?? [];
+  const benchQuery = useQuery(
+    remoteApiQuery.bench.list.queryOptions({
+      input: {},
+      staleTime: 0,
+      refetchInterval: BENCH_POLL_MS,
+    }),
+  );
+  const benchRuns = benchQuery.data?.runs ?? [];
 
   const deleteMutation = useMutation(
     remoteApiQuery.evals.delete.mutationOptions({
@@ -135,6 +145,15 @@ export function EvaluationsPane() {
 
       <div className="min-h-0 w-full flex-1 overflow-y-auto">
         <div className="mx-auto w-full max-w-5xl px-6 pb-12">
+          {benchRuns.length > 0 ? (
+            <section className="mb-8 flex flex-col gap-2">
+              <h2 className="font-medium text-muted-foreground text-xs">Benchmarks</h2>
+              <BenchmarkRunList runs={benchRuns} />
+            </section>
+          ) : null}
+          {benchRuns.length > 0 && evaluations.length > 0 ? (
+            <h2 className="mb-2 font-medium text-muted-foreground text-xs">Evaluations</h2>
+          ) : null}
           {listQuery.isPending ? (
             <ListSkeleton />
           ) : listQuery.isError ? (
@@ -155,23 +174,38 @@ export function EvaluationsPane() {
               size="md"
               title="Couldn't load evaluations"
             />
-          ) : evaluations.length === 0 ? (
+          ) : evaluations.length === 0 && benchRuns.length > 0 ? (
             <EmptyState
               action={
-                <Button
-                  onClick={() => setNewDialogOpen(true)}
-                  size="sm"
-                  type="button"
-                >
+                <Button onClick={() => setNewDialogOpen(true)} size="sm" type="button" variant="outline">
                   <Plus className="size-3.5" />
                   New evaluation
                 </Button>
               }
+              description="For a deeper look than the benchmark, ask one question about a local model and the agent plans the tests."
+              size="sm"
+              title="No evaluations yet"
+            />
+          ) : evaluations.length === 0 ? (
+            <EmptyState
+              action={
+                <div className="flex gap-2">
+                  <RunBenchmarkButton />
+                  <Button
+                    onClick={() => setNewDialogOpen(true)}
+                    size="sm"
+                    type="button"
+                  >
+                    <Plus className="size-3.5" />
+                    New evaluation
+                  </Button>
+                </div>
+              }
               decorated
-              description="Ask one question about a local model. The agent drafts a test plan, holaOS runs it here, and you publish the report under your name."
+              description="Run the standard benchmark on a model in one click, or ask one question about a local model and let the agent plan the tests."
               icon={BarChart3}
               size="md"
-              title="No evaluations yet"
+              title="Nothing tested yet"
             />
           ) : (
             <ul className="divide-y divide-border overflow-hidden rounded-xl border border-border bg-card">

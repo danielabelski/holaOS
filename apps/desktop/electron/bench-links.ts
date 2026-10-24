@@ -41,6 +41,12 @@ export function benchLinkFromApp(subjectId: unknown, suite: unknown = BENCH_DEFA
   return parseBenchDeepLink(new URL(`ai.holaboss.app://${BENCH_DEEP_LINK_HOST}?${params.toString()}`));
 }
 
+const RUN_ID_PATTERN = /^[0-9a-f-]{36}$/;
+
+export function isRunId(value: unknown): value is string {
+  return typeof value === "string" && RUN_ID_PATTERN.test(value);
+}
+
 export function benchCatalog(): BenchCatalogEntry[] {
   return BUNDLED_BENCH_SUBJECTS.map((subject) => ({
     id: subject.id,
@@ -61,6 +67,7 @@ export async function loadBenchContext(
     suite: link.suite,
     error: null,
     result_base_url: deps.resultBaseUrl,
+    show_run_id: null,
   };
   const bundled = BUNDLED_BENCH_SUBJECTS.find((subject) => subject.id === link.subjectId) ?? null;
   const fallback = (error: string): BenchWindowContext => (bundled ? { ...base, subject: { ...bundled } } : { ...base, error });

@@ -84,6 +84,7 @@ function baseContext(): Omit<RemoteApiContext, "identity"> {
       current: notUsed,
       cancel: notUsed,
       record: notUsed,
+      list: notUsed,
       setArtifacts: notUsed,
     },
     capabilities: {

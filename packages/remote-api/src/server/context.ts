@@ -200,6 +200,7 @@ export interface BenchService {
   current(input: BenchInputs["current"]): MaybePromise<BenchOutputs["current"]>;
   cancel(input: BenchInputs["cancel"]): MaybePromise<BenchOutputs["cancel"]>;
   record(input: BenchInputs["record"]): MaybePromise<BenchOutputs["record"]>;
+  list(input: BenchInputs["list"]): MaybePromise<BenchOutputs["list"]>;
   setArtifacts(input: BenchInputs["setArtifacts"]): MaybePromise<BenchOutputs["setArtifacts"]>;
 }
 

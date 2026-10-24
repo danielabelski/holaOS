@@ -1,6 +1,7 @@
 import type { BenchEvent, BenchRun, BenchSubject } from "@holaboss/remote-api/contract";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { remoteApi } from "@/lib/remoteApiClient";
+import type { RunRecordView } from "./record";
 
 const POLL_MS = 200;
 const STREAM_CHARS = 1600;
@@ -242,4 +243,20 @@ export function useBenchRun(suite: string) {
   }, [runId]);
 
   return { run, progress, startError, start, cancel };
+}
+
+/** The suite checklist as it stood at the end of a finished run. */
+export function stepsFromRecord(record: RunRecordView, suite: string): BenchStep[] {
+  return (SUITE_PLAN[suite] ?? []).map((step) => {
+    if (step.kind === "warmup") {
+      return { ...step, state: "done" };
+    }
+    const result = record.results.find((entry) => entry.task === step.id);
+    if (!result) {
+      return { ...step, state: "pending" };
+    }
+    return result.kind === "speed"
+      ? { ...step, state: "done", decodeTps: result.metrics.decode_tps, ttftMs: result.metrics.ttft_ms }
+      : { ...step, state: "done", status: result.status, passed: result.passed, samples: result.samples };
+  });
 }

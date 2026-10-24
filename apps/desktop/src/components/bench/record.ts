@@ -39,7 +39,11 @@ export interface RunRecordView {
     conditions?: { cpu_busy_pct: number | null };
   };
   results: Array<SpeedResult | TaskResult>;
-  artifacts: { highlights: Array<{ t: number; label: string; task?: string }> };
+  artifacts: {
+    highlights: Array<{ t: number; label: string; task?: string }>;
+    recording?: { file: string; scored_run: boolean } | null;
+    cards?: string[];
+  };
   started_at: string;
 }
 
@@ -110,8 +114,7 @@ export function taskResults(record: RunRecordView): TaskResult[] {
 }
 
 /** The machine as people say it: "Apple M5 Pro · 48 GB" or "RTX 4090 24 GB · 64 GB RAM". */
-export function hardwareLabel(record: RunRecordView): string {
-  const hw = record.runtime.hardware;
+export function machineSummary(hw: { cpu?: string; memory_gb?: number; gpus?: string[] }): string {
   const gpu = hw.gpus?.[0]
     ?.replace(/^NVIDIA\s+(GeForce\s+)?/i, "")
     .replace(/,\s*(\d+)\s*MiB$/i, (_match, mib: string) => ` ${Math.round(Number(mib) / 1024)} GB`)
@@ -121,6 +124,10 @@ export function hardwareLabel(record: RunRecordView): string {
     return [gpu, memory ? `${memory} RAM` : ""].filter(Boolean).join(" · ");
   }
   return [hw.cpu ?? "Unknown machine", memory].filter(Boolean).join(" · ");
+}
+
+export function hardwareLabel(record: RunRecordView): string {
+  return machineSummary(record.runtime.hardware);
 }
 
 export function engineLabel(record: RunRecordView): string {

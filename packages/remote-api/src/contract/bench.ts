@@ -48,6 +48,22 @@ export const benchEventSchema = z
 
 const runIdInput = workspaceScoped.extend({ run_id: z.string().min(1) });
 
+export const benchRunSummarySchema = z.object({
+  run_id: z.string(),
+  run_dir: z.string(),
+  subject_id: z.string(),
+  subject_name: z.string(),
+  quant: z.string(),
+  started_at: z.string(),
+  decode_tps: z.number().nullable(),
+  hardware: z.object({
+    cpu: z.string().optional(),
+    memory_gb: z.number().optional(),
+    gpus: z.array(z.string()).optional(),
+  }),
+  cpu_busy_pct: z.number().nullable(),
+});
+
 export const benchContract = {
   start: oc
     .input(
@@ -81,6 +97,10 @@ export const benchContract = {
       NOT_READY: { message: "the run has not produced a Run Record" },
     })
     .output(z.object({ record: z.record(z.string(), z.unknown()) })),
+  /** Finished runs on disk, newest first; they outlive runtime restarts. */
+  list: oc
+    .input(workspaceScoped.extend({ subject_id: z.string().optional() }))
+    .output(z.object({ runs: z.array(benchRunSummarySchema) })),
   /** Attach the desktop's recording and cards; files are names inside the run directory. */
   setArtifacts: oc
     .input(
@@ -101,3 +121,4 @@ export const benchContract = {
 export type BenchSubject = z.infer<typeof benchSubjectSchema>;
 export type BenchRun = z.infer<typeof benchRunSchema>;
 export type BenchEvent = z.infer<typeof benchEventSchema>;
+export type BenchRunSummary = z.infer<typeof benchRunSummarySchema>;

@@ -2445,7 +2445,8 @@ declare global {
 			catalog: () => Promise<
 				import("../../shared/bench-protocol").BenchCatalogEntry[]
 			>;
-			open: (subjectId: string) => Promise<void>;
+			/** Opens the bench window on the model's latest run, or on `runId` when given. */
+			open: (subjectId: string, runId?: string) => Promise<void>;
 			getContext: () => Promise<
 				import("../../shared/bench-protocol").BenchWindowContext | null
 			>;

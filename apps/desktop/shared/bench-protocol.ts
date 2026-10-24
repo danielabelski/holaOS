@@ -7,6 +7,8 @@ export interface BenchWindowContext {
   error: string | null;
   /** Public result page for a run: `<result_base_url>/<run_id>`. */
   result_base_url: string;
+  /** A finished run to show instead of the model's latest one. */
+  show_run_id: string | null;
 }
 
 export interface BenchKitFile {

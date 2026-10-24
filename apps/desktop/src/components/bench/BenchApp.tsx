@@ -1,4 +1,4 @@
-import type { BenchRun, BenchSubject } from "@holaboss/remote-api/contract";
+import type { BenchRun, BenchRunSummary, BenchSubject } from "@holaboss/remote-api/contract";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import {
@@ -26,13 +26,14 @@ import {
   TASK_INFO,
   formatGb,
   formatTps,
+  machineSummary,
   readingComparison,
   resultUrl,
   speedResult,
   wasBusy,
 } from "./record";
 import { type BenchRecording, startBenchRecording } from "./recording";
-import { type BenchMachine, type BenchProgress, type BenchStep, useBenchRun } from "./useBenchRun";
+import { type BenchProgress, type BenchStep, stepsFromRecord, useBenchRun } from "./useBenchRun";
 
 const BENCH_THEME = "holaos-light";
 const FINAL_FRAME_MS = 1500;
@@ -42,21 +43,29 @@ interface FinishedRun {
   url: string;
   cards: Array<{ name: string; file: string; dataUrl: string }>;
   recordingFile: string | null;
+  runDir: string;
+  /** Loaded from disk rather than just run in this window. */
+  past: boolean;
+}
+
+const CARD_NAMES = ["benchmark-card", "capability-card"] as const;
+
+async function renderCards(record: RunRecordView, runDir: string, url: string) {
+  const assets = await cardAssets(url);
+  const cards = [];
+  for (const name of CARD_NAMES) {
+    const html = name === "benchmark-card" ? benchmarkCardHtml(record, assets) : capabilityCardHtml(record, assets);
+    cards.push({ name, ...(await window.electronAPI.bench.renderCard(runDir, name, html)) });
+  }
+  return cards;
+}
+
+function runTime(iso: string): string {
+  return new Date(iso).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
 }
 
 function subjectFrom(context: BenchWindowContext | null): BenchSubject | null {
   return (context?.subject as BenchSubject | null | undefined) ?? null;
-}
-
-function machineLabel(machine: BenchMachine | null): string | null {
-  if (!machine) {
-    return null;
-  }
-  const gpu = machine.gpus?.[0]
-    ?.replace(/^NVIDIA\s+(GeForce\s+)?/i, "")
-    .replace(/,\s*(\d+)\s*MiB$/i, (_match, mib: string) => ` ${Math.round(Number(mib) / 1024)} GB`);
-  const memory = machine.memory_gb ? `${machine.memory_gb} GB` : "";
-  return gpu ? [gpu, memory && `${memory} RAM`].filter(Boolean).join(" · ") : [machine.cpu, memory].filter(Boolean).join(" · ");
 }
 
 function Label({ children, className }: { children: React.ReactNode; className?: string }) {
@@ -395,15 +404,7 @@ export function BenchApp() {
         }
         setFinishing("Making the cards");
         const { record } = await remoteApi.bench.record({ run_id: done.run_id });
-        const view = record as unknown as RunRecordView;
-        const assets = await cardAssets(url);
-        const cards = [];
-        for (const [name, html] of [
-          ["benchmark-card", benchmarkCardHtml(view, assets)],
-          ["capability-card", capabilityCardHtml(view, assets)],
-        ] as const) {
-          cards.push({ name, ...(await window.electronAPI.bench.renderCard(done.run_dir, name, html)) });
-        }
+        const cards = await renderCards(record as unknown as RunRecordView, done.run_dir, url);
         const offset = active && progress.runStartedAt ? Math.max(0, (active.startedAt - progress.runStartedAt) / 1000) : 0;
         const { record: final } = await remoteApi.bench.setArtifacts({
           run_id: done.run_id,
@@ -411,7 +412,7 @@ export function BenchApp() {
           cards: cards.map((card) => card.file),
           recording_offset_s: offset,
         });
-        setFinished({ record: final as unknown as RunRecordView, url, cards, recordingFile });
+        setFinished({ record: final as unknown as RunRecordView, url, cards, recordingFile, runDir: done.run_dir, past: false });
       } catch (error) {
         setRecordingError(error instanceof Error ? error.message : "Could not finish the results.");
       } finally {
@@ -420,6 +421,55 @@ export function BenchApp() {
     },
     [context?.result_base_url, progress.runStartedAt],
   );
+
+  const showPastRun = useCallback(
+    async (summary: BenchRunSummary) => {
+      setFinishing("Loading the last run");
+      try {
+        const { record } = await remoteApi.bench.record({ run_id: summary.run_id });
+        const view = record as unknown as RunRecordView;
+        const url = resultUrl(context?.result_base_url ?? "", summary.run_id);
+        // Cards are derived from the record, so an older run shows in the current design.
+        const cards = await renderCards(view, summary.run_dir, url);
+        const recording = view.artifacts.recording;
+        setFinished({
+          record: view,
+          url,
+          cards,
+          recordingFile: recording ? `${summary.run_dir}/${recording.file}` : null,
+          runDir: summary.run_dir,
+          past: true,
+        });
+      } catch {
+        // nothing to show; the start screen stays
+      } finally {
+        setFinishing(null);
+      }
+    },
+    [context?.result_base_url],
+  );
+
+  const subjectId = subjectFrom(context)?.id ?? null;
+  const showRunId = context?.show_run_id ?? null;
+  const shownRun = finished?.record.run_id ?? null;
+  useEffect(() => {
+    if (!loaded || !subjectId || runStatus.current === "running") {
+      return;
+    }
+    let cancelled = false;
+    void remoteApi.bench
+      .list({ subject_id: subjectId })
+      .then(({ runs }) => {
+        const target = showRunId ? runs.find((entry) => entry.run_id === showRunId) : runs[0];
+        if (!cancelled && target && target.run_id !== shownRun) {
+          void showPastRun(target);
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [loaded, subjectId, showRunId, shownRun, showPastRun]);
 
   useEffect(() => {
     if (run && run.status !== "running" && finalizedRun.current !== run.run_id) {
@@ -431,7 +481,11 @@ export function BenchApp() {
   const subject = subjectFrom(context);
   const isRunning = run?.status === "running";
   const record = finished?.record ?? null;
-  const machine = machineLabel(progress.machine);
+  const showingFinished = Boolean(finished) && !isRunning;
+  const steps = showingFinished && finished ? stepsFromRecord(finished.record, suite) : progress.steps;
+  const machineInfo = showingFinished && finished ? finished.record.runtime.hardware : progress.machine;
+  const machine = machineInfo ? machineSummary(machineInfo) : null;
+  const engineVersion = showingFinished && finished ? finished.record.runtime.provider.version : progress.engineVersion;
   const finalSpeed = record ? speedResult(record, "speed@0")?.decode_tps : undefined;
   const reading = readingComparison(finalSpeed);
 
@@ -461,7 +515,7 @@ export function BenchApp() {
         <section className="flex min-h-0 flex-col gap-2 border-border border-r p-4">
           <Label className="px-3 py-1">Suite</Label>
           <ul className="flex flex-col gap-0.5">
-            {progress.steps.map((step) => (
+            {steps.map((step) => (
               <StepRow current={step.id === progress.currentStep && isRunning} key={step.id} step={step} />
             ))}
           </ul>
@@ -476,9 +530,7 @@ export function BenchApp() {
               <div className="flex flex-col gap-1">
                 <Label>This machine</Label>
                 <span className="font-medium text-sm">{machine}</span>
-                {progress.engineVersion ? (
-                  <span className="text-muted-foreground text-xs">Ollama {progress.engineVersion}</span>
-                ) : null}
+                {engineVersion ? <span className="text-muted-foreground text-xs">Ollama {engineVersion}</span> : null}
               </div>
             ) : null}
           </div>
@@ -506,7 +558,7 @@ export function BenchApp() {
               </div>
               {run && isRunning ? (
                 <CenterLive progress={progress} run={run} />
-              ) : run?.status === "failed" ? (
+              ) : run?.status === "failed" && !finished ? (
                 <RunError onRetry={() => void start(subject)} onUnloadAndRun={() => void start(subject, true)} run={run} />
               ) : finishing ? (
                 <div className="mt-10 flex items-center gap-2 text-muted-foreground text-sm">
@@ -515,6 +567,11 @@ export function BenchApp() {
                 </div>
               ) : record ? (
                 <div className="mt-10 flex flex-col items-center gap-6">
+                  {finished?.past ? (
+                    <span className="rounded-full bg-card px-2.5 py-1 text-muted-foreground text-xs ring-1 ring-border">
+                      Last run · {runTime(record.started_at)}
+                    </span>
+                  ) : null}
                   <HeroNumber
                     label="Decode speed"
                     sub={
@@ -549,8 +606,8 @@ export function BenchApp() {
         </section>
 
         <section className="flex min-h-0 flex-col gap-4 overflow-y-auto border-border border-l p-4">
-          {finished && run ? (
-            <FinishedPanel finished={finished} onRunAgain={() => subject && void start(subject)} runDir={run.run_dir} />
+          {finished && !isRunning ? (
+            <FinishedPanel finished={finished} onRunAgain={() => subject && void start(subject)} runDir={finished.runDir} />
           ) : (
             <div className="flex flex-col gap-4 px-1">
               <Label>What this measures</Label>

@@ -146,6 +146,33 @@ test("one click runs the standard suite end to end and writes a Run Record", { s
     () => runner.setArtifacts(started.run_id, { recording: null, cards: ["../../etc/passwd"] }),
     (error: unknown) => error instanceof BenchError && error.code === "invalid_artifacts",
   );
+
+  const listed = runner.list("openbmb-minicpm5-2b");
+  assert.equal(listed.length, 1);
+  assert.equal(listed[0].run_id, started.run_id);
+  assert.equal(listed[0].subject_name, "MiniCPM5-2B");
+  assert.ok((listed[0].decode_tps ?? 0) > 0);
+  assert.deepEqual(runner.list("someone-else"), []);
+});
+
+test("runs from before a restart can still be listed, read and given new cards", { skip: process.platform === "win32" }, async () => {
+  const { runner, dir } = makeRunner();
+  const { run_id } = runner.start({ subject, suite: "suite-standard@1.0" });
+  const { run } = await settle(runner, run_id);
+  assert.equal(run.status, "done");
+  const highlights = (runner.record(run_id) as unknown as RunRecord).artifacts.highlights;
+
+  const restarted = makeRunner({ runDir: (id) => path.join(dir, "runs", id) }).runner;
+  assert.deepEqual(restarted.list().map((entry) => entry.run_id), [run_id]);
+  assert.equal((restarted.record(run_id) as unknown as RunRecord).run_id, run_id);
+  fs.writeFileSync(path.join(run.run_dir, "capability-card.png"), "");
+  const updated = restarted.setArtifacts(run_id, { recording: null, cards: ["capability-card.png"] }) as unknown as RunRecord;
+  assert.deepEqual(updated.artifacts.cards, ["capability-card.png"]);
+  assert.deepEqual(updated.artifacts.highlights, highlights);
+  assert.throws(() => restarted.record("00000000-0000-0000-0000-000000000000"), (error: unknown) => {
+    return error instanceof BenchError && error.code === "not_found";
+  });
+  assert.throws(() => restarted.record("../../etc"), (error: unknown) => error instanceof BenchError && error.code === "not_found");
 });
 
 test("missing Ollama fails with the download link", async () => {

@@ -41,12 +41,15 @@ export function createBenchWindowController(deps: BenchWindowDeps) {
   let win: BrowserWindow | null = null;
   let context: BenchWindowContext | null = null;
 
-  async function open(link: BenchDeepLink): Promise<void> {
-    context = await loadBenchContext(link, {
-      subjectsBaseUrl: deps.subjectsBaseUrl(),
-      resultBaseUrl: deps.resultBaseUrl(),
-      fetchImpl: deps.fetchImpl,
-    });
+  async function open(link: BenchDeepLink, showRunId: string | null = null): Promise<void> {
+    context = {
+      ...(await loadBenchContext(link, {
+        subjectsBaseUrl: deps.subjectsBaseUrl(),
+        resultBaseUrl: deps.resultBaseUrl(),
+        fetchImpl: deps.fetchImpl,
+      })),
+      show_run_id: showRunId,
+    };
     if (win && !win.isDestroyed()) {
       win.webContents.send("bench:context", context);
       if (win.isMinimized()) {

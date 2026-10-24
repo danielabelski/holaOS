@@ -1752,8 +1752,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
 	bench: {
 		catalog: () =>
 			ipcRenderer.invoke("bench:catalog") as Promise<BenchCatalogEntry[]>,
-		open: (subjectId: string) =>
-			ipcRenderer.invoke("bench:open", subjectId) as Promise<void>,
+		open: (subjectId: string, runId?: string) =>
+			ipcRenderer.invoke("bench:open", subjectId, runId) as Promise<void>,
 		getContext: () =>
 			ipcRenderer.invoke("bench:getContext") as Promise<BenchWindowContext | null>,
 		onContext: (listener: (context: BenchWindowContext) => void) => {

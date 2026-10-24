@@ -36,7 +36,7 @@ export type { CronjobRecord } from "./cronjobs";
 export type { CapabilityCatalogEntry, WorkspaceCapability } from "./capabilities";
 export type { ChannelConnection } from "./channels";
 export { BENCH_RUN_PHASES, BENCH_RUN_STATUSES, benchSubjectSchema } from "./bench";
-export type { BenchEvent, BenchRun, BenchSubject } from "./bench";
+export type { BenchEvent, BenchRun, BenchRunSummary, BenchSubject } from "./bench";
 export {
   EVAL_AGENT_CONDITIONS,
   EVAL_QUESTION_TYPES,

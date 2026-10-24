@@ -39,7 +39,10 @@ const setArtifacts = os.bench.setArtifacts.handler(({ input, context, errors }) 
   mapBenchErrors(() => context.bench.setArtifacts(input), errors),
 );
 
+const list = os.bench.list.handler(({ input, context }) => context.bench.list(input));
+
 export const benchRouter = {
+  list,
   start,
   get,
   current,

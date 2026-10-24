@@ -3834,6 +3834,7 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
         current: () => ({ run: bench.current() as never }),
         cancel: (input) => benchCall(() => bench.cancel(input.run_id) as never),
         record: (input) => benchCall(() => ({ record: bench.record(input.run_id) })),
+        list: (input) => ({ runs: bench.list(input.subject_id) }),
         setArtifacts: (input) =>
           benchCall(() => ({
             record: bench.setArtifacts(input.run_id, {

@@ -73,6 +73,21 @@ export interface BenchRunState {
   finished_at: string | null;
 }
 
+export interface BenchRunSummary {
+  run_id: string;
+  run_dir: string;
+  subject_id: string;
+  subject_name: string;
+  quant: string;
+  started_at: string;
+  decode_tps: number | null;
+  hardware: { cpu?: string; memory_gb?: number; gpus?: string[] };
+  cpu_busy_pct: number | null;
+}
+
+const RUN_ID_PATTERN = /^[0-9a-f-]{36}$/;
+const LIST_LIMIT = 20;
+
 export class BenchError extends Error {
   readonly code: BenchErrorCode;
   readonly details?: Record<string, unknown>;
@@ -228,15 +243,63 @@ export class BenchRunner {
     return { run: { ...entry.state }, events: entry.events.filter((event) => event.seq > after) };
   }
 
-  record(runId: string): Record<string, unknown> {
+  private benchRoot(): string {
+    return path.dirname(this.deps.runDir("_"));
+  }
+
+  /** Runs from this session are in memory; earlier ones are read back from their run directory. */
+  private recordPath(runId: string): string {
     const entry = this.runs.get(runId);
-    if (!entry) {
+    if (entry) {
+      if (!entry.state.record_path) {
+        throw new BenchError("not_ready", "the run has not produced a Run Record");
+      }
+      return entry.state.record_path;
+    }
+    const file = RUN_ID_PATTERN.test(runId) ? path.join(this.benchRoot(), runId, "run-record.json") : "";
+    if (!file || !fs.existsSync(file)) {
       throw new BenchError("not_found", "benchmark run not found");
     }
-    if (!entry.state.record_path) {
-      throw new BenchError("not_ready", "the run has not produced a Run Record");
+    return file;
+  }
+
+  record(runId: string): Record<string, unknown> {
+    return JSON.parse(fs.readFileSync(this.recordPath(runId), "utf8")) as Record<string, unknown>;
+  }
+
+  /** Finished runs on disk, newest first. */
+  list(subjectId?: string): BenchRunSummary[] {
+    const root = this.benchRoot();
+    if (!fs.existsSync(root)) {
+      return [];
     }
-    return JSON.parse(fs.readFileSync(entry.state.record_path, "utf8")) as Record<string, unknown>;
+    const runs: BenchRunSummary[] = [];
+    for (const name of fs.readdirSync(root)) {
+      if (!RUN_ID_PATTERN.test(name)) {
+        continue;
+      }
+      try {
+        const record = JSON.parse(fs.readFileSync(path.join(root, name, "run-record.json"), "utf8")) as RunRecord;
+        if (subjectId && record.subject.id !== subjectId) {
+          continue;
+        }
+        const speed = record.results.find((result) => result.task === "speed@0") as { metrics?: { decode_tps?: number } } | undefined;
+        runs.push({
+          run_id: record.run_id,
+          run_dir: path.join(root, name),
+          subject_id: record.subject.id,
+          subject_name: record.subject.name,
+          quant: record.subject.quant,
+          started_at: record.started_at,
+          decode_tps: speed?.metrics?.decode_tps ?? null,
+          hardware: record.runtime.hardware as BenchRunSummary["hardware"],
+          cpu_busy_pct: record.runtime.conditions?.cpu_busy_pct ?? null,
+        });
+      } catch {
+        // an unfinished or unreadable run is not listed
+      }
+    }
+    return runs.sort((a, b) => b.started_at.localeCompare(a.started_at)).slice(0, LIST_LIMIT);
   }
 
   /** Called by the desktop once the recording and cards exist; `recording_offset_s` is how long after run start recording began. */
@@ -244,11 +307,13 @@ export class BenchRunner {
     runId: string,
     input: { recording: { file: string; scored_run: boolean } | null; cards: string[]; recording_offset_s?: number },
   ): Record<string, unknown> {
+    const recordPath = this.recordPath(runId);
     const record = this.record(runId) as unknown as RunRecord;
-    const entry = this.runs.get(runId) as RunEntry;
+    const runDir = path.dirname(recordPath);
+    const entry = this.runs.get(runId);
     const inRunDir = (file: string) => {
       const name = path.basename(file);
-      if (!fs.existsSync(path.join(entry.state.run_dir, name))) {
+      if (!fs.existsSync(path.join(runDir, name))) {
         throw new BenchError("invalid_artifacts", `${name} is not in this run's directory.`);
       }
       return name;
@@ -257,9 +322,11 @@ export class BenchRunner {
     record.artifacts = {
       recording: input.recording ? { file: inRunDir(input.recording.file), scored_run: input.recording.scored_run } : null,
       cards: input.cards.map(inRunDir),
-      highlights: benchHighlights(entry.events).map((h) => ({ ...h, t: Math.max(0, Math.round((h.t - offset) * 10) / 10) })),
+      highlights: entry
+        ? benchHighlights(entry.events).map((h) => ({ ...h, t: Math.max(0, Math.round((h.t - offset) * 10) / 10) }))
+        : record.artifacts.highlights,
     };
-    fs.writeFileSync(entry.state.record_path as string, `${JSON.stringify(record, null, 2)}\n`);
+    fs.writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`);
     return record as unknown as Record<string, unknown>;
   }
 
