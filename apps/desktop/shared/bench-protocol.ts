@@ -28,4 +28,5 @@ export interface BenchCatalogEntry {
   name: string;
   vendor: string | null;
   quant: string;
+  download_bytes: number | null;
 }

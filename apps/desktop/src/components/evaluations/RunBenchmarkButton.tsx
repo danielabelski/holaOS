@@ -54,7 +54,9 @@ export function RunBenchmarkButton() {
             <span className="flex min-w-0 flex-col">
               <span className="truncate text-sm">{entry.name}</span>
               <span className="truncate text-muted-foreground text-xs">
-                {[entry.vendor, entry.quant, "Ollama"].filter(Boolean).join(" · ")}
+                {[entry.vendor, entry.quant, entry.download_bytes ? `${(entry.download_bytes / 2 ** 30).toFixed(1)} GB` : null]
+                  .filter(Boolean)
+                  .join(" · ")}
               </span>
             </span>
           </DropdownMenuItem>

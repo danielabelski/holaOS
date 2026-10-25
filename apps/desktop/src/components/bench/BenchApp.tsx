@@ -70,6 +70,18 @@ function subjectFrom(context: BenchWindowContext | null): BenchSubject | null {
   return (context?.subject as BenchSubject | null | undefined) ?? null;
 }
 
+/** "Downloads 22.3 GB the first time · Needs 32 GB of memory or more", from the optional hints in a model's config. */
+function sizeHint(context: BenchWindowContext | null): string | null {
+  const subject = context?.subject ?? {};
+  const download = typeof subject.download_bytes === "number" ? subject.download_bytes : null;
+  const memory = typeof subject.min_memory_gb === "number" ? subject.min_memory_gb : null;
+  const parts = [
+    download ? `Downloads ${formatGb(download)} the first time` : null,
+    memory && memory > 8 ? `Needs ${memory} GB of memory or more` : null,
+  ].filter(Boolean);
+  return parts.length > 0 ? parts.join(" · ") : null;
+}
+
 function Label({ children, className }: { children: React.ReactNode; className?: string }) {
   return <span className={cn("font-mono text-[11px] text-muted-foreground uppercase tracking-[0.09em]", className)}>{children}</span>;
 }
@@ -647,6 +659,9 @@ export function BenchApp() {
                   <span className="max-w-[300px] text-center text-muted-foreground text-xs leading-5">
                     About 3 minutes once the model is downloaded. This window is recorded while it runs.
                   </span>
+                  {sizeHint(context) ? (
+                    <span className="max-w-[300px] text-center font-medium text-muted-foreground text-xs leading-5">{sizeHint(context)}</span>
+                  ) : null}
                   {startError ? <span className="text-destructive text-xs">{startError}</span> : null}
                 </div>
               )}

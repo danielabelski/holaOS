@@ -69,8 +69,12 @@ test("opens from inside the app go through the same validation as deep links", (
   assert.equal(benchLinkFromApp(42), null);
 });
 
-test("the bundled catalog lists MiniCPM so the bench works before HolaHub hosts configs", () => {
-  assert.deepEqual(benchCatalog().map((entry) => entry.id), ["openbmb-minicpm5-2b"]);
+test("the bundled catalog lists the three model pages so the bench works before HolaHub hosts configs", () => {
+  assert.deepEqual(
+    benchCatalog().map((entry) => entry.id),
+    ["openbmb-minicpm5-2b", "qwen-qwen3.5-2b", "qwen-qwen3.6-35b-a3b"],
+  );
+  assert.equal(benchCatalog().find((entry) => entry.id === "qwen-qwen3.6-35b-a3b")?.download_bytes, 23_938_333_577);
 });
 
 const minicpm = { subjectId: "openbmb-minicpm5-2b", suite: "suite-standard@1.0" };

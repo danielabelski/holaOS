@@ -60,6 +60,7 @@ export function benchCatalog(): BenchCatalogEntry[] {
     name: subject.name,
     vendor: subject.vendor ?? null,
     quant: subject.quant,
+    download_bytes: subject.download_bytes ?? null,
   }));
 }
 
